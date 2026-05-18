@@ -57,7 +57,8 @@ class PenaltyEntExpSimulatedEnv(BaseSimulatedEnv):
         entropy = 0
         entropy_set = set(self.entropy_window) - {0}
         if len(entropy_set):
-            action_k = self.history_action[max(0, self.total_turn - self.step_n_actions + 1):self.total_turn + 1]
+            action_k = self.history_action[max(0, self.total_turn - self.step_n_actions + 1):self.total_turn + 1] # 获取用户最近交互过的k个物品序列
+            # 这里的lbe是LabelEncoder的缩写
             if hasattr(self.env_task, "lbe_item") and self.env_task.lbe_item:
                 action_trans = self.env_task.lbe_item.inverse_transform(action_k)
             else:
@@ -78,9 +79,9 @@ class PenaltyEntExpSimulatedEnv(BaseSimulatedEnv):
                         continue
                     ans_feat = 0
                     for feat in feat_set:
-                        if feat in self.entropy_dict["map"]:
+                        if feat in self.entropy_dict["map"]: # 当前物品序列组合已经出现过，直接取值
                             ans_feat += self.entropy_dict["map"][feat]
-                        else:
+                        else: # 当前物品序列组合没有出现过，直接给1
                             ans_feat += 1 # todo! 补足差额
                     entropy += ans_feat / len(feat_set)
                 else:

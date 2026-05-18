@@ -1,0 +1,90 @@
+
+
+construct_diffusion_model : 
+  normalizer_type : &normalizer_type standard
+  denoising_network : 
+    _target_ : src.core.diffusion.denoiser_network.mixer.MixerUnet
+    horizon : &seq_len 31   # 生成轨迹长度
+    d_in : 4
+    dim : 16
+    cond_dim : 1
+    condition_dropout : 0.25
+    use_dropout : True
+    force_dropout : False # for uncond sampling
+    learned_sinusoidal_cond : False
+    random_fourier_features : True
+    learned_sinusoidal_dim : 16
+  disable_terminal_norm : True # No normalization on the terminals.
+
+# Diffusion Model.
+ElucidatedDiffusion : 
+  num_sample_steps : 128
+  sigma_data : 1.0
+  S_churn : 80
+  S_tmin : 0.05
+  S_tmax : 50
+  S_noise : 1.003
+
+# Training.
+Trainer : 
+  train_batch_size : &batch_size 64
+  train_lr : 3e-4
+  lr_scheduler : cosinewarmup
+  weight_decay : 0
+  train_num_steps : 1000000   
+  save_and_sample_every : 100000
+  reweighted_training : False
+  
+  
+# Sampling.
+SimpleDiffusionGenerator : 
+  num_sample_steps : 128
+  sample_batch_size : 512
+  noise_level : 0.75
+  amplify_returnscale : 1.3
+  save_num_transitions : 500000
+  temperature : 1.0
+  weighted_sampling : False
+  state_conditioning : False
+  with_strategy : False
+  weight_param : 50.0
+
+
+# Dataset.
+Dataset : 
+  seq_len : *seq_len
+  reward_scale : 0.01
+  batch_size : *batch_size
+  num_workers : 4
+  normalizer_type : *normalizer_type
+  modalities : ["observations", "actions", "rewards"]
+  discounted_return : True
+  gamma : 0.99
+  restore_rewards : False
+  penalty : 100
+
+RSEnvConfig:
+  env: KuaiEnv-v0      # 环境名称 KuaiEnv-v0 KuaiRand-v0
+  #dataset: KuaiEnv-v0   # 数据集名称
+  num_leave_compute: 1  # 退出机制的时间窗口
+  leave_threshold: 0    # 退出机制的阈值，在指定时间窗口内，相同类别出现的次数
+  max_turn: 30        # 最大交互轮数
+  random_init: True   # 是否随机初始化用户
+  cuda: 0
+  seed: 2025
+  user_model_name: DeepFM
+  read_message: pointneg
+  trajectory_source: small # big -> DM_KuaiEnv-v0_data.pkl, small -> DM_KuaiEnv-v0_small_data.pkl
+  # state_tracker
+  which_tracker: avg
+  reward_handle: cat
+  embedding_dim: 32
+  use_userEmbedding: False
+  window_size: 3
+  freeze_emb: True   # 加载user和item嵌入向量
+  use_pretrained_embedding: True # True表示用的state tracker是avg
+  need_state_norm: False
+  # tianshou
+  buffer_size: 100000
+  training_num: 1
+  

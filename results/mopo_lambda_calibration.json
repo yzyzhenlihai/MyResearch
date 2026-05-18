@@ -1,0 +1,154 @@
+{
+  "config": {
+    "big_csv": "data/KuaiRec/data_raw/big_matrix_processed.csv",
+    "small_csv": "data/KuaiRec/data_raw/small_matrix_processed.csv",
+    "prediction_mat_path": "saved_models/KuaiEnv-v0/DeepFM/matsPre/[pointneg]_matPre.pickle",
+    "var_mat_path": "saved_models/KuaiEnv-v0/DeepFM/matsVar/[pointneg]_matVar.pickle",
+    "default_variance_reference_lambda": 0.05,
+    "lambda_entropy": 0.05,
+    "entropy_window": [
+      1,
+      2
+    ],
+    "feature_level": true,
+    "is_sorted": true,
+    "chunksize": 200000,
+    "entropy_map_cache": "results/mopo_lambda_entropy_map.pkl"
+  },
+  "data_summary": {
+    "kept_rows": 4676570,
+    "kept_users": 1411,
+    "predicted_mat_shape": [
+      1411,
+      3327
+    ],
+    "maxvar_mat_shape": [
+      1411,
+      3327
+    ],
+    "small_space_shape": [
+      1411,
+      3327
+    ],
+    "entropy_map_size": 527,
+    "replay_csv_used": "data/KuaiRec/data_raw/small_matrix_processed.csv"
+  },
+  "stats": {
+    "entropy": {
+      "count": 4676570,
+      "mean": 1.5855221745273533,
+      "median": 1.5856345891952515,
+      "p95": 1.6365108489990234,
+      "p99": 1.6556485891342163,
+      "min": 1.5184680223464966,
+      "max": 1.8322391510009766
+    },
+    "lambda_entropy_entropy": {
+      "count": 4676570,
+      "mean": 0.07927610872636767,
+      "median": 0.07928172945976258,
+      "p95": 0.08182554244995117,
+      "p99": 0.08278242945671083,
+      "min": 0.07592340111732483,
+      "max": 0.09161195755004883
+    },
+    "maxvar": {
+      "count": 4676570,
+      "mean": 6.325761858149026e-05,
+      "median": 4.539992369245738e-05,
+      "p95": 5.610319240076926e-05,
+      "p99": 0.0003867309418274023,
+      "min": 4.539992369245738e-05,
+      "max": 0.033911317586898804
+    },
+    "default_variance_penalty": {
+      "count": 4676570,
+      "mean": 3.1628809290745135e-06,
+      "median": 2.269996184622869e-06,
+      "p95": 2.8051596200384632e-06,
+      "p99": 1.9336547091370117e-05,
+      "min": 2.269996184622869e-06,
+      "max": 0.0016955658793449402
+    }
+  },
+  "lambda_candidates": {
+    "lambda_mean": 1253.2262596044764,
+    "lambda_median": 1746.2965355806145,
+    "lambda_star": 1458.482823320215,
+    "official_mopo_sweep": [
+      0.0,
+      0.05,
+      146.0,
+      486.0,
+      1460.0
+    ]
+  },
+  "reward_sanity": [
+    {
+      "lambda_variance": 0.0,
+      "reward_mean": 0.01417534751589448,
+      "reward_p95": 0.016346448543481527,
+      "reward_max": 0.060729189217090605
+    },
+    {
+      "lambda_variance": 0.05,
+      "reward_mean": 0.015867750514310337,
+      "reward_p95": 0.01803904375661659,
+      "reward_max": 0.06180702126584947
+    },
+    {
+      "lambda_variance": 146.0,
+      "reward_mean": 4.955992102890223,
+      "reward_p95": 4.96037502712752,
+      "reward_max": 4.970027003140421
+    },
+    {
+      "lambda_variance": 486.0,
+      "reward_mean": 16.464332492118107,
+      "reward_p95": 16.4747297945607,
+      "reward_max": 16.4833643985854
+    },
+    {
+      "lambda_variance": 1460.0,
+      "reward_mean": 49.43234290125918,
+      "reward_p95": 49.46008837549016,
+      "reward_max": 49.46721692203719
+    }
+  ],
+  "historical_mopo_logs": {
+    "unique_lambdas": [
+      0.0,
+      0.01,
+      0.05
+    ],
+    "logs_by_lambda": {
+      "0": [
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_01_06-07_03_45.log",
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_01_06-07_07_01.log",
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_01_06-07_08_44.log",
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_01_07-02_50_16.log",
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_01_07-03_28_11.log",
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_03_30-01_40_02.log",
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_03_30-10_55_34.log"
+      ],
+      "0.05": [
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_01_17-12_55_12.log",
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_04_01-05_17_55.log"
+      ],
+      "0.01": [
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_01_17-14_26_50.log",
+        "saved_models/KuaiEnv-v0/MOPO/logs/[MOPO]_2026_03_30-01_41_53.log"
+      ]
+    }
+  },
+  "manual_commands": [
+    "CUDA_VISIBLE_DEVICES=<gpu_id> PYTHONPATH=.:./src:./src/DeepCTR-Torch SWANLAB_MODE=offline conda run -n easyrl4rec python examples/advance/run_MOPO.py --env KuaiEnv-v0 --user_model_name DeepFM --read_message pointneg --seed 2023 --cuda <cuda_id> --which_tracker avg --window_size 3 --epoch 100 --batch-size 1024 --hidden-sizes 64 64 --leave_threshold 0 --num_leave_compute 1 --max_turn 30 --force_length 10 --lambda_entropy 0.0 --lambda_variance 0 --message MOPO_lambda_0",
+    "CUDA_VISIBLE_DEVICES=<gpu_id> PYTHONPATH=.:./src:./src/DeepCTR-Torch SWANLAB_MODE=offline conda run -n easyrl4rec python examples/advance/run_MOPO.py --env KuaiEnv-v0 --user_model_name DeepFM --read_message pointneg --seed 2023 --cuda <cuda_id> --which_tracker avg --window_size 3 --epoch 100 --batch-size 1024 --hidden-sizes 64 64 --leave_threshold 0 --num_leave_compute 1 --max_turn 30 --force_length 10 --lambda_entropy 0.0 --lambda_variance 0.05 --message MOPO_lambda_0p05",
+    "CUDA_VISIBLE_DEVICES=<gpu_id> PYTHONPATH=.:./src:./src/DeepCTR-Torch SWANLAB_MODE=offline conda run -n easyrl4rec python examples/advance/run_MOPO.py --env KuaiEnv-v0 --user_model_name DeepFM --read_message pointneg --seed 2023 --cuda <cuda_id> --which_tracker avg --window_size 3 --epoch 100 --batch-size 1024 --hidden-sizes 64 64 --leave_threshold 0 --num_leave_compute 1 --max_turn 30 --force_length 10 --lambda_entropy 0.0 --lambda_variance 146 --message MOPO_lambda_146",
+    "CUDA_VISIBLE_DEVICES=<gpu_id> PYTHONPATH=.:./src:./src/DeepCTR-Torch SWANLAB_MODE=offline conda run -n easyrl4rec python examples/advance/run_MOPO.py --env KuaiEnv-v0 --user_model_name DeepFM --read_message pointneg --seed 2023 --cuda <cuda_id> --which_tracker avg --window_size 3 --epoch 100 --batch-size 1024 --hidden-sizes 64 64 --leave_threshold 0 --num_leave_compute 1 --max_turn 30 --force_length 10 --lambda_entropy 0.0 --lambda_variance 486 --message MOPO_lambda_486",
+    "CUDA_VISIBLE_DEVICES=<gpu_id> PYTHONPATH=.:./src:./src/DeepCTR-Torch SWANLAB_MODE=offline conda run -n easyrl4rec python examples/advance/run_MOPO.py --env KuaiEnv-v0 --user_model_name DeepFM --read_message pointneg --seed 2023 --cuda <cuda_id> --which_tracker avg --window_size 3 --epoch 100 --batch-size 1024 --hidden-sizes 64 64 --leave_threshold 0 --num_leave_compute 1 --max_turn 30 --force_length 10 --lambda_entropy 0.0 --lambda_variance 1460 --message MOPO_lambda_1460"
+  ],
+  "warnings": [
+    "big_matrix_processed.csv 中不存在同时落在 KuaiEnv small-space user/item 的交互；已自动回退到 small_matrix_processed.csv 作为回放分布。"
+  ]
+}

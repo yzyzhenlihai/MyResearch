@@ -1,4 +1,10 @@
 import argparse
+import os
+import pandas as pd
+import numpy as np
+import pickle
+import sys
+sys.path.extend(['./src', './src/DeepCTR-Torch',"./src/tianshou"])
 
 def get_env_args(args):
     env = args.env
@@ -170,3 +176,4 @@ def get_true_env(args, read_user_num=None):
         env = KuaiEnv(**kwargs_um)
         dataset = KuaiData()
     return env, dataset, kwargs_um
+

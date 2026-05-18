@@ -11,9 +11,9 @@ import numpy as np
 import torch
 from gymnasium.spaces import Discrete
 
-sys.path.extend([".", "./examples", "./src", "./src/DeepCTR-Torch", "./src/tianshou"])
+sys.path.extend([".", "./examples/policy", "./src", "./src/DeepCTR-Torch", "./src/tianshou"])
 
-from ..policy.policy_utils import get_args_all, learn_policy, prepare_dir_log, prepare_user_model, prepare_test_envs, setup_state_tracker
+from policy_utils import get_args_all, learn_policy, prepare_dir_log, prepare_user_model, prepare_test_envs, setup_state_tracker
 
 # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
@@ -37,6 +37,21 @@ try:
 except ImportError:
     envpool = None
 
+import swanlab as wandb
+wandb.login(api_key="ccVCViGdYDi4LOGAy6FBp", save=True)
+def set_wandb(args):
+    if "device" in args:
+        args.device = str(args.device)
+
+    wandb.init(
+        project = f"DORL",
+        config = args,
+        name = f"{args.message}-{args.env}-Policy_Training-num_leave_compute:{args.num_leave_compute}-leave_threshold:{args.leave_threshold}-window_size:{args.window_size}-seed:{args.seed}-lambda_variance:{args.lambda_variance}-lambda_entropy:{args.lambda_entropy}"
+    )
+
+def finish_wandb():
+    wandb.finish()
+
 
 def get_args_MOPO():
     parser = argparse.ArgumentParser()
@@ -48,6 +63,7 @@ def get_args_MOPO():
     parser.add_argument('--rew-norm', action="store_true", default=False)
 
     # Env
+    parser.add_argument('--lambda_entropy', default=5, type=float)
     parser.add_argument('--lambda_variance', default=0.05, type=float)
 
     parser.add_argument("--read_message", type=str, default="UM")
@@ -151,10 +167,11 @@ def main(args):
     policy, train_collector, test_collector_set, optim = setup_policy_model(args, state_tracker, train_envs, test_envs_dict)
 
     # %% 4. Learn policy
+    set_wandb(args)
     learn_policy(args, env, dataset, policy, train_collector, test_collector_set, state_tracker, optim, MODEL_SAVE_PATH,
                  logger_path, trainer="onpolicy")
 
-
+    finish_wandb()
 if __name__ == '__main__':
     trainer = "onpolicy"
     args_all = get_args_all(trainer)

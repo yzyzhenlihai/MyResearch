@@ -31,6 +31,32 @@ from src.tianshou.tianshou.policy import A2CPolicy
 
 # from util.upload import my_upload
 import logzero
+import swanlab as wandb
+
+_SWANLAB_MODE = os.environ.get("SWANLAB_MODE", "").lower()
+_SWANLAB_DISABLE_LOGIN = _SWANLAB_MODE in {"offline", "disabled"}
+
+if not _SWANLAB_DISABLE_LOGIN:
+    wandb.login(api_key="ccVCViGdYDi4LOGAy6FBp", save=True)
+
+
+def set_wandb(args):
+    if _SWANLAB_DISABLE_LOGIN:
+        logzero.logger.info("Skip swanlab login/init because SWANLAB_MODE=%s", _SWANLAB_MODE)
+        return
+    if "device" in args:
+        args.device = str(args.device)
+        
+    wandb.init(
+        project = f"DORL",
+        config = args,
+        name = f"{args.message}-{args.env}-Policy_Training-num_leave_compute:{args.num_leave_compute}-leave_threshold:{args.leave_threshold}-window_size:{args.window_size}-seed:{args.seed}-lambda_variance:{args.lambda_variance}-lambda_entropy:{args.lambda_entropy}"
+    )
+
+def finish_wandb():
+    if _SWANLAB_DISABLE_LOGIN:
+        return
+    wandb.finish()
 
 try:
     import envpool
@@ -66,7 +92,8 @@ def get_args_DORL():
     parser.add_argument('--gamma_exposure', default=10, type=float)
 
     parser.add_argument('--lambda_entropy', default=5, type=float)
-
+    parser.add_argument('--lambda_variance', default=0.05, type=float)
+    
     parser.add_argument("--read_message", type=str, default="UM")
     parser.add_argument("--message", type=str, default="DORL")
 
@@ -255,7 +282,7 @@ def setup_policy_model(args, state_tracker, train_envs, test_envs_dict):
         ent_coef=args.ent_coef,
         max_grad_norm=args.max_grad_norm,
         reward_normalization=args.rew_norm,
-        action_space=Discrete(args.action_shape),
+        action_space=Discrete(args.action_shape), 
         action_bound_method="",  # not clip
         action_scaling=False
     )
@@ -292,12 +319,12 @@ def main(args):
     # %% 3. Setup policy
     state_tracker = setup_state_tracker(args, ensemble_models, env, train_envs, test_envs_dict)
     policy, train_collector, test_collector_set, optim = setup_policy_model(args, state_tracker, train_envs, test_envs_dict)
-
+    set_wandb(args)
     # %% 4. Learn policy
     learn_policy(args, env, dataset, policy, train_collector, test_collector_set, state_tracker, optim, MODEL_SAVE_PATH,
                  logger_path, trainer="onpolicy")
 
-
+    finish_wandb()
 if __name__ == '__main__':
     trainer = "onpolicy"
     args_all = get_args_all(trainer)

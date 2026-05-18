@@ -58,13 +58,13 @@ class LoggerEval_Policy():
             res['num_test'] = num_test
             for metric in self.metrics:
                 if metric == 'len_tra':
-                    res[prefix + 'len_tra'] = len_tra
+                    res[prefix + 'len_tra'] = float(len_tra)
                 elif metric == 'R_tra':
-                    res[prefix + 'R_tra'] = R_tra
+                    res[prefix + 'R_tra'] = float(R_tra)
                 elif metric == 'ctr':
-                    res[prefix + 'ctr'] = f"{ctr:.5f}"
+                    res[prefix + 'ctr'] = float(ctr)
                 elif metric in ['CV', 'CV_turn', 'Diversity', 'Novelty', 'Serendipity']:  # have been calculated by evaluators
-                    res[prefix + metric] = f"{results[prefix + metric]:.5f}"
+                    res[prefix + metric] = float(results[prefix + metric])
                 
                 elif metric == "all_feats" and (prefix + "all_feats") in results:
                     res[prefix + 'all_feats'] = results[prefix + "all_feats"].tolist()
@@ -85,3 +85,4 @@ class LoggerEval_Policy():
 
         # 2. upload logger
         # self.upload_logger()
+        return results_all

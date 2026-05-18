@@ -30,7 +30,7 @@ class RecPolicy(ABC, nn.Module):
 
         self.state_tracker = state_tracker
         self.n_items = state_tracker.num_item
-        self.emb_dim = state_tracker.emb_dim
+        self.emb_dim = state_tracker.emb_dim # 返回的是动作嵌入向量
         self.device = args.device
 
         # self.slate_size = args.slate_size
@@ -106,7 +106,9 @@ class RecPolicy(ABC, nn.Module):
         batch, indices = buffer.sample(sample_size)
         self.updating = True
         batch = self.process_fn(batch, buffer, indices)  # RecPolicy.process_fn()
-        result = self.policy.learn(batch, **kwargs)
+        real_batch_size = kwargs.pop('batch_size', sample_size)
+        real_repeat = kwargs.pop('repeat', 1)
+        result = self.policy.learn(batch, batch_size=real_batch_size, repeat=real_repeat, **kwargs)
 
         self.policy.post_process_fn(batch, buffer, indices)
         if self.policy.lr_scheduler is not None:
@@ -137,9 +139,13 @@ class RecPolicy(ABC, nn.Module):
             self, 
             batch: Batch
         )-> Union[Batch, np.ndarray]:
+        """
+        通过policy网络输出的动作向量,选出具体的item id
+        如果没有这个包装层,A2C策略只会输出一堆无实际意义的浮点数向量,我们无法知道到底该给用户推荐哪个商品。
+        """
         act = self.policy.map_action(batch.act)
         if self.action_type == "continuous":
-            action_scores = self.get_score(act)  # [B, n_items]
+            action_scores = self.get_score(act)  # [B, n_items] # get_score计算当前向量与所有候选物品向量之间的相似度
             action_scores = action_scores * batch.mask  # remove recommended item id
             discrete_acts = self.select_action(action_scores)
         else:

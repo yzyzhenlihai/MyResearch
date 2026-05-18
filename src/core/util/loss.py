@@ -31,9 +31,9 @@ def loss_pairwise_pointwise_Standard(y, y_deepfm_pos, y_deepfm_neg, score, alpha
     loss = loss_y + args.bpr_weight * bpr_click
     return loss
 
-# IPS loss
+# IPS loss 
 def loss_pointwise_negative_IPS(y, y_deepfm_pos, y_deepfm_neg, score, alpha_u=None, beta_i=None, args=None, log_var=None, log_var_neg=None):
-    loss_y = (((y_deepfm_pos - y) ** 2) * score).sum()
+    loss_y = (((y_deepfm_pos - y) ** 2) * score).sum()  # 这里的score是逆倾向得分，即1/P,其中P是物品被曝光的概率
     loss_y_neg = (((y_deepfm_neg - 0) ** 2)).sum()
 
     loss = loss_y + loss_y_neg

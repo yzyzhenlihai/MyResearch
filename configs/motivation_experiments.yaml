@@ -1,0 +1,66 @@
+env: KuaiEnv-v0
+user_model_name: DeepFM
+read_message: pointneg
+seed: 2023
+cpu: true
+cuda: 0
+is_userinfo: false
+random_init: true
+
+analysis_data_source: grid
+policy_checkpoint_path: ""
+policy_checkpoint_dir: saved_models/KuaiEnv-v0/DORL
+policy_allow_random_init_for_rollout: false
+policy_rollout_n_steps: 2048
+policy_rollout_env_num: 32
+policy_deterministic_eval: false
+policy_remove_recommended_ids: false
+
+primary_uncertainty_source: ensemble_disagreement
+uncertainty_source: ensemble_disagreement
+appendix_uncertainty_sources: [variance_head]
+oracle_reward_for_error: watch_ratio_normed
+oracle_reward_for_ranking: watch_ratio_normed
+decision_cost_reward: watch_ratio
+cost_primary_risk: local_pairwise_flip
+
+topk: 20
+shortlist_topl: 100
+evaluation_slice: shortlist_union
+pairwise_mode: local_topl
+bucket_count: 10
+high_error_quantile: 0.8
+high_flip_quantile: 0.8
+support_quantiles: [0.2, 0.8]
+support_quantile_mode: per_user
+margin_quantiles: [0.2, 0.8]
+margin_quantile_mode: per_user
+conditional_support_slice: small_margin
+
+cost_lambdas: [0.1, 0.2, 0.5, 1.0]
+cost_compare_modes: [soft_penalty, hard_mask]
+cost_budget_quantiles: [0.05, 0.10, 0.20]
+exposure_weight_scheme: log_discount
+
+output_dir: results/motivation_kuairec_dorl_v2_full
+baseline_results_dir: results/motivation_kuairec_dorl_full
+run_subset_ablation: true
+subset_ablation_output_dir: results/motivation_kuairec_dorl_v2_ablation
+ablation_max_users: 64
+ablation_subset_items: 512
+max_users: 0
+subset_items: 0
+smoke_test: false
+
+verify_ood: true
+big_chunksize: 2000000
+knn_k: 20
+tau_support: auto
+
+forward_check_users: 3
+forward_check_items: 64
+forward_allclose_atol: 1.0e-5
+ensemble_user_batch_size: 32
+ensemble_eval_batch_size: 8192
+
+run_rollout_return: false

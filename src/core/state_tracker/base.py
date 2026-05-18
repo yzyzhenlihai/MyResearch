@@ -161,6 +161,9 @@ class StateTracker_Base(nn.Module):
 
     def convert_to_k_state_embedding(self, buffer=None, indices=None, is_obs=None, batch=None,
                                      use_batch_in_statetracker=False, is_train=True):
+        """
+        该函数的作用是为推荐系统里的强化学习智能体（Agent）构建一个“记忆”
+        """
         # Planning: indices = last_indices
         # Learning: indices = current_indices
         if use_batch_in_statetracker:  # when collector collects the data, batch is not None.
@@ -169,17 +172,18 @@ class StateTracker_Base(nn.Module):
             rew_all = batch.rew_prev
             live_mat = np.ones([1, len(user_item_pair_all)], dtype=bool)
             assert is_obs == True
-        else:
+        else: # 在训练阶段
             user_item_pair_all = np.zeros([0, 2], dtype=int)
             rew_all = np.zeros([0])
             live_mat = np.zeros([0, len(indices)], dtype=bool)
 
         if len(buffer) > 0:
             assert indices is not None
-            index = indices
+            index = indices  # 当前时间步
             live_ids = np.ones_like(index, dtype=bool)
 
             while any(live_ids) and len(live_mat) < self.window_size:
+                # 1. 从 Buffer 提取当前 index 的数据 (用户ID, 物品ID, 奖励)
                 if is_obs:  # modeling the obs in the batch
                     user_item_pair = buffer[index].obs
                     rew = buffer.rew_prev[index]
@@ -196,14 +200,15 @@ class StateTracker_Base(nn.Module):
 
                 dead = buffer.is_start[index]
                 live_ids[dead] = False
+                # 指针前移，跳到上一个时间步t-1
                 index = buffer.prev(index)
 
-        user_all = np.expand_dims(user_item_pair_all[:, 0], -1)
-        item_all = np.expand_dims(user_item_pair_all[:, 1], -1)
+        user_all = np.expand_dims(user_item_pair_all[:, 0], -1) # 把用户单独取出来，并在最后加上一维(N,1)
+        item_all = np.expand_dims(user_item_pair_all[:, 1], -1) # 把item单独取出来
 
-        e_i = self.get_embedding(item_all, "action")
+        e_i = self.get_embedding(item_all, "action") # 将动作转化为嵌入向量
 
-        if self.use_userEmbedding:
+        if self.use_userEmbedding: # 默认是不使用用户嵌入
             e_u = self.get_embedding(user_all, "user")
             s_t = torch.cat([e_u, e_i], dim=-1)
         else:
@@ -213,7 +218,7 @@ class StateTracker_Base(nn.Module):
         e_r = self.get_embedding(rew_matrix, "feedback")
 
         normed_r = self.get_normed_reward(e_r, is_train=is_train)
-
+        # 对特征进行融合
         if self.reward_handle == "mul":
             state_flat = s_t * normed_r
         elif self.reward_handle == "cat":
@@ -233,7 +238,7 @@ class StateTracker_Base(nn.Module):
 
         len_states = mask.sum(0).squeeze(-1).cpu().numpy()
         mask = mask.swapaxes(0, 1)
-
+        # 将到序翻转为正序
         emb_state_reverse = reverse_padded_sequence(emb_state, len_states)
         seq = emb_state_reverse
 

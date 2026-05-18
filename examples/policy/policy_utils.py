@@ -9,6 +9,7 @@ import socket
 import sys
 import time
 import argparse
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -37,9 +38,113 @@ from src.tianshou.tianshou.trainer import onpolicy_trainer, offpolicy_trainer
 from src.tianshou.tianshou.trainer.offline import offline_trainer
 
 from src.core.util.utils import create_dir
+from src.core.util.wandb_utils import load_wandb
 import logzero
 from logzero import logger
+from omegaconf import open_dict
 
+wandb = load_wandb(repo_root=Path(__file__).resolve().parents[2])
+
+OFFPOLICY_COLLECT_MODE_STEP = "step"
+"""离策略训练按 transition 数收集样本的模式名。"""
+
+OFFPOLICY_COLLECT_MODE_EPISODE = "episode"
+"""离策略训练按完整轨迹数收集样本的模式名。"""
+
+OFFPOLICY_COLLECT_MODES = (
+    OFFPOLICY_COLLECT_MODE_STEP,
+    OFFPOLICY_COLLECT_MODE_EPISODE,
+)
+"""离策略训练允许的 collect 模式集合。"""
+
+
+def _get_active_wandb_run():
+    """返回当前激活的 wandb run；未初始化时返回空。"""
+
+    if wandb is None:
+        return None
+    return getattr(wandb, "run", None)
+
+
+def _to_wandb_scalar(value):
+    """把 trainer 结果字典里的值转换成适合 wandb 的标量。"""
+
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, (float, int, bool)):
+        return value
+    return None
+
+
+def _log_final_result_to_wandb(result):
+    """把 trainer 最终结果汇总写入 wandb。"""
+
+    active_run = _get_active_wandb_run()
+    if active_run is None:
+        return
+
+    final_metrics = {}
+    for key, value in result.items():
+        scalar_value = _to_wandb_scalar(value)
+        if scalar_value is None:
+            continue
+        final_metrics[f"final/{key}"] = scalar_value
+
+    if not final_metrics:
+        return
+
+    wandb.log(final_metrics)
+    for key, value in final_metrics.items():
+        active_run.summary[key] = value
+
+
+def _build_offpolicy_collect_kwargs(args):
+    """构造离策略训练的 collect 参数。
+
+    Args:
+        args (argparse.Namespace): 训练配置，需包含
+            `offpolicy_collect_mode`、`step_per_collect` 与
+            `episode_per_collect` 字段。
+
+    Returns:
+        dict: 传递给 `offpolicy_trainer` 的 collect 相关关键字参数。
+
+    Raises:
+        ValueError: 当 collect 模式非法，或对应模式下的收集数量不是正整数时抛出。
+    """
+
+    collect_mode = getattr(args, "offpolicy_collect_mode", OFFPOLICY_COLLECT_MODE_STEP)
+    if collect_mode not in OFFPOLICY_COLLECT_MODES:
+        raise ValueError(
+            f"Unsupported offpolicy collect mode: {collect_mode}. "
+            f"Expected one of {OFFPOLICY_COLLECT_MODES}."
+        )
+
+    if collect_mode == OFFPOLICY_COLLECT_MODE_STEP:
+        step_per_collect = int(getattr(args, "step_per_collect", 0))
+        if step_per_collect <= 0:
+            raise ValueError(
+                "step_per_collect must be a positive integer when "
+                "offpolicy_collect_mode='step'."
+            )
+        return {
+            "step_per_collect": step_per_collect,
+            "episode_per_collect": None,
+        }
+
+    episode_per_collect = int(getattr(args, "episode_per_collect", 0))
+    if episode_per_collect <= 0:
+        raise ValueError(
+            "episode_per_collect must be a positive integer when "
+            "offpolicy_collect_mode='episode'."
+        )
+    return {
+        "step_per_collect": None,
+        "episode_per_collect": episode_per_collect,
+    }
 
 def get_args_all(trainer="onpolicy"):
     parser = argparse.ArgumentParser()
@@ -132,6 +237,12 @@ def get_args_all(trainer="onpolicy"):
     parser.add_argument('--gamma', type=float, default=0.9)
     parser.add_argument('--step-per-epoch', type=int, default=(100000 if trainer == "onpolicy" else 10000))
     parser.add_argument('--step-per-collect', type=int, default=100)
+    parser.add_argument(
+        '--offpolicy_collect_mode',
+        type=str,
+        choices=list(OFFPOLICY_COLLECT_MODES),
+        default=OFFPOLICY_COLLECT_MODE_STEP,
+    )
     parser.add_argument('--repeat-per-collect', type=int, default=1)
     parser.add_argument('--logdir', type=str, default='log')
 
@@ -161,6 +272,7 @@ def prepare_dir_log(args):
 
 
 def prepare_user_model(args):
+    
     args.device = torch.device("cuda:{}".format(args.cuda) if torch.cuda.is_available() else "cpu")
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -203,7 +315,10 @@ def prepare_train_envs(args, ensemble_models, env, kwargs_um):
 
     return train_envs
 
-
+"""
+构造测试环境
+这里测试环境就是KuaiEnv/KuaiRand定义的环境，里面的mat是user-item的rewards
+"""
 def prepare_test_envs(args, env, kwargs_um):
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -239,18 +354,121 @@ def setup_state_tracker(args, ensemble_models, env, train_envs, test_envs_dict, 
     if use_buffer_in_train:
         buffer = train_envs
         train_envs = None
-
-    saved_embedding = ensemble_models.load_val_user_item_embedding(freeze_emb=args.freeze_emb)
+    # feat_user(3327,41) feat_item(1411, 8) 
+    saved_embedding = ensemble_models.load_val_user_item_embedding(freeze_emb=args.freeze_emb) # 这边加载的是验证集的物品嵌入
     if args.use_pretrained_embedding:
         # if args.which_tracker.lower() == "avg":
         user_columns, action_columns, feedback_columns, have_user_embedding, have_action_embedding, have_feedback_embedding = \
-            get_dataset_columns(saved_embedding["feat_user"].weight.shape[1],
-                                saved_embedding["feat_item"].weight.shape[1],
+            get_dataset_columns(saved_embedding["feat_user"].weight.shape[1], # 8
+                                saved_embedding["feat_item"].weight.shape[1], # 41
                                 env.mat.shape[0], env.mat.shape[1], envname=args.env)
     else:
         user_columns, action_columns, feedback_columns, have_user_embedding, have_action_embedding, have_feedback_embedding = \
             get_dataset_columns(args.embedding_dim, args.embedding_dim, env.mat.shape[0], env.mat.shape[1],
                                 envname=args.env)
+
+    args.action_shape = action_columns[0].vocabulary_size # 等于item的数量 KuaiEnv 3327
+    args.state_dim = action_columns[0].embedding_dim # KuaiEnv 41
+
+    if args.use_userEmbedding:
+        args.state_dim = action_columns[0].embedding_dim + saved_embedding.feat_user.weight.shape[1]
+    train_max = None
+    train_min = None
+    test_max = None
+    test_min = None
+    if train_envs is not None:
+        if use_buffer_in_train:
+            train_max = buffer.rew.max()
+            train_min = buffer.rew.min()
+        else:
+            train_max = train_envs.get_env_attr("MAX_R")[0] - train_envs.get_env_attr("MIN_R")[0]
+            train_min = 0
+
+    if test_envs_dict is not None:
+        test_max = test_envs_dict['FB'].get_env_attr("mat")[0].max()
+        test_min = test_envs_dict['FB'].get_env_attr("mat")[0].min()
+
+    if args.which_tracker.lower() == "caser":
+        assert args.window_size >= max(args.filter_sizes)
+        state_tracker = StateTracker_Caser(user_columns, action_columns, feedback_columns, args.state_dim,
+                                           train_max, train_min, test_max, test_min, reward_handle=args.reward_handle,
+                                           saved_embedding=saved_embedding,
+                                           device=args.device,
+                                           window_size=args.window_size,
+                                           filter_sizes=args.filter_sizes, num_filters=args.num_filters,
+                                           dropout_rate=args.dropout_rate).to(args.device)
+    elif args.which_tracker.lower() == "gru":
+        state_tracker = StateTracker_GRU(user_columns, action_columns, feedback_columns, args.state_dim,
+                                         train_max, train_min, test_max, test_min, reward_handle=args.reward_handle,
+                                         saved_embedding=saved_embedding,
+                                         device=args.device,
+                                         window_size=args.window_size).to(args.device)
+    elif args.which_tracker.lower() == "sasrec":
+        state_tracker = StateTracker_SASRec(user_columns, action_columns, feedback_columns, args.state_dim,
+                                            train_max, train_min, test_max, test_min, reward_handle=args.reward_handle,
+                                            saved_embedding=saved_embedding,
+                                            device=args.device, window_size=args.window_size,
+                                            dropout_rate=args.dropout_rate, num_heads=args.num_heads).to(args.device)
+    elif args.which_tracker.lower() == "nextitnet":
+        state_tracker = StateTracker_NextItNet(user_columns, action_columns, feedback_columns, args.state_dim,
+                                               train_max, train_min, test_max, test_min,
+                                               reward_handle=args.reward_handle, saved_embedding=saved_embedding,
+                                               device=args.device, window_size=args.window_size,
+                                               dilations=args.dilations).to(args.device)
+    elif args.which_tracker.lower() == "avg":
+        assert args.use_pretrained_embedding
+        state_tracker = StateTrackerAvg(user_columns, action_columns, feedback_columns, args.state_dim,
+                                        train_max, train_min, test_max, test_min, reward_handle=args.reward_handle,
+                                        saved_embedding=saved_embedding,
+                                        device=args.device, window_size=args.window_size,
+                                        use_userEmbedding=args.use_userEmbedding).to(args.device)
+    else:
+        return None
+
+    state_tracker.set_need_normalization(args.need_state_norm)
+    args.state_dim = state_tracker.final_dim
+
+    return state_tracker
+
+
+
+def setup_state_tracker_bigmatrix(args, ensemble_models, env=None, train_envs=None, test_envs_dict=None,
+                                  use_buffer_in_train=False, use_training_embedding=True):
+    """
+    Variant of `setup_state_tracker` that loads embeddings aligned with the (big) training matrix.
+
+    - If `use_training_embedding` is True, this loads embeddings saved for the training set
+      via `EnsembleModel.load_user_item_embedding()`; otherwise it falls back to val embeddings.
+    - If `env` is None, the function infers user/item counts from the saved embedding sizes.
+    This function does not modify the original `setup_state_tracker` so other code paths remain unchanged.
+    """
+    if use_buffer_in_train:
+        buffer = train_envs
+        train_envs = None
+
+    # load embeddings for big matrix (training) or val depending on flag
+    if use_training_embedding:
+        saved_embedding = ensemble_models.load_user_item_embedding(freeze_emb=args.freeze_emb)
+    else:
+        saved_embedding = ensemble_models.load_val_user_item_embedding(freeze_emb=args.freeze_emb)
+
+    # determine user/item counts and embedding dims
+    item_emb_dim = saved_embedding["feat_item"].weight.shape[1]
+    user_emb_dim = saved_embedding["feat_user"].weight.shape[1]
+
+    if env is not None:
+        num_users, num_items = env.mat.shape[0], env.mat.shape[1]
+    else:
+        # infer counts from the pretrained embedding weight sizes
+        num_users = saved_embedding["feat_user"].weight.shape[0]
+        num_items = saved_embedding["feat_item"].weight.shape[0]
+
+    if args.use_pretrained_embedding:
+        user_columns, action_columns, feedback_columns, have_user_embedding, have_action_embedding, have_feedback_embedding = \
+            get_dataset_columns(user_emb_dim, item_emb_dim, num_users, num_items, envname=args.env)
+    else:
+        user_columns, action_columns, feedback_columns, have_user_embedding, have_action_embedding, have_feedback_embedding = \
+            get_dataset_columns(args.embedding_dim, args.embedding_dim, num_users, num_items, envname=args.env)
 
     args.action_shape = action_columns[0].vocabulary_size
     args.state_dim = action_columns[0].embedding_dim
@@ -258,15 +476,23 @@ def setup_state_tracker(args, ensemble_models, env, train_envs, test_envs_dict, 
     if args.use_userEmbedding:
         args.state_dim = action_columns[0].embedding_dim + saved_embedding.feat_user.weight.shape[1]
 
-    if use_buffer_in_train:
-        train_max = buffer.rew.max()
-        train_min = buffer.rew.min()
-    else:
-        train_max = train_envs.get_env_attr("MAX_R")[0] - train_envs.get_env_attr("MIN_R")[0]
-        train_min = 0
-    test_max = test_envs_dict['FB'].get_env_attr("mat")[0].max()
-    test_min = test_envs_dict['FB'].get_env_attr("mat")[0].min()
+    train_max = None
+    train_min = None
+    test_max = None
+    test_min = None
+    if train_envs is not None:
+        if use_buffer_in_train:
+            train_max = buffer.rew.max()
+            train_min = buffer.rew.min()
+        else:
+            train_max = train_envs.get_env_attr("MAX_R")[0] - train_envs.get_env_attr("MIN_R")[0]
+            train_min = 0
 
+    if test_envs_dict is not None:
+        test_max = test_envs_dict['FB'].get_env_attr("mat")[0].max()
+        test_min = test_envs_dict['FB'].get_env_attr("mat")[0].min()
+
+    # build the same set of trackers as setup_state_tracker
     if args.which_tracker.lower() == "caser":
         assert args.window_size >= max(args.filter_sizes)
         state_tracker = StateTracker_Caser(user_columns, action_columns, feedback_columns, args.state_dim,
@@ -379,16 +605,24 @@ def learn_policy(args, env, dataset, policy, train_collector, test_collector_set
         )
 
     elif trainer == "offpolicy":
+        collect_kwargs = _build_offpolicy_collect_kwargs(args)
+        logger.info(
+            "Use offpolicy collect mode=%s, step_per_collect=%s, episode_per_collect=%s",
+            args.offpolicy_collect_mode,
+            collect_kwargs["step_per_collect"],
+            collect_kwargs["episode_per_collect"],
+        )
         result = offpolicy_trainer(
             policy,
             train_collector,
             test_collector_set,
             args.epoch,
             args.step_per_epoch,
-            args.step_per_collect,
+            collect_kwargs["step_per_collect"],
             args.test_num,
             args.batch_size,
             update_per_step=args.update_per_step,
+            episode_per_collect=collect_kwargs["episode_per_collect"],
             # stop_fn=stop_fn,	
             # save_best_fn=save_best_fn,	
             # logger=logger1,	
@@ -405,3 +639,4 @@ def learn_policy(args, env, dataset, policy, train_collector, test_collector_set
     print(__file__)
     pprint.pprint(result)
     logger.info(result)
+    _log_final_result_to_wandb(result)

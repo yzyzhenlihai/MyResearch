@@ -101,10 +101,25 @@ class EnsembleModel():
             # model.linear_model.device = "cpu"
             # model.linear.device = "cpu"
             #
-
+    
+    # 加载验证集的嵌入 （稠密小矩阵）
     def load_val_user_item_embedding(self, model_i=0, freeze_emb=True):
         user_embedding = torch.load(get_detailed_path(self.USER_VAL_EMBEDDING_PATH, model_i))
         item_embedding = torch.load(get_detailed_path(self.ITEM_VAL_EMBEDDING_PATH, model_i))
+        saved_embedding = torch.nn.ModuleDict(
+            {"feat_user": torch.nn.Embedding.from_pretrained(user_embedding, freeze=freeze_emb),
+             "feat_item": torch.nn.Embedding.from_pretrained(item_embedding, freeze=freeze_emb)})
+        return saved_embedding
+    # 加载训练集的嵌入（稀疏大矩阵）
+    def load_user_item_embedding(self, model_i=0, freeze_emb=True):
+        """Load user/item embeddings saved for the training set (not the val set).
+
+        This mirrors `load_val_user_item_embedding` but reads the paths
+        `USER_EMBEDDING_PATH` / `ITEM_EMBEDDING_PATH` instead of the val versions.
+        Use this when you need embeddings that align with the (big) training matrix.
+        """
+        user_embedding = torch.load(get_detailed_path(self.USER_EMBEDDING_PATH, model_i))
+        item_embedding = torch.load(get_detailed_path(self.ITEM_EMBEDDING_PATH, model_i))
         saved_embedding = torch.nn.ModuleDict(
             {"feat_user": torch.nn.Embedding.from_pretrained(user_embedding, freeze=freeze_emb),
              "feat_item": torch.nn.Embedding.from_pretrained(item_embedding, freeze=freeze_emb)})
@@ -166,7 +181,7 @@ class EnsembleModel():
                                                             x_columns, y_columns, use_auxiliary=use_auxiliary)
 
         prediction, var_max = self.get_prediction_and_maxvar(mean_mat_list, var_mat_list, deterministic)
-
+        # 保存的是验证集的mat，用于后续policy训练
         with open(self.PREDICTION_MAT_PATH, "wb") as f:
             pickle.dump(prediction, f)
         with open(self.VAR_MAT_PATH, "wb") as f:

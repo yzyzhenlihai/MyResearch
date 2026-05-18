@@ -173,9 +173,9 @@ def prepare_dir_log(args):
     logzero.logger.info(json.dumps(vars(args), indent=2))
     return MODEL_SAVE_PATH, logger_path
 
-
+# 加载训练数据集
 def load_dataset_train(args, dataset, tau, entity_dim, feature_dim, MODEL_SAVE_PATH, DATAPATH):
-    user_features, item_features, reward_features = dataset.get_features(args.is_userinfo)
+    user_features, item_features, reward_features = dataset.get_features(args.is_userinfo) # 返回的是特征名称
     df_train, df_user, df_item, list_feat = dataset.get_train_data()
 
     if "time_ms" in df_train.columns:
@@ -223,6 +223,7 @@ def load_dataset_train(args, dataset, tau, entity_dim, feature_dim, MODEL_SAVE_P
     return dataset, df_user, df_item, x_columns, y_columns, ab_columns
 
 def load_dataset_train_IPS(args, dataset, tau, entity_dim, feature_dim, MODEL_SAVE_PATH, DATAPATH):
+    # 对于KuaiRand和KuaiEnv,is_userinfo=False
     user_features, item_features, reward_features = dataset.get_features(args.is_userinfo)
     df_train, df_user, df_item, list_feat = dataset.get_train_data()
 
@@ -269,9 +270,10 @@ def load_dataset_train_IPS(args, dataset, tau, entity_dim, feature_dim, MODEL_SA
 
     return dataset, df_user, df_item, x_columns, y_columns, ab_columns
 
+# 加载验证数据集
 def load_dataset_val(args, dataset, entity_dim, feature_dim):
     user_features, item_features, reward_features = dataset.get_features(args.is_userinfo)
-    df_val, df_user_val, df_item_val, list_feat = dataset.get_val_data()
+    df_val, df_user_val, df_item_val, list_feat = dataset.get_val_data() 
 
     assert user_features[0] == "user_id"
     assert item_features[0] == "item_id"

@@ -57,7 +57,14 @@ class KuaiData(BaseData):
         # if is_require_feature_domination:
         #     item_feat_domination = self.get_domination(df_data, df_item)
         #     return df_data, df_user, df_item, list_feat, item_feat_domination
-
+        df_data["terminals"] = False
+            #loc = cnts.iloc[0]-1
+            # for i in range(len(cnts)):
+            #     df_raw["done"].iloc[loc] = 1
+            #     if(i+1 < len(cnts)):
+            #         loc += cnts.iloc[i+1]
+            #3. 利用user model计算出每个transition的奖励
+        df_data["rewards"] = df_data["watch_ratio_normed"]
         return df_data, df_user, df_item, list_feat
 
     def get_domination(self):
@@ -163,6 +170,10 @@ class KuaiData(BaseData):
         return df_item
 
     def get_lbe(self):
+        """
+        创建并训练两个LabelEncoder对象（分别用于user_id和item_id）,
+        以便将原始的、可能是非连续或非数值型的ID映射为连续整数索引（0, 1, 2...）。
+        """
         if not os.path.isfile(os.path.join(DATAPATH, "user_id_small.csv")) or not os.path.isfile(
                 os.path.join(DATAPATH, "item_id_small.csv")):
             small_path = os.path.join(DATAPATH, "small_matrix_processed.csv")
@@ -183,8 +194,31 @@ class KuaiData(BaseData):
         lbe_item = LabelEncoder()
         lbe_item.fit(item_id_small["item_id_small"])
 
-        return lbe_user, lbe_item
+        return lbe_user, lbe_item # 后续在访问small mat的时候，需要进行转换再访问
 
+    def get_dataset(self):
+    #1. 加载原始数据集
+        if os.path.isfile(os.path.join(PRODATAPATH, "DM_KuaiEnv-v0_train_processed.csv")):
+            df_raw = pd.read_csv(os.path.join(PRODATAPATH, "DM_KuaiEnv-v0_train_processed.csv"))
+            return df_raw
+        else: 
+            filename = os.path.join(DATAPATH, "big_matrix_processed.csv")
+            df_train = get_df_data(filename,
+                                usecols=['user_id', 'item_id', 'timestamp', 'watch_ratio_normed', 'duration_normed'])
+            df_raw = df_train[["user_id", "item_id", "watch_ratio_normed"]]
+            #2. 加入terminals列，表示是否轨迹结束，每个用户的最后一个动作为terminal
+            # 这里默认轨迹没有自然结束，都是人为结束的
+            cnts = df_raw["user_id"].value_counts().sort_index()
+            df_raw["terminals"] = 0
+            #loc = cnts.iloc[0]-1
+            # for i in range(len(cnts)):
+            #     df_raw["done"].iloc[loc] = 1
+            #     if(i+1 < len(cnts)):
+            #         loc += cnts.iloc[i+1]
+            #3. 利用user model计算出每个transition的奖励
+            df_raw["rewards"] = df_raw["watch_ratio_normed"]
+            df_raw.to_csv(os.path.join(PRODATAPATH, "DM_KuaiEnv-v0_train_processed.csv"), index=False)
+            return df_raw
 
     @staticmethod
     def load_mat():
@@ -298,6 +332,7 @@ class KuaiData(BaseData):
 
         return None
 
+    
 
 
 

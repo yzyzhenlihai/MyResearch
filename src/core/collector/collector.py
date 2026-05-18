@@ -204,8 +204,9 @@ class Collector(object):
         gym_reset_kwargs = gym_reset_kwargs if gym_reset_kwargs else {}
         obs_reset, info = self.env.reset(global_ids, **gym_reset_kwargs)
 
-
-        self.data.obs[local_ids] = obs_reset
+        # collector 会在本轮末尾统一执行 `self.data.obs = self.data.obs_next`，
+        # 因此这里需要直接覆写 `obs_next`，保证结束的环境在下一轮看到的是 reset 后的首状态。
+        self.data.obs_next[local_ids] = obs_reset
         self.data.info[local_ids] = info
         self.data.rew_prev[local_ids] = np.zeros(len(obs_reset))
         self.data.is_start[local_ids] = np.ones(len(obs_reset), dtype=bool)
@@ -406,6 +407,8 @@ class Collector(object):
                 self.data, buffer_ids=ready_env_ids
                 )
             self.data.is_start = np.zeros(len(self.data), dtype=bool)
+            # 下一轮构造状态时需要上一轮即时奖励，因此这里把当前 reward 滚动为 rew_prev。
+            self.data.rew_prev = np.array(self.data.rew, copy=True)
 
             # collect statistics
             step_count += len(ready_env_ids)

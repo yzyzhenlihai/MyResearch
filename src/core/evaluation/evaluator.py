@@ -222,6 +222,8 @@ class Evaluator_User_Experience():
 
         results.update(results_all)
 
+        return results
+
 
 def save_model_fn(epoch, policy, model_save_path, optim, state_tracker, is_save=False):
     if not is_save:

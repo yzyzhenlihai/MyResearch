@@ -85,7 +85,7 @@ def test_static_model_in_RL_env(model, env, dataset_val, is_softmax=True, epsilo
 
     eval_result_standard = interactive_evaluation(model, env, dataset_val, is_softmax, epsilon, is_ucb, k,
                                                   need_transform, num_trajectory, item_feat_domination,
-                                                  remove_recommended=False, force_length=0, top_rate=top_rate, draw_bar=draw_bar)
+                                                  remove_recommended=False, force_length=0, top_rate=top_rate, draw_bar=draw_bar) # remove_recommended表示同一个用户会话中，模型不会重复推荐已经推荐过的物品
 
     # No overlap and end with the env rule
     eval_result_NX_0 = interactive_evaluation(model, env, dataset_val, is_softmax, epsilon, is_ucb, k,

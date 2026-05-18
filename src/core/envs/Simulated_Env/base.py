@@ -86,7 +86,7 @@ class BaseSimulatedEnv(gym.Env):
             self._add_action_to_history(t, action)
 
         # 2. Predict click score, i.e, reward
-        pred_reward = self._compute_pred_reward(action)
+        pred_reward = self._compute_pred_reward(action) # 计算当前动作的奖励
 
         self.cum_reward += pred_reward
         self.total_turn = self.env_task.total_turn

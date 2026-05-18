@@ -40,3 +40,7 @@ events.*
 *.pickle
 temp.*
 *.dat
+
+
+wandb/
+docs/

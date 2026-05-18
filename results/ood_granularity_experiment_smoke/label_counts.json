@@ -1,0 +1,16 @@
+{
+  "main_label_counts": {
+    "Other": 453,
+    "NH": 50,
+    "Near-Low": 48,
+    "DO": 31,
+    "Far-High": 14
+  },
+  "quadrant_label_counts": {
+    "Other": 459,
+    "Near-Low": 54,
+    "Near-High": 49,
+    "Far-Low": 19,
+    "Far-High": 15
+  }
+}

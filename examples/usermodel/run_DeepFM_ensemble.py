@@ -92,15 +92,26 @@ def main(args, is_save=True):
     # %% 2. Prepare dataset
     env, dataset, kwargs_um = get_true_env(args, read_user_num=None)
 
+    """
+    加载训练集和验证集，df_user和df_item分别是用户和物品的特征数据,索引为ID
+    代码会明确输入特征（x_columns）、目标标签（y_columns）以及可能的A/B测试特征（ab_columns）的结构和类型。
+    """
     dataset_train, dataset_val, df_user, df_item, df_user_val, df_item_val, x_columns, y_columns, ab_columns = \
-        prepare_dataset(args, dataset, MODEL_SAVE_PATH, DATAPATH)  # TODO 修改简化！
+        prepare_dataset(args, dataset, MODEL_SAVE_PATH, DATAPATH)  # TODO 修改简化！ 
 
     # %% 3. Setup model
     task, task_logit_dim, is_ranking = get_task(args.env, args.yfeat)
+    """
+    初始化一个 EnsembleModel 对象。这不是单个模型，而是一个由多个（n_models个）结构相同的深度学习网络组成的模型集成
+    """
     ensemble_models = setup_user_model(args, x_columns, y_columns, ab_columns,
                                         task, task_logit_dim, is_ranking, MODEL_SAVE_PATH)
 
     item_feat_domination = dataset.get_domination()
+    """
+    将test_static_model_in_RL_env函数打包，使得在训练过程中，可以定期调用这个函数，
+    把用户模型当作一个智能体（Agent）放入模拟环境中进行测试，观察其表现。
+    """
     ensemble_models.compile_RL_test(
         functools.partial(test_static_model_in_RL_env, env=env, dataset_val=dataset_val, is_softmax=args.is_softmax,
                           epsilon=args.epsilon, is_ucb=args.is_ucb, need_transform=args.need_transform,
@@ -108,7 +119,9 @@ def main(args, is_save=True):
                           force_length=args.force_length, top_rate=args.top_rate))
 
     # %% 5. Learn and evaluate model
-
+    """
+    启动模型训练
+    """
     ensemble_models.fit_data(dataset_train, dataset_val,
                             batch_size=args.batch_size, epochs=args.epoch, shuffle=True,
                             callbacks=[LoggerEval_UserModel()])
@@ -120,8 +133,8 @@ def main(args, is_save=True):
 
 
 if __name__ == '__main__':
-    args_all = get_args_all()
-    args = get_args_dataset_specific(args_all.env)
+    args_all = get_args_all() # 通用脚本参数
+    args = get_args_dataset_specific(args_all.env) # 针对特定数据集的参数
     args_all.__dict__.update(args.__dict__)
 
     try:

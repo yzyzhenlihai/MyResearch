@@ -31,7 +31,7 @@ class KuaiEnv(BaseEnv):
         # smallmat shape: (1411, 3327)
         super(KuaiEnv, self).__init__(num_leave_compute, leave_threshold, max_turn, random_init)
 
-    @staticmethod
+    @staticmethod 
     def load_env_data():
         mat, lbe_user, lbe_item = KuaiData.load_mat()
         list_feat, df_feat = KuaiData.load_category()

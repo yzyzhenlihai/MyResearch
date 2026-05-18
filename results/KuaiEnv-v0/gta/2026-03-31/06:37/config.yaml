@@ -1,0 +1,76 @@
+construct_diffusion_model:
+  normalizer_type: standard
+  denoising_network:
+    _target_: src.core.diffusion.denoiser_network.mixer.MixerUnet
+    horizon: 31
+    d_in: 4
+    dim: 16
+    cond_dim: 1
+    condition_dropout: 0.25
+    use_dropout: true
+    force_dropout: false
+    learned_sinusoidal_cond: false
+    random_fourier_features: true
+    learned_sinusoidal_dim: 16
+  disable_terminal_norm: true
+ElucidatedDiffusion:
+  num_sample_steps: 128
+  sigma_data: 1.0
+  S_churn: 80
+  S_tmin: 0.05
+  S_tmax: 50
+  S_noise: 1.003
+Trainer:
+  train_batch_size: 64
+  train_lr: 0.0003
+  lr_scheduler: cosinewarmup
+  weight_decay: 0
+  train_num_steps: 1000000
+  save_and_sample_every: 100000
+  reweighted_training: false
+SimpleDiffusionGenerator:
+  num_sample_steps: 128
+  sample_batch_size: 512
+  noise_level: 0.75
+  amplify_returnscale: 1.3
+  save_num_transitions: 500000
+  temperature: 1.0
+  weighted_sampling: false
+  state_conditioning: false
+  with_strategy: false
+  weight_param: 50.0
+Dataset:
+  seq_len: 31
+  reward_scale: 0.01
+  batch_size: 64
+  num_workers: 4
+  normalizer_type: standard
+  modalities:
+  - observations
+  - actions
+  - rewards
+  discounted_return: true
+  gamma: 0.99
+  restore_rewards: false
+  penalty: 100
+RSEnvConfig:
+  env: KuaiEnv-v0
+  num_leave_compute: 1
+  leave_threshold: 0
+  max_turn: 30
+  random_init: true
+  cuda: 0
+  seed: 2025
+  user_model_name: DeepFM
+  read_message: pointneg
+  trajectory_source: small
+  which_tracker: avg
+  reward_handle: cat
+  embedding_dim: 32
+  use_userEmbedding: false
+  window_size: 3
+  freeze_emb: true
+  use_pretrained_embedding: true
+  need_state_norm: false
+  buffer_size: 100000
+  training_num: 1

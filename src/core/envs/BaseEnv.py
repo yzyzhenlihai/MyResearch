@@ -7,10 +7,10 @@ import torch
 class BaseEnv(ABC, gym.Env):
     def __init__(self, num_leave_compute, leave_threshold, max_turn, random_init):
         
-        self.max_turn = max_turn
+        self.max_turn = max_turn # 最大交互轮数
         self.random_init = random_init
-        
-        self.observation_space = gym.spaces.Box(low=0, high=len(self.mat) - 1, shape=(1,), dtype=np.int32)
+        # self.mat是user model预测的奖励矩阵，self.mat.shape[1]是物品数量，self.mat.shape[0]是用户数量
+        self.observation_space = gym.spaces.Box(low=0, high=len(self.mat) - 1, shape=(1,), dtype=np.int32) 
         self.action_space = gym.spaces.Box(low=0, high=self.mat.shape[1] - 1, shape=(1,), dtype=np.int32)
 
         self.num_leave_compute = num_leave_compute

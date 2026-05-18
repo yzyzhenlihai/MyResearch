@@ -81,7 +81,7 @@ def setup_policy_model(args, state_tracker, train_envs, test_envs_dict):
     )
     policy.set_eps(args.explore_eps)
 
-    rec_policy = RecPolicy(args, policy, state_tracker)
+    rec_policy = RecPolicy(args, policy, state_tracker) # 用新的策略又包装了一下
 
     # Prepare the collectors and logs
     train_collector = Collector(

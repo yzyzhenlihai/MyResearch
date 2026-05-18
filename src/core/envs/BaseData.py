@@ -67,6 +67,9 @@ class BaseData(ABC):
 
         return item_feat_domination
     
+    def get_dataset(self):
+        pass
+
     @staticmethod
     def get_saved_distance_mat(mat, PRODATAPATH):
         distance_mat_path = os.path.join(PRODATAPATH, f"distance_mat.pickle")

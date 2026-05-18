@@ -44,9 +44,12 @@ class StateTrackerAvg(StateTracker_Base):
 
     def forward(self, buffer=None, indices=None, is_obs=None, batch=None, is_train=True, use_batch_in_statetracker=False, **kwargs):
 
+        # 获得历史序列的embedding
         seq, mask, len_states = self.convert_to_k_state_embedding(buffer, indices=indices, is_obs=is_obs, batch=batch, use_batch_in_statetracker=use_batch_in_statetracker, is_train=is_train)
-
+        # 对时间步维度求和
         state_sum = seq.sum(dim=1)
+        # 求平均值 (Batch_Size, Hidden_Dim) 它认为用户的当前兴趣等于过去 K 次交互物品特征的平均值。
         state_final = state_sum / torch.from_numpy(np.expand_dims(len_states, -1)).to(self.device)
         
         return state_final
+    
