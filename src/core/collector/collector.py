@@ -239,6 +239,49 @@ class Collector(object):
         # self.data.obs_next[local_ids] = obs_reset
         # self.data[local_ids] = batched_data
 
+    def _inject_darlr_context(self, ready_env_ids: np.ndarray) -> None:
+        """把 DARLR selector 上下文注入对应的向量环境。
+
+        Args:
+            ready_env_ids (np.ndarray): 当前 collect 循环中活跃的全局环境 id。
+
+        Returns:
+            None: 该函数仅通过 `set_env_attr` 修改底层环境属性。
+        """
+
+        if not hasattr(self.data.policy, "darlr_context"):
+            return
+        if not hasattr(self.env, "set_env_attr"):
+            return
+
+        context_batch = self.data.policy.darlr_context
+        for local_index, env_id in enumerate(ready_env_ids):
+            per_env_context = self._slice_darlr_context(context_batch, local_index)
+            self.env.set_env_attr("darlr_context", per_env_context, id=int(env_id))
+
+    @staticmethod
+    def _slice_darlr_context(context_batch: Batch, local_index: int) -> Dict[str, Any]:
+        """从 batch 级 DARLR context 中取出单个环境的上下文。
+
+        Args:
+            context_batch (Batch): `DARLRPolicy.forward()` 生成的上下文 batch。
+            local_index (int): 当前环境在活跃 batch 中的位置。
+
+        Returns:
+            Dict[str, Any]: 单环境上下文字典，可直接写入 env 属性。
+        """
+
+        per_env_context = {}
+        for key in context_batch.keys():
+            value = context_batch[key]
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            if isinstance(value, np.ndarray) and value.shape[0] > local_index:
+                per_env_context[key] = value[local_index]
+            else:
+                per_env_context[key] = value
+        return per_env_context
+
     def collect(
         self,
         n_step: Optional[int] = None,
@@ -364,6 +407,7 @@ class Collector(object):
 
             # get bounded and remapped actions first (not saved into buffer)
             action_remap = self.policy.map_action(self.data)  # RecPolicy transform!
+            self._inject_darlr_context(ready_env_ids)
 
             obs_next, rew, terminated, truncated, info = self.env.step(action_remap, ready_env_ids)
 

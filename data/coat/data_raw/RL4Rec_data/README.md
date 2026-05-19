@@ -1,1 +1,0 @@
-Note: The data file `coat_pseudoGT_ratingM.ascii` is sourced from the https://github.com/BetsyHJ/RL4Rec repository.

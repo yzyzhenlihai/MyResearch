@@ -97,8 +97,16 @@ def _log_final_result_to_wandb(result):
         return
 
     wandb.log(final_metrics)
+
+    # swanlab 与 wandb 的 run 对象接口不完全相同；没有 summary 时只记录曲线。
+    active_summary = getattr(active_run, "summary", None)
+    if active_summary is None:
+        return
     for key, value in final_metrics.items():
-        active_run.summary[key] = value
+        try:
+            active_summary[key] = value
+        except (TypeError, AttributeError):
+            return
 
 
 def _build_offpolicy_collect_kwargs(args):
