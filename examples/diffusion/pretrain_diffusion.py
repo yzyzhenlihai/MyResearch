@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import pickle
 import random
 import sys
@@ -55,8 +56,8 @@ DEFAULT_TRAJECTORY_DATASET_PATH = PROJECT_ROOT / "data/KuaiRec/data_processed/DM
 DEFAULT_SAVE_ROOT = PROJECT_ROOT / "saved_models"
 """默认模型保存根目录。"""
 
-DEFAULT_WANDB_PROJECT = "DOSER-Diffusion"
-"""可选实验日志后端的默认项目名。"""
+DEFAULT_SWANLAB_PROJECT = "DOSER-Diffusion"
+"""SwanLab 实验日志后端的默认项目名。"""
 
 DEFAULT_HIDDEN_DIM = 256
 """扩散网络的默认隐藏层维度。"""
@@ -127,11 +128,11 @@ class ArtifactPaths:
 
 
 class ExperimentTracker:
-    """管理可选的实验日志后端。
+    """管理可选的 SwanLab 实验日志后端。
 
-    该类默认不开启在线日志；只有当用户显式传入 `--enable_wandb`
-    时，才会尝试初始化 `wandb`。如果运行环境未安装 `wandb`，
-    会自动降级为仅控制台日志。
+    该类默认不开启在线日志；只有当用户显式传入 `--enable_swanlab`
+    或兼容别名 `--enable_wandb` 时，才会尝试初始化 `swanlab`。如果
+    运行环境未安装 `swanlab`，会自动降级为仅控制台日志。
     """
 
     def __init__(
@@ -140,14 +141,16 @@ class ExperimentTracker:
         project: str,
         run_name: str,
         config: Dict[str, Any],
+        mode: Optional[str] = None,
     ) -> None:
-        """初始化可选日志跟踪器。
+        """初始化可选 SwanLab 日志跟踪器。
 
         Args:
-            enabled (bool): 是否尝试启用在线实验日志。
-            project (str): 项目名。
+            enabled (bool): 是否尝试启用 SwanLab 实验日志。
+            project (str): SwanLab 项目名。
             run_name (str): 运行名。
             config (Dict[str, Any]): 配置快照。
+            mode (Optional[str]): 可选 SwanLab 运行模式，写入 `SWANLAB_MODE`。
 
         Returns:
             None
@@ -161,22 +164,30 @@ class ExperimentTracker:
         self._module = None
 
         if not enabled:
-            LOGGER.info("外部实验日志已关闭，仅保留控制台日志。")
+            LOGGER.info("SwanLab 实验日志已关闭，仅保留控制台日志。")
             return
 
-        try:
-            import wandb  # type: ignore
-        except ImportError:
-            LOGGER.warning("未安装 wandb，跳过在线实验日志。")
+        resolved_mode = (mode or os.environ.get("SWANLAB_MODE", "")).strip().lower()
+        if resolved_mode:
+            os.environ["SWANLAB_MODE"] = resolved_mode
+        if resolved_mode == "disabled":
+            LOGGER.info("检测到 SWANLAB_MODE=disabled，跳过 SwanLab 初始化。")
             self.enabled = False
             return
 
-        self._module = wandb
-        self._run = wandb.init(project=project, name=run_name, config=config, reinit=True)
-        LOGGER.info("已启用 wandb 运行记录：project=%s, run=%s", project, run_name)
+        try:
+            import swanlab  # type: ignore
+        except ImportError:
+            LOGGER.warning("未安装 swanlab，跳过 SwanLab 实验日志。")
+            self.enabled = False
+            return
+
+        self._module = swanlab
+        self._run = swanlab.init(project=project, name=run_name, config=config)
+        LOGGER.info("已启用 SwanLab 运行记录：project=%s, run=%s", project, run_name)
 
     def log(self, metrics: Dict[str, float]) -> None:
-        """记录一组标量指标。
+        """记录一组标量指标到 SwanLab。
 
         Args:
             metrics (Dict[str, float]): 需要记录的标量指标。
@@ -192,7 +203,7 @@ class ExperimentTracker:
             self._module.log(metrics)
 
     def finish(self) -> None:
-        """安全结束日志会话。"""
+        """安全结束 SwanLab 日志会话。"""
 
         if self._run is not None and self._module is not None:
             self._module.finish()
@@ -1593,10 +1604,11 @@ def train(args: argparse.Namespace) -> Dict[str, Any]:
     behavior_optimizer = torch.optim.Adam(behavior_model.parameters(), lr=DEFAULT_LEARNING_RATE)
 
     tracker = ExperimentTracker(
-        enabled=args.enable_wandb,
-        project=args.wandb_project,
-        run_name=f"{args.env_name}-{args.artifact_name}",
+        enabled=args.enable_swanlab,
+        project=args.swanlab_project,
+        run_name=args.swanlab_run_name or f"{args.env_name}-{args.artifact_name}",
         config=namespace_to_dict(args),
+        mode=args.swanlab_mode,
     )
 
     state_threshold = None
@@ -1722,8 +1734,32 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="是否训练条件状态扩散模型 p(s_next | s, a)，默认开启。",
     )
-    parser.add_argument("--enable_wandb", action="store_true", default=False)
-    parser.add_argument("--wandb_project", type=str, default=DEFAULT_WANDB_PROJECT)
+    parser.add_argument(
+        "--enable_swanlab",
+        action="store_true",
+        default=False,
+        help="是否启用 SwanLab 记录训练指标，默认关闭。",
+    )
+    parser.add_argument(
+        "--enable_wandb",
+        dest="enable_swanlab",
+        action="store_true",
+        help="兼容旧参数名；等价于 --enable_swanlab。",
+    )
+    parser.add_argument("--swanlab_project", type=str, default=DEFAULT_SWANLAB_PROJECT)
+    parser.add_argument(
+        "--wandb_project",
+        dest="swanlab_project",
+        type=str,
+        help="兼容旧参数名；等价于 --swanlab_project。",
+    )
+    parser.add_argument("--swanlab_run_name", type=str, default=None)
+    parser.add_argument(
+        "--swanlab_mode",
+        type=str,
+        default=None,
+        help="可选 SwanLab 运行模式，例如 disabled 或 offline。",
+    )
     parser.add_argument("--max_trajectories", type=int, default=None)
     parser.add_argument("--max_transitions", type=int, default=None)
     parser.add_argument("--percentile", type=float, default=DEFAULT_PERCENTILE)
