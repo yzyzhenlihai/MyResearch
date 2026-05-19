@@ -89,7 +89,7 @@ def get_args_dorl_doser_onpolicy() -> argparse.Namespace:
         dest="doser_detach_aux_state",
         action="store_false",
     )
-    parser.set_defaults(doser_detach_aux_state=False)
+    parser.set_defaults(doser_detach_aux_state=True)
     parser.add_argument("--doser_log_interval", type=int, default=DEFAULT_DOSER_LOG_INTERVAL)
 
     parser.add_argument("--wandb_project", type=str, default=DEFAULT_WANDB_PROJECT)
