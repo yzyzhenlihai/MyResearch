@@ -42,11 +42,13 @@ from src.core.policy.doser import (  # noqa: E402
     load_diffusion_artifact,
 )
 from src.core.util.data import get_env_args, get_true_env  # noqa: E402
-from src.core.util.wandb_utils import load_wandb  # noqa: E402
 from src.tianshou.tianshou.data import VectorReplayBuffer  # noqa: E402
 from src.tianshou.tianshou.env import DummyVectorEnv  # noqa: E402
 
-wandb = load_wandb(repo_root=Path(__file__).resolve().parents[2])
+try:
+    import swanlab  # type: ignore
+except ImportError:
+    swanlab = None
 
 
 DEFAULT_DOSER_SOFT_TAU = 0.005
@@ -58,36 +60,43 @@ DEFAULT_DIFFUSION_SAMPLE_STEPS = 20
 DEFAULT_DOSER_LOG_INTERVAL = 100
 """训练指标默认汇报间隔。"""
 
-DEFAULT_WANDB_PROJECT = "DORL-DOSER"
-"""DORL-DOSER 训练默认使用的 wandb project 名称。"""
+DEFAULT_SWANLAB_PROJECT = "DORL-DOSER"
+"""DORL-DOSER 训练默认使用的 SwanLab project 名称。"""
 
+DEFAULT_WANDB_PROJECT = DEFAULT_SWANLAB_PROJECT
+"""兼容旧代码导入的 project 常量。"""
 
-WANDB_DISABLED_VALUES = {"1", "true", "yes", "on"}
+SWANLAB_DISABLED_VALUES = {"1", "true", "yes", "on"}
 """将环境变量解析为布尔开关时认定为真值的集合。"""
 
 
-def _get_wandb_mode() -> str:
-    """读取 wandb 运行模式。
+def _get_swanlab_mode() -> str:
+    """读取 SwanLab 运行模式。
 
-    优先使用标准的 `WANDB_MODE`，同时兼容历史 `SWANLAB_MODE` 配置，
-    方便已有训练脚本平滑迁移。
+    优先使用标准的 `SWANLAB_MODE`，同时兼容历史 `WANDB_MODE` 配置，
+    方便已有训练脚本平滑迁移到 SwanLab。
 
     Returns:
-        str: 当前 wandb 模式，小写字符串。
+        str: 当前 SwanLab 模式，小写字符串。
     """
 
-    return os.environ.get("WANDB_MODE", os.environ.get("SWANLAB_MODE", "")).strip().lower()
+    return os.environ.get("SWANLAB_MODE", os.environ.get("WANDB_MODE", "")).strip().lower()
 
 
-def _is_wandb_disabled() -> bool:
-    """判断当前进程是否显式关闭 wandb 日志。"""
+def _is_swanlab_disabled() -> bool:
+    """判断当前进程是否显式关闭 SwanLab 日志。"""
 
-    disabled_flag = os.environ.get("WANDB_DISABLED", "").strip().lower()
-    return disabled_flag in WANDB_DISABLED_VALUES or _get_wandb_mode() == "disabled"
+    disabled_flag = os.environ.get("SWANLAB_DISABLED", "").strip().lower()
+    legacy_disabled_flag = os.environ.get("WANDB_DISABLED", "").strip().lower()
+    return (
+        disabled_flag in SWANLAB_DISABLED_VALUES
+        or legacy_disabled_flag in SWANLAB_DISABLED_VALUES
+        or _get_swanlab_mode() == "disabled"
+    )
 
 
-def _to_wandb_serializable(value: Any) -> Any:
-    """把常见训练配置转换为 wandb 可接受的 JSON 风格数据。"""
+def _to_swanlab_serializable(value: Any) -> Any:
+    """把常见训练配置转换为 SwanLab 可接受的 JSON 风格数据。"""
 
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -96,14 +105,14 @@ def _to_wandb_serializable(value: Any) -> Any:
     if isinstance(value, torch.device):
         return str(value)
     if isinstance(value, dict):
-        return {str(key): _to_wandb_serializable(val) for key, val in value.items()}
+        return {str(key): _to_swanlab_serializable(val) for key, val in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_to_wandb_serializable(item) for item in value]
+        return [_to_swanlab_serializable(item) for item in value]
     return str(value)
 
 
-def _build_default_wandb_run_name(args: argparse.Namespace) -> str:
-    """为当前训练构造默认的 wandb run 名称。"""
+def _build_default_swanlab_run_name(args: argparse.Namespace) -> str:
+    """为当前训练构造默认的 SwanLab run 名称。"""
 
     return (
         f"{args.message}-{args.env}-seed:{args.seed}"
@@ -114,70 +123,112 @@ def _build_default_wandb_run_name(args: argparse.Namespace) -> str:
     )
 
 
-def set_wandb(
+def _activate_swanlab_metric_logger() -> None:
+    """把历史 `wandb` 模块变量绑定到 SwanLab。
+
+    仓库的 trainer 和 `policy_utils` 历史上通过名为 `wandb` 的模块变量
+    写入指标。DORL-DOSER 改用 SwanLab 后，需要将这些模块变量指向
+    `swanlab`，否则只会初始化 run，不会写入 epoch/test 曲线。
+
+    Returns:
+        None: 仅执行模块级绑定。
+    """
+
+    if swanlab is None:
+        return
+
+    try:
+        import policy_utils as policy_utils_module
+
+        policy_utils_module.wandb = swanlab
+    except ImportError:
+        logger.warning("Skip binding policy_utils logger to SwanLab.")
+
+    for module_name in (
+        "tianshou.trainer.base",
+        "src.tianshou.tianshou.trainer.base",
+        "src.core.policy.doser",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            module.wandb = swanlab
+
+
+def set_swanlab(
     args: argparse.Namespace,
     run_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """按需初始化 wandb 实验记录。
+    """按需初始化 SwanLab 实验记录。
 
     Args:
         args (argparse.Namespace): 当前训练配置。
         run_metadata (Optional[Dict[str, Any]]): 训练运行阶段补充写入的元信息。
+
+    Returns:
+        None: 仅在 SwanLab 可用且未禁用时初始化远程记录。
     """
 
-    if wandb is None:
-        logger.info("Skip wandb init because wandb is unavailable.")
+    if swanlab is None:
+        logger.info("Skip SwanLab init because swanlab is unavailable.")
         return
 
-    if _is_wandb_disabled():
+    explicit_mode = getattr(args, "swanlab_mode", None)
+    if explicit_mode:
+        os.environ["SWANLAB_MODE"] = str(explicit_mode)
+
+    if _is_swanlab_disabled():
         logger.info(
-            "Skip wandb init because wandb logging is disabled: WANDB_MODE=%s, WANDB_DISABLED=%s",
-            _get_wandb_mode(),
+            "Skip SwanLab init because logging is disabled: "
+            "SWANLAB_MODE=%s, SWANLAB_DISABLED=%s, WANDB_MODE=%s, WANDB_DISABLED=%s",
+            _get_swanlab_mode(),
+            os.environ.get("SWANLAB_DISABLED", ""),
+            os.environ.get("WANDB_MODE", ""),
             os.environ.get("WANDB_DISABLED", ""),
         )
         return
 
-    config = {key: _to_wandb_serializable(value) for key, value in vars(args).items()}
+    config = {key: _to_swanlab_serializable(value) for key, value in vars(args).items()}
     if run_metadata:
         config.update(
             {
-                key: _to_wandb_serializable(value)
+                key: _to_swanlab_serializable(value)
                 for key, value in run_metadata.items()
             }
         )
 
-    init_kwargs = dict(
-        project=args.wandb_project,
+    swanlab.init(
+        project=getattr(args, "swanlab_project", DEFAULT_SWANLAB_PROJECT),
         config=config,
-        name=args.wandb_run_name or _build_default_wandb_run_name(args),
+        name=getattr(args, "swanlab_run_name", None)
+        or _build_default_swanlab_run_name(args),
     )
-    if args.wandb_entity:
-        init_kwargs["entity"] = args.wandb_entity
-    if args.wandb_group:
-        init_kwargs["group"] = args.wandb_group
-    if args.wandb_job_type:
-        init_kwargs["job_type"] = args.wandb_job_type
-    if args.wandb_tags:
-        init_kwargs["tags"] = list(args.wandb_tags)
-    if args.wandb_dir:
-        init_kwargs["dir"] = args.wandb_dir
+    _activate_swanlab_metric_logger()
 
-    if args.wandb_mode:
-        init_kwargs["mode"] = args.wandb_mode
-    wandb_mode = _get_wandb_mode()
-    if wandb_mode and "mode" not in init_kwargs:
-        init_kwargs["mode"] = wandb_mode
-    wandb.init(**init_kwargs)
+
+def finish_swanlab() -> None:
+    """安全结束 SwanLab 记录。"""
+
+    if swanlab is None or _is_swanlab_disabled():
+        return
+    finish = getattr(swanlab, "finish", None)
+    if finish is None:
+        return
+    finish()
+
+
+def set_wandb(
+    args: argparse.Namespace,
+    run_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """兼容旧调用名的 SwanLab 初始化入口。"""
+
+    set_swanlab(args=args, run_metadata=run_metadata)
 
 
 def finish_wandb() -> None:
-    """安全结束 wandb 记录。"""
+    """兼容旧调用名的 SwanLab 结束入口。"""
 
-    if wandb is None:
-        return
-    if getattr(wandb, "run", None) is None:
-        return
-    wandb.finish()
+    finish_swanlab()
 
 
 def get_args_dorl_doser() -> argparse.Namespace:
@@ -210,14 +261,34 @@ def get_args_dorl_doser() -> argparse.Namespace:
     parser.add_argument("--doser_log_interval", type=int, default=DEFAULT_DOSER_LOG_INTERVAL) # 日志打印/记录间隔。
     parser.add_argument("--doser_catalog_chunk_size", type=int, default=512) # 全物品集合计算 Q 时的分块大小
 
-    parser.add_argument("--wandb_project", type=str, default=DEFAULT_WANDB_PROJECT)
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_group", type=str, default=None)
-    parser.add_argument("--wandb_job_type", type=str, default="train")
-    parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument("--wandb_tags", nargs="*", default=None)
-    parser.add_argument("--wandb_dir", type=str, default=None)
-    parser.add_argument("--wandb_mode", type=str, default=None)
+    parser.add_argument(
+        "--swanlab_project",
+        "--wandb_project",
+        dest="swanlab_project",
+        type=str,
+        default=DEFAULT_SWANLAB_PROJECT,
+        help="SwanLab project 名称；--wandb_project 为兼容旧脚本的别名。",
+    )
+    parser.add_argument(
+        "--swanlab_run_name",
+        "--wandb_run_name",
+        dest="swanlab_run_name",
+        type=str,
+        default=None,
+        help="SwanLab run 名称；--wandb_run_name 为兼容旧脚本的别名。",
+    )
+    parser.add_argument(
+        "--swanlab_mode",
+        "--wandb_mode",
+        dest="swanlab_mode",
+        type=str,
+        default=None,
+        help="SwanLab 运行模式，例如 online、offline 或 disabled。",
+    )
+    parser.add_argument("--swanlab_dir", "--wandb_dir", dest="swanlab_dir", type=str, default=None)
+    parser.add_argument("--swanlab_tags", "--wandb_tags", dest="swanlab_tags", nargs="*", default=None)
+    parser.add_argument("--swanlab_group", "--wandb_group", dest="swanlab_group", type=str, default=None)
+    parser.add_argument("--swanlab_job_type", "--wandb_job_type", dest="swanlab_job_type", type=str, default="train")
  
     parser.add_argument("--is_exposure_intervention", dest="use_exposure_intervention", action="store_true")
     parser.add_argument("--no_exposure_intervention", dest="use_exposure_intervention", action="store_false")
@@ -594,7 +665,7 @@ def main(args: argparse.Namespace) -> None:
         diffusion_artifact=diffusion_artifact,
     )
 
-    set_wandb(args, run_metadata=wandb_metadata)
+    set_swanlab(args, run_metadata=wandb_metadata)
     try:
         learn_policy(
             args,
@@ -610,7 +681,7 @@ def main(args: argparse.Namespace) -> None:
             trainer="offpolicy",
         )
     finally:
-        finish_wandb()
+        finish_swanlab()
 
 
 if __name__ == "__main__":

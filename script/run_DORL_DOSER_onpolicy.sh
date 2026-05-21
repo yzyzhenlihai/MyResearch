@@ -4,13 +4,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export PYTHONPATH="${PYTHONPATH:-.:./src:./src/DeepCTR-Torch:./src/tianshou}"
-export WANDB_MODE="${WANDB_MODE:-disabled}"
-
+export SWANLAB_MODE="${SWANLAB_MODE:-online}"
 PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/python}"
 
 DATASET="${DATASET:-KuaiEnv-v0}"
 SEED="${SEED:-2023}"
-CUDA="${CUDA:-0}"
+CUDA="${CUDA:-1}"
 CPU_FLAG="${CPU_FLAG:-0}"
 EPOCH="${EPOCH:-100}"
 STEP_PER_EPOCH="${STEP_PER_EPOCH:-100000}"
@@ -136,6 +135,6 @@ fi
   --lr "${LR}" \
   --lambda_entropy "${LAMBDA_ENTROPY}" \
   --entropy_window ${ENTROPY_WINDOW} \
-  --wandb_mode "${WANDB_MODE}" \
+  --swanlab_mode "${SWANLAB_MODE}" \
   "${DATASET_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"

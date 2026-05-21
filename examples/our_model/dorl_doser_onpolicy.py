@@ -24,11 +24,11 @@ from policy_utils import (  # noqa: E402
 from dorl_doser import (  # noqa: E402
     DEFAULT_DIFFUSION_SAMPLE_STEPS,
     DEFAULT_DOSER_LOG_INTERVAL,
-    DEFAULT_WANDB_PROJECT,
-    finish_wandb,
+    DEFAULT_SWANLAB_PROJECT,
+    finish_swanlab,
     prepare_train_envs_and_reward_model,
     resolve_default_artifact_name,
-    set_wandb,
+    set_swanlab,
 )
 from src.core.collector.collector import Collector  # noqa: E402
 from src.core.collector.collector_set import CollectorSet  # noqa: E402
@@ -92,14 +92,34 @@ def get_args_dorl_doser_onpolicy() -> argparse.Namespace:
     parser.set_defaults(doser_detach_aux_state=True)
     parser.add_argument("--doser_log_interval", type=int, default=DEFAULT_DOSER_LOG_INTERVAL)
 
-    parser.add_argument("--wandb_project", type=str, default=DEFAULT_WANDB_PROJECT)
-    parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--wandb_group", type=str, default=None)
-    parser.add_argument("--wandb_job_type", type=str, default="train")
-    parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument("--wandb_tags", nargs="*", default=None)
-    parser.add_argument("--wandb_dir", type=str, default=None)
-    parser.add_argument("--wandb_mode", type=str, default=None)
+    parser.add_argument(
+        "--swanlab_project",
+        "--wandb_project",
+        dest="swanlab_project",
+        type=str,
+        default=DEFAULT_SWANLAB_PROJECT,
+        help="SwanLab project 名称；--wandb_project 为兼容旧脚本的别名。",
+    )
+    parser.add_argument(
+        "--swanlab_run_name",
+        "--wandb_run_name",
+        dest="swanlab_run_name",
+        type=str,
+        default=None,
+        help="SwanLab run 名称；--wandb_run_name 为兼容旧脚本的别名。",
+    )
+    parser.add_argument(
+        "--swanlab_mode",
+        "--wandb_mode",
+        dest="swanlab_mode",
+        type=str,
+        default=None,
+        help="SwanLab 运行模式，例如 online、offline 或 disabled。",
+    )
+    parser.add_argument("--swanlab_dir", "--wandb_dir", dest="swanlab_dir", type=str, default=None)
+    parser.add_argument("--swanlab_tags", "--wandb_tags", dest="swanlab_tags", nargs="*", default=None)
+    parser.add_argument("--swanlab_group", "--wandb_group", dest="swanlab_group", type=str, default=None)
+    parser.add_argument("--swanlab_job_type", "--wandb_job_type", dest="swanlab_job_type", type=str, default="train")
 
     parser.add_argument(
         "--is_exposure_intervention",
@@ -277,7 +297,7 @@ def main(args: argparse.Namespace) -> None:
         diffusion_artifact=diffusion_artifact,
     )
 
-    set_wandb(args, run_metadata=wandb_metadata)
+    set_swanlab(args, run_metadata=wandb_metadata)
     try:
         learn_policy(
             args,
@@ -293,7 +313,7 @@ def main(args: argparse.Namespace) -> None:
             trainer="onpolicy",
         )
     finally:
-        finish_wandb()
+        finish_swanlab()
 
 
 if __name__ == "__main__":
