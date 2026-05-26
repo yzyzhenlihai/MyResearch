@@ -4,12 +4,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 export PYTHONPATH="${PYTHONPATH:-.:./src:./src/DeepCTR-Torch:./src/tianshou}"
-export SWANLAB_MODE="${SWANLAB_MODE:-online}"
+export SWANLAB_MODE="${SWANLAB_MODE:-cloud}" # disabled
 PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/python}"
 
 DATASET="${DATASET:-KuaiEnv-v0}"
 SEED="${SEED:-2023}"
-CUDA="${CUDA:-1}"
+CUDA="${CUDA:-0}"
 CPU_FLAG="${CPU_FLAG:-0}"
 EPOCH="${EPOCH:-100}"
 STEP_PER_EPOCH="${STEP_PER_EPOCH:-100000}"
@@ -47,6 +47,17 @@ DOSER_ACTION_SAMPLES="${DOSER_ACTION_SAMPLES:-10}"
 DOSER_Q_MIN="${DOSER_Q_MIN:-0.0}"
 DOSER_AUX_CRITIC_COEF="${DOSER_AUX_CRITIC_COEF:-1.0}"
 DOSER_LOG_INTERVAL="${DOSER_LOG_INTERVAL:-100}"
+DOSER_ENABLE_RERANK="${DOSER_ENABLE_RERANK:-1}"
+DOSER_ACTOR_TOPK="${DOSER_ACTOR_TOPK:-64}"
+DOSER_DIFFUSION_CANDIDATES="${DOSER_DIFFUSION_CANDIDATES:-64}"
+DOSER_RANDOM_CANDIDATES="${DOSER_RANDOM_CANDIDATES:-16}"
+DOSER_RERANK_TEMPERATURE="${DOSER_RERANK_TEMPERATURE:-1.0}"
+DOSER_RERANK_ALPHA_Q="${DOSER_RERANK_ALPHA_Q:-1.0}"
+DOSER_RERANK_BETA_ACTION_OOD="${DOSER_RERANK_BETA_ACTION_OOD:-0.5}"
+DOSER_RERANK_GAMMA_REWARD="${DOSER_RERANK_GAMMA_REWARD:-0.2}"
+DOSER_ACTION_THRESHOLD_SCALE="${DOSER_ACTION_THRESHOLD_SCALE:-1.0}"
+DOSER_STATE_THRESHOLD_SCALE="${DOSER_STATE_THRESHOLD_SCALE:-2.0}"
+DOSER_SHARE_ACTOR_CRITIC_BACKBONE="${DOSER_SHARE_ACTOR_CRITIC_BACKBONE:-0}"
 
 LR="${LR:-0.001}"
 GAMMA="${GAMMA:-0.9}"
@@ -76,6 +87,18 @@ if [[ "${CPU_FLAG}" == "1" ]]; then
   EXTRA_ARGS+=(--cpu)
 fi
 
+if [[ "${DOSER_ENABLE_RERANK}" == "1" ]]; then
+  EXTRA_ARGS+=(--doser_enable_rerank)
+else
+  EXTRA_ARGS+=(--no_doser_enable_rerank)
+fi
+
+if [[ "${DOSER_SHARE_ACTOR_CRITIC_BACKBONE}" == "1" ]]; then
+  EXTRA_ARGS+=(--doser_share_actor_critic_backbone)
+else
+  EXTRA_ARGS+=(--no_doser_share_actor_critic_backbone)
+fi
+
 if [[ -n "${DIFFUSION_ARTIFACT_NAME}" ]]; then
   EXTRA_ARGS+=(--diffusion_artifact_name "${DIFFUSION_ARTIFACT_NAME}")
 fi
@@ -91,6 +114,9 @@ if [[ "${SMOKE:-0}" == "1" ]]; then
   BUFFER_SIZE=10
   DOSER_ACTION_SAMPLES=1
   DIFFUSION_SAMPLE_STEPS=1
+  DOSER_ACTOR_TOPK=4
+  DOSER_DIFFUSION_CANDIDATES=1
+  DOSER_RANDOM_CANDIDATES=1
   MAX_TURN="${SMOKE_MAX_TURN:-2}"
   FORCE_LENGTH="${SMOKE_FORCE_LENGTH:-1}"
 fi
@@ -127,6 +153,15 @@ fi
   --doser_q_min "${DOSER_Q_MIN}" \
   --doser_aux_critic_coef "${DOSER_AUX_CRITIC_COEF}" \
   --doser_detach_aux_state \
+  --doser_actor_topk "${DOSER_ACTOR_TOPK}" \
+  --doser_diffusion_candidates "${DOSER_DIFFUSION_CANDIDATES}" \
+  --doser_random_candidates "${DOSER_RANDOM_CANDIDATES}" \
+  --doser_rerank_temperature "${DOSER_RERANK_TEMPERATURE}" \
+  --doser_rerank_alpha_q "${DOSER_RERANK_ALPHA_Q}" \
+  --doser_rerank_beta_action_ood "${DOSER_RERANK_BETA_ACTION_OOD}" \
+  --doser_rerank_gamma_reward "${DOSER_RERANK_GAMMA_REWARD}" \
+  --doser_action_threshold_scale "${DOSER_ACTION_THRESHOLD_SCALE}" \
+  --doser_state_threshold_scale "${DOSER_STATE_THRESHOLD_SCALE}" \
   --doser_log_interval "${DOSER_LOG_INTERVAL}" \
   --vf-coef "${VF_COEF}" \
   --ent-coef "${ENT_COEF}" \

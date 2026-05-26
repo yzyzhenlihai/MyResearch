@@ -79,6 +79,29 @@ def get_args_dorl_doser_onpolicy() -> argparse.Namespace:
     parser.add_argument("--doser_action_samples", type=int, default=10)
     parser.add_argument("--doser_q_min", type=float, default=0.0)
     parser.add_argument("--doser_aux_critic_coef", type=float, default=1.0)
+    parser.add_argument("--doser_enable_rerank", dest="doser_enable_rerank", action="store_true")
+    parser.add_argument("--no_doser_enable_rerank", dest="doser_enable_rerank", action="store_false")
+    parser.set_defaults(doser_enable_rerank=True)
+    parser.add_argument("--doser_actor_topk", type=int, default=64)
+    parser.add_argument("--doser_diffusion_candidates", type=int, default=64)
+    parser.add_argument("--doser_random_candidates", type=int, default=16)
+    parser.add_argument("--doser_rerank_temperature", type=float, default=1.0)
+    parser.add_argument("--doser_rerank_alpha_q", type=float, default=1.0)
+    parser.add_argument("--doser_rerank_beta_action_ood", type=float, default=0.5)
+    parser.add_argument("--doser_rerank_gamma_reward", type=float, default=0.2)
+    parser.add_argument("--doser_action_threshold_scale", type=float, default=1.0)
+    parser.add_argument("--doser_state_threshold_scale", type=float, default=2.0)
+    parser.add_argument(
+        "--doser_share_actor_critic_backbone",
+        dest="doser_share_actor_critic_backbone",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no_doser_share_actor_critic_backbone",
+        dest="doser_share_actor_critic_backbone",
+        action="store_false",
+    )
+    parser.set_defaults(doser_share_actor_critic_backbone=False)
     parser.add_argument(
         "--doser_detach_aux_state",
         dest="doser_detach_aux_state",
@@ -188,11 +211,15 @@ def setup_onpolicy_policy_model(
             f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu"
         )
 
-    # 共享 backbone，保持 actor 仍是原始 DORL/A2C 的离散策略结构。
-    net = Net(args.state_dim, hidden_sizes=args.hidden_sizes, device=args.device)
-    actor = Actor(net, args.action_shape, device=args.device).to(args.device)
+    # 默认拆分 actor/critic backbone，避免 DOSER auxiliary critic 梯度污染 actor 表征。
+    actor_net = Net(args.state_dim, hidden_sizes=args.hidden_sizes, device=args.device)
+    if args.doser_share_actor_critic_backbone:
+        critic_net = actor_net
+    else:
+        critic_net = Net(args.state_dim, hidden_sizes=args.hidden_sizes, device=args.device)
+    actor = Actor(actor_net, args.action_shape, device=args.device).to(args.device)
     critic = A2CDOSERAugmentedCritic(
-        preprocess_net=net,
+        preprocess_net=critic_net,
         action_dim=state_tracker.emb_dim,
         hidden_sizes=args.hidden_sizes,
         device=args.device,
@@ -224,6 +251,16 @@ def setup_onpolicy_policy_model(
         doser_detach_aux_state=args.doser_detach_aux_state,
         doser_action_samples=args.doser_action_samples,
         diffusion_sample_steps=args.diffusion_sample_steps,
+        doser_enable_rerank=args.doser_enable_rerank,
+        doser_actor_topk=args.doser_actor_topk,
+        doser_diffusion_candidates=args.doser_diffusion_candidates,
+        doser_random_candidates=args.doser_random_candidates,
+        doser_rerank_temperature=args.doser_rerank_temperature,
+        doser_rerank_alpha_q=args.doser_rerank_alpha_q,
+        doser_rerank_beta_action_ood=args.doser_rerank_beta_action_ood,
+        doser_rerank_gamma_reward=args.doser_rerank_gamma_reward,
+        doser_action_threshold_scale=args.doser_action_threshold_scale,
+        doser_state_threshold_scale=args.doser_state_threshold_scale,
         log_interval=args.doser_log_interval,
     )
     rec_policy = RecPolicy(args, policy, state_tracker)
