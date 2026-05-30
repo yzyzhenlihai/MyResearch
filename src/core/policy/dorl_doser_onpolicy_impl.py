@@ -27,6 +27,7 @@ from src.core.policy.dorl_doser_impl import (
     CounterfactualRewardModel,
     DiffusionArtifact,
     DORLDOSEROODHelper,
+    OBS_LAST_ACTION_COLUMN,
     build_mlp,
 )
 
@@ -788,6 +789,45 @@ class OnPolicyDORLDOSERPolicy(A2CPolicy):
             user_ids = obs[:, 0].long()
         return user_ids.index_select(0, row_ids)
 
+    def _extract_reward_histories(
+        self,
+        batch: Batch,
+        row_ids: torch.Tensor,
+        action_ids: torch.Tensor,
+    ) -> np.ndarray:
+        """为 reward prior 构造短动作历史。
+
+        Args:
+            batch (Batch): 当前 batch，`obs[:, 1]` 通常为上一时刻 item id。
+            row_ids (torch.Tensor): 候选动作所在行。
+            action_ids (torch.Tensor): 候选 item id。
+
+        Returns:
+            np.ndarray: 动作历史数组，形状为 `(num_candidates, history_len)`。
+            当无法解析上一动作时，仅返回当前候选动作。
+        """
+
+        candidate_actions = (
+            action_ids.detach().cpu().numpy().reshape(-1, 1).astype(np.int64)
+        )
+        try:
+            obs = torch.as_tensor(batch.obs, device=row_ids.device)
+            if obs.ndim >= 2 and obs.shape[1] > OBS_LAST_ACTION_COLUMN:
+                previous_actions = (
+                    obs[:, OBS_LAST_ACTION_COLUMN]
+                    .long()
+                    .index_select(0, row_ids)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1, 1)
+                    .astype(np.int64)
+                )
+                return np.concatenate([previous_actions, candidate_actions], axis=1)
+        except Exception as exc:  # pragma: no cover - 训练时防御分支
+            LOGGER.debug("Failed to parse reward histories from batch.obs: %s", exc)
+        return candidate_actions
+
     def _rowwise_zscore(
         self,
         values: torch.Tensor,
@@ -848,9 +888,11 @@ class OnPolicyDORLDOSERPolicy(A2CPolicy):
         """
 
         user_ids = self._extract_user_ids(batch, row_ids)
+        reward_histories = self._extract_reward_histories(batch, row_ids, action_ids)
         rewards = self.reward_model.estimate(
             user_ids.detach().cpu().numpy(),
             action_ids.detach().cpu().numpy(),
+            history_actions=reward_histories,
         )
         return torch.as_tensor(rewards, device=action_ids.device, dtype=torch.float32)
 
@@ -955,6 +997,11 @@ class OnPolicyDORLDOSERPolicy(A2CPolicy):
             "rerank/q_score": float(q_values.detach().mean().cpu().item()),
             "rerank/action_error": float(action_error.detach().mean().cpu().item()),
             "rerank/reward_prior": float(reward_prior.detach().mean().cpu().item()),
+            "rerank/reward_prior_min": float(reward_prior.detach().min().cpu().item()),
+            "rerank/reward_prior_max": float(reward_prior.detach().max().cpu().item()),
+            "rerank/reward_prior_std": float(
+                reward_prior.detach().std(unbiased=False).cpu().item()
+            ),
             "rerank/action_ood_penalty": float(action_ood_penalty.detach().mean().cpu().item()),
         }
         return rerank_probs, metrics

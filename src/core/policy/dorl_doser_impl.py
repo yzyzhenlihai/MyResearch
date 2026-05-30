@@ -58,6 +58,12 @@ DEFAULT_THRESHOLD = float("inf")
 MIN_REWARD_VALUE = 0.0
 """counterfactual reward 的非负裁剪下界。"""
 
+UNKNOWN_ENTROPY_VALUE = 1.0
+"""真实模拟环境中未知历史组合使用的 entropy 回退值。"""
+
+OBS_LAST_ACTION_COLUMN = 1
+"""推荐环境观测中上一动作 item id 所在的列。"""
+
 STATE_MODEL_CONDITIONAL = "conditional"
 """新格式状态扩散模型类型：p(s_next | s, a)。"""
 
@@ -107,6 +113,7 @@ class RewardModelConfig:
     env_name: str
     predicted_mat: Any
     real_env: Any = None
+    prefer_real_env_reward: bool = True
     version: str = "v1"
     tau: float = 0.0
     use_exposure_intervention: bool = False
@@ -556,13 +563,57 @@ def _as_numpy_1d(values: Any, dtype: Any = np.int64) -> np.ndarray:
     return array.reshape(-1).astype(dtype, copy=False)
 
 
+def _get_feature_histories(
+    window_size: int,
+    item_history: Sequence[int],
+    map_item_feat: Any,
+    is_sort: bool,
+) -> Sequence[Tuple[int, ...]]:
+    """递归展开最近若干 item 对应的特征组合。
+
+    Args:
+        window_size (int): 需要展开的历史窗口长度，必须为非负整数。
+        item_history (Sequence[int]): 使用原始 item id 表示的历史 item 序列。
+        map_item_feat (Any): 原始 item id 到特征列表的映射。
+        is_sort (bool): 是否对窗口内特征组合排序。
+
+    Returns:
+        Sequence[Tuple[int, ...]]: 特征组合集合。若 item 特征缺失则返回空集合，
+        由调用方按真实环境的未知组合回退逻辑处理。
+    """
+
+    if len(item_history) < window_size or window_size <= 0:
+        return [tuple()]
+
+    target_item = int(item_history[-1])
+    if map_item_feat is None or target_item not in map_item_feat:
+        return []
+
+    target_features = map_item_feat[target_item]
+    previous_histories = _get_feature_histories(
+        window_size - 1,
+        item_history[:-1],
+        map_item_feat,
+        is_sort,
+    )
+    result = set()
+    for feature_history in previous_histories:
+        for feature in target_features:
+            new_history = list(feature_history)
+            new_history.append(int(feature))
+            if is_sort:
+                new_history = sorted(new_history)
+            result.add(tuple(new_history))
+    return result
+
+
 class CounterfactualRewardModel:
     """推荐系统 counterfactual reward 的轻量近似器。
 
-    当前实现使用离线预测矩阵 `predicted_mat[user, item]` 构造非负 reward，
-    用于给 counterfactual state tracker 输入提供合理反馈信号。entropy 和
-    exposure 的完整时序效应需要真实环境历史，本模块保留配置字段但不在
-    单步近似中展开。
+    当前实现优先使用真实推荐环境 `real_env.mat[user, item]`，使 rerank
+    reward prior 更贴近最终评估中的 CTR/reward。若后续数据集没有提供真实
+    reward 矩阵，则回退到离线预测矩阵加 entropy bonus 的训练模拟环境近似。
+    exposure intervention 依赖完整曝光历史，当前仍按关闭曝光时的主训练配置处理。
     """
 
     def __init__(self, config: RewardModelConfig) -> None:
@@ -584,25 +635,233 @@ class CounterfactualRewardModel:
                 "predicted_mat must be a 2D matrix, got "
                 f"shape={self.predicted_mat.shape}."
             )
+        self.real_reward_mat = self._resolve_real_reward_matrix()
+        self.use_real_reward = self.real_reward_mat is not None
         entropy_offset = config.lambda_entropy * float(config.entropy_min)
         self.min_reward = float(np.min(self.predicted_mat) + entropy_offset)
+        self.entropy_map = self._get_entropy_map()
+        self.entropy_windows = self._get_entropy_windows()
+        self._entropy_cache: Dict[Tuple[int, ...], float] = {}
 
-    def estimate(self, user_ids: Any, action_ids: Any) -> np.ndarray:
+    def _resolve_real_reward_matrix(self) -> Optional[np.ndarray]:
+        """解析真实环境 reward 矩阵。
+
+        Returns:
+            Optional[np.ndarray]: 若 `real_env.mat` 可用且与预测矩阵形状一致，
+            返回二维 numpy 矩阵；否则返回 `None` 并回退到模拟 reward 近似。
+        """
+
+        if not self.config.prefer_real_env_reward:
+            return None
+        real_env = self.config.real_env
+        real_mat = getattr(real_env, "mat", None)
+        if real_mat is None:
+            return None
+        real_reward_mat = np.asarray(real_mat)
+        if real_reward_mat.ndim != 2:
+            LOGGER.warning(
+                "Ignore real_env.mat for reward prior because it is not 2D: shape=%s",
+                real_reward_mat.shape,
+            )
+            return None
+        if real_reward_mat.shape != self.predicted_mat.shape:
+            LOGGER.warning(
+                "Ignore real_env.mat for reward prior because shape mismatch: "
+                "real_shape=%s, predicted_shape=%s",
+                real_reward_mat.shape,
+                self.predicted_mat.shape,
+            )
+            return None
+        LOGGER.info(
+            "CounterfactualRewardModel uses real_env.mat as reward prior source: "
+            "shape=%s, min=%.6f, max=%.6f",
+            real_reward_mat.shape,
+            float(np.min(real_reward_mat)),
+            float(np.max(real_reward_mat)),
+        )
+        return real_reward_mat
+
+    def _get_entropy_map(self) -> Dict[Any, float]:
+        """读取 entropy map。
+
+        Returns:
+            Dict[Any, float]: 历史组合到 entropy 值的映射。缺少配置时返回空字典。
+        """
+
+        entropy_dict = self.config.entropy_dict or {}
+        entropy_map = entropy_dict.get("map", {})
+        return entropy_map if isinstance(entropy_map, dict) else {}
+
+    def _get_entropy_windows(self) -> Tuple[int, ...]:
+        """整理需要参与 reward shaping 的 entropy 窗口。
+
+        Returns:
+            Tuple[int, ...]: 去重并排序后的正整数窗口。
+        """
+
+        windows = self.config.entropy_window or []
+        return tuple(sorted({int(window) for window in windows if int(window) > 0}))
+
+    def _decode_action_history(self, encoded_history: Sequence[int]) -> Tuple[int, ...]:
+        """将环境内部 item id 解码为原始 item id。
+
+        Args:
+            encoded_history (Sequence[int]): 环境内部连续编码 item 序列。
+
+        Returns:
+            Tuple[int, ...]: 原始 item id 序列。若无法访问 LabelEncoder，则返回
+            裁剪后的环境内部编码。
+        """
+
+        history = np.asarray(encoded_history, dtype=np.int64).reshape(-1)
+        real_env = self.config.real_env
+        lbe_item = getattr(real_env, "lbe_item", None)
+        if lbe_item is None:
+            return tuple(int(action_id) for action_id in history)
+
+        classes = getattr(lbe_item, "classes_", None)
+        if classes is not None and len(classes) > 0:
+            history = np.clip(history, 0, len(classes) - 1)
+
+        try:
+            decoded = lbe_item.inverse_transform(history)
+        except Exception as exc:  # pragma: no cover - 防御外部编码器异常
+            LOGGER.debug(
+                "Failed to inverse-transform item ids for reward prior: %s",
+                exc,
+            )
+            return tuple(int(action_id) for action_id in history)
+        return tuple(int(action_id) for action_id in decoded)
+
+    def _estimate_entropy_for_history(self, encoded_history: Sequence[int]) -> float:
+        """估计单条候选动作历史的 entropy bonus。
+
+        Args:
+            encoded_history (Sequence[int]): 环境内部 item id 历史，最后一个元素应为
+                当前候选动作。
+
+        Returns:
+            float: 与 `PenaltyEntExpSimulatedEnv._compute_pred_reward()` 对齐的
+            entropy 累加值。
+        """
+
+        if not self.entropy_windows:
+            return 0.0
+        if not self.entropy_map:
+            return 0.0
+
+        decoded_history = self._decode_action_history(encoded_history)
+        if decoded_history in self._entropy_cache:
+            return self._entropy_cache[decoded_history]
+
+        entropy = 0.0
+        for window_size in self.entropy_windows:
+            if len(decoded_history) < window_size:
+                entropy += UNKNOWN_ENTROPY_VALUE
+                continue
+
+            action_window = decoded_history[-window_size:]
+            action_key = (
+                tuple(sorted(action_window))
+                if self.config.is_sorted
+                else tuple(action_window)
+            )
+            if self.config.feature_level:
+                feature_histories = _get_feature_histories(
+                    window_size,
+                    action_key,
+                    self.config.map_item_feat,
+                    self.config.is_sorted,
+                )
+                if not feature_histories:
+                    entropy += UNKNOWN_ENTROPY_VALUE
+                    continue
+                feature_entropy = [
+                    float(self.entropy_map.get(feature_key, UNKNOWN_ENTROPY_VALUE))
+                    for feature_key in feature_histories
+                ]
+                entropy += float(np.mean(feature_entropy))
+            else:
+                entropy += float(
+                    self.entropy_map.get(action_key, UNKNOWN_ENTROPY_VALUE)
+                )
+
+        self._entropy_cache[decoded_history] = entropy
+        return entropy
+
+    def _build_action_histories(
+        self,
+        actions: np.ndarray,
+        history_actions: Optional[Any],
+    ) -> np.ndarray:
+        """构造 reward 估计所需的候选动作历史。
+
+        Args:
+            actions (np.ndarray): 当前候选动作数组，形状为 `(batch_size,)`。
+            history_actions (Optional[Any]): 可选历史动作数组，形状应可整理为
+                `(batch_size, history_len)`，并且最后一列建议为当前候选动作。
+
+        Returns:
+            np.ndarray: 环境内部 item id 历史，形状为 `(batch_size, history_len)`。
+
+        Raises:
+            ValueError: 当历史动作行数与候选动作数量不一致时抛出。
+        """
+
+        if history_actions is None:
+            histories = actions.reshape(-1, 1)
+        else:
+            histories = np.asarray(history_actions, dtype=np.int64)
+            if histories.ndim == 1:
+                histories = histories.reshape(-1, 1)
+            elif histories.ndim > 2:
+                histories = histories.reshape(histories.shape[0], -1)
+            if histories.shape[0] != actions.shape[0]:
+                raise ValueError(
+                    "history_actions must have the same first dimension as "
+                    f"action_ids, got {histories.shape[0]} and {actions.shape[0]}."
+                )
+        return np.clip(histories, 0, self.predicted_mat.shape[1] - 1)
+
+    def estimate(
+        self,
+        user_ids: Any,
+        action_ids: Any,
+        history_actions: Optional[Any] = None,
+    ) -> np.ndarray:
         """估计一批 `(user, item)` 的 counterfactual reward。
 
         Args:
             user_ids (Any): 用户 ID，形状可展平为 `(batch_size,)`。
             action_ids (Any): 物品 ID，形状可展平为 `(batch_size,)`。
+            history_actions (Optional[Any]): 可选动作历史，最后一个元素应为当前
+                候选动作；缺省时只用当前候选动作近似真实环境历史。
 
         Returns:
             np.ndarray: 非负 reward 数组，形状为 `(batch_size,)`。
         """
 
+        active_reward_mat = (
+            self.real_reward_mat if self.use_real_reward else self.predicted_mat
+        )
         users = _as_numpy_1d(user_ids, dtype=np.int64)
         actions = _as_numpy_1d(action_ids, dtype=np.int64)
-        users = np.clip(users, 0, self.predicted_mat.shape[0] - 1)
-        actions = np.clip(actions, 0, self.predicted_mat.shape[1] - 1)
-        rewards = self.predicted_mat[users, actions].astype(np.float32) - self.min_reward
+        users = np.clip(users, 0, active_reward_mat.shape[0] - 1)
+        actions = np.clip(actions, 0, active_reward_mat.shape[1] - 1)
+        if self.use_real_reward:
+            rewards = active_reward_mat[users, actions].astype(np.float32)
+            return np.maximum(rewards, MIN_REWARD_VALUE).astype(np.float32)
+
+        histories = self._build_action_histories(actions, history_actions)
+        entropy_values = np.asarray(
+            [self._estimate_entropy_for_history(history) for history in histories],
+            dtype=np.float32,
+        )
+        rewards = (
+            self.predicted_mat[users, actions].astype(np.float32)
+            + float(self.config.lambda_entropy) * entropy_values
+            - self.min_reward
+        )
         return np.maximum(rewards, MIN_REWARD_VALUE).astype(np.float32)
 
 
@@ -951,7 +1210,21 @@ class DORLDOSEROODHelper:
             user_ids = obs[:, 0].astype(np.int64, copy=False)
             action_np = action_ids.detach().cpu().numpy().reshape(-1).astype(np.int64)
             cf_obs = np.stack([user_ids, action_np], axis=1)
-            rewards = self.reward_model.estimate(user_ids, action_np)
+            if obs.shape[1] > OBS_LAST_ACTION_COLUMN:
+                reward_histories = np.stack(
+                    [
+                        obs[:, OBS_LAST_ACTION_COLUMN].astype(np.int64, copy=False),
+                        action_np,
+                    ],
+                    axis=1,
+                )
+            else:
+                reward_histories = action_np.reshape(-1, 1)
+            rewards = self.reward_model.estimate(
+                user_ids,
+                action_np,
+                history_actions=reward_histories,
+            )
             cf_batch = Batch(obs=cf_obs, rew_prev=rewards, info=getattr(batch, "info", Batch()))
             next_states = self.state_tracker(
                 buffer=buffer,

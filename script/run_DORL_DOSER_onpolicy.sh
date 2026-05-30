@@ -9,7 +9,7 @@ PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/pytho
 
 DATASET="${DATASET:-KuaiEnv-v0}"
 SEED="${SEED:-2023}"
-CUDA="${CUDA:-0}"
+CUDA="${CUDA:-6}"
 CPU_FLAG="${CPU_FLAG:-0}"
 EPOCH="${EPOCH:-100}"
 STEP_PER_EPOCH="${STEP_PER_EPOCH:-100000}"
