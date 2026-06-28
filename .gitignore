@@ -49,4 +49,5 @@ docs/
 swanlog/
 .codex
 .vscode/
+*.npz
 
