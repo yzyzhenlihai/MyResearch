@@ -44,3 +44,9 @@ temp.*
 
 wandb/
 docs/
+data/
+docs/
+swanlog/
+.codex
+.vscode/
+
