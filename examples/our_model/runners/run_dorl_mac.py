@@ -107,15 +107,37 @@ def build_common_argv(args: argparse.Namespace) -> List[str]:
         str(args.max_turn),
         "--force_length",
         str(args.force_length),
+        "--invalid_action_penalty",
+        str(args.invalid_action_penalty),
+        "--lambda_entropy",
+        str(args.lambda_entropy),
+        "--lambda_variance",
+        str(args.lambda_variance),
+        "--dynamics_loss_weight",
+        str(args.dynamics_loss_weight),
         "--swanlab_project",
         args.swanlab_project,
         "--run_name",
         args.run_name,
     ]
+    common_args.append("--entropy_window")
+    common_args.extend(str(window) for window in args.entropy_window)
+    common_args.extend(
+        [
+            "--use_entropy_reward" if args.use_entropy_reward else "--no_entropy_reward",
+            "--use_uncertainty_penalty"
+            if args.use_uncertainty_penalty
+            else "--no_uncertainty_penalty",
+            "--feature_level" if args.feature_level else "--no_feature_level",
+            "--is_sorted" if args.is_sorted else "--no_sorted",
+        ]
+    )
     if args.item_embedding_path:
         common_args.extend(["--item_embedding_path", args.item_embedding_path])
     if args.predicted_mat_path:
         common_args.extend(["--predicted_mat_path", args.predicted_mat_path])
+    if args.maxvar_mat_path:
+        common_args.extend(["--maxvar_mat_path", args.maxvar_mat_path])
     return common_args
 
 

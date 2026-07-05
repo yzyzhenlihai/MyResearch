@@ -100,6 +100,40 @@ class RuleBasedLeaveModel:
             updated[batch_index, -1] = item_ids[batch_index]
         return updated
 
+    def first_violation_steps(
+        self,
+        leave_history_item_ids: torch.Tensor,
+        chunk_item_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """判断完整 action chunk 中第一次触发退出规则的位置。
+
+        Args:
+            leave_history_item_ids (torch.Tensor): chunk 执行前的历史 item，
+                形状为 `(B, H)`，无效位置为 `-1`。
+            chunk_item_ids (torch.Tensor): 当前 chunk 内 item，形状为 `(B, K)`。
+
+        Returns:
+            torch.Tensor: 每个样本第一次触发退出规则的 step，下标从 0 开始；
+            未触发时返回 `-1`。
+        """
+
+        history_np = leave_history_item_ids.detach().cpu().numpy()
+        chunk_np = chunk_item_ids.detach().cpu().numpy()
+        violation_steps: List[int] = []
+        for history, chunk_items in zip(history_np, chunk_np):
+            valid_history = [int(item) for item in history if int(item) != INVALID_ITEM_ID]
+            first_step = -1
+            for step_index, item_id in enumerate(chunk_items):
+                item_id = int(item_id)
+                if item_id == INVALID_ITEM_ID:
+                    continue
+                if self._should_leave_by_history(valid_history, item_id):
+                    first_step = int(step_index)
+                    break
+                valid_history.append(item_id)
+            violation_steps.append(first_step)
+        return torch.as_tensor(violation_steps, dtype=torch.long, device=chunk_item_ids.device)
+
     def _should_leave_one(self, history: np.ndarray, item_id: int, env_step: int) -> bool:
         """判断单个样本是否触发离开。
 
@@ -116,6 +150,27 @@ class RuleBasedLeaveModel:
             return False
         valid_history = [int(item) for item in history if int(item) != INVALID_ITEM_ID]
         window_actions = valid_history[-self.num_leave_compute :]
+        hist_categories: List[int] = []
+        for historical_item in window_actions:
+            hist_categories.extend(self.list_feat_small[historical_item])
+        hist_counter = Counter(hist_categories)
+        for category in self.list_feat_small[item_id]:
+            if hist_counter[category] > self.leave_threshold:
+                return True
+        return False
+
+    def _should_leave_by_history(self, valid_history: Sequence[int], item_id: int) -> bool:
+        """基于完整有效历史判断候选 item 是否违反退出规则。
+
+        Args:
+            valid_history (Sequence[int]): 已执行 item 历史。
+            item_id (int): 当前候选 item id。
+
+        Returns:
+            bool: 是否触发退出规则。
+        """
+
+        window_actions = list(valid_history)[-self.num_leave_compute :]
         hist_categories: List[int] = []
         for historical_item in window_actions:
             hist_categories.extend(self.list_feat_small[historical_item])

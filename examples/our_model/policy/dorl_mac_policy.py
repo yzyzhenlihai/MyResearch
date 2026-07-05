@@ -51,6 +51,9 @@ class DORLMACPolicyAdapter:
         self.device = device
         self.n_items = action_mapper.num_items
         self.action_dim = action_mapper.action_dim
+        self.chunk_size = agent.chunk_size
+        self._cached_chunks: Optional[torch.Tensor] = None
+        self._cached_positions: Optional[torch.Tensor] = None
 
     def __call__(
         self,
@@ -96,11 +99,18 @@ class DORLMACPolicyAdapter:
             buffer=buffer,
             indices=indices,
         )
-        chunks = self.agent.select_chunks(states.float(), num_samples=self.num_samples_test)
-        first_action_embedding = chunks[:, : self.action_dim]
+        chunk_actions = self._next_chunk_actions(
+            states=states.float(),
+            reset_mask=self._get_reset_mask(batch=batch, batch_size=states.shape[0]),
+        )
         return Batch(
-            act=first_action_embedding.detach().cpu().numpy(),
-            policy=Batch(mac_recommended_mask=recommended_mask.detach().cpu().numpy()),
+            act=chunk_actions.detach().cpu().numpy(),
+            policy=Batch(
+                mac_recommended_mask=recommended_mask.detach().cpu().numpy(),
+                mac_chunk_position=self._cached_positions.detach().cpu().numpy()
+                if self._cached_positions is not None
+                else None,
+            ),
         )
 
     def map_action(self, batch: Batch) -> np.ndarray:
@@ -175,6 +185,7 @@ class DORLMACPolicyAdapter:
 
         self.agent.train(mode)
         self.state_tracker.train(mode)
+        self.reset_chunk_cache()
 
     def eval(self, mode: bool = True) -> None:
         """切换评估模式。
@@ -189,6 +200,80 @@ class DORLMACPolicyAdapter:
         del mode
         self.agent.eval()
         self.state_tracker.eval()
+        self.reset_chunk_cache()
+
+    def reset_chunk_cache(self) -> None:
+        """清空评估期 action chunk 缓存。
+
+        Returns:
+            None.
+        """
+
+        self._cached_chunks = None
+        self._cached_positions = None
+
+    def _next_chunk_actions(self, states: torch.Tensor, reset_mask: torch.Tensor) -> torch.Tensor:
+        """按 chunk 缓存顺序返回当前步 action embedding。
+
+        Args:
+            states (torch.Tensor): 当前状态，形状为 `(B, state_dim)`。
+            reset_mask (torch.Tensor): 哪些行是新 episode，需要丢弃旧缓存。
+
+        Returns:
+            torch.Tensor: 当前步 action embedding，形状为 `(B, action_dim)`。
+        """
+
+        batch_size = int(states.shape[0])
+        if (
+            self._cached_chunks is None
+            or self._cached_positions is None
+            or self._cached_chunks.shape[0] != batch_size
+        ):
+            self._cached_chunks = torch.zeros(
+                batch_size,
+                self.chunk_size,
+                self.action_dim,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._cached_positions = torch.full(
+                (batch_size,),
+                self.chunk_size,
+                dtype=torch.long,
+                device=self.device,
+            )
+
+        reset_mask = reset_mask.to(device=self.device, dtype=torch.bool)
+        self._cached_positions[reset_mask] = self.chunk_size
+        refill_mask = self._cached_positions >= self.chunk_size
+        if refill_mask.any():
+            refill_states = states[refill_mask].to(device=self.device, dtype=torch.float32)
+            new_chunks = self.agent.select_chunks(refill_states, num_samples=self.num_samples_test)
+            self._cached_chunks[refill_mask] = new_chunks.view(-1, self.chunk_size, self.action_dim)
+            self._cached_positions[refill_mask] = 0
+
+        row_indices = torch.arange(batch_size, device=self.device)
+        positions = self._cached_positions.clamp(min=0, max=self.chunk_size - 1)
+        actions = self._cached_chunks[row_indices, positions]
+        self._cached_positions = self._cached_positions + 1
+        return actions
+
+    def _get_reset_mask(self, batch: Batch, batch_size: int) -> torch.Tensor:
+        """从 Collector batch 中读取 episode 起始标记。
+
+        Args:
+            batch (Batch): Collector 当前 batch。
+            batch_size (int): 当前 batch 大小。
+
+        Returns:
+            torch.Tensor: bool reset mask，形状为 `(B,)`。
+        """
+
+        if hasattr(batch, "is_start"):
+            is_start = np.asarray(batch.is_start, dtype=bool).reshape(-1)
+            if is_start.shape[0] == batch_size:
+                return torch.as_tensor(is_start, dtype=torch.bool, device=self.device)
+        return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
 
     def _get_recommend_mask(
         self,

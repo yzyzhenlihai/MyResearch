@@ -10,6 +10,7 @@ export PYTHONPATH="${PWD}:${PWD}/src:${PWD}/src/DeepCTR-Torch:${PWD}/src/tiansho
 
 PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/python}"
 DRY_RUN="${DRY_RUN:-0}"
+RESET_METRICS="${RESET_METRICS:-1}"
 
 ENV_NAME="${ENV_NAME:-KuaiEnv-v0}"
 USER_MODEL_NAME="${USER_MODEL_NAME:-DeepFM}"
@@ -21,19 +22,30 @@ WINDOW_SIZE="${WINDOW_SIZE:-3}"
 CHUNK_SIZE="${CHUNK_SIZE:-3}"
 GAMMA="${GAMMA:-0.9}"
 SEED="${SEED:-2023}"
-DEVICE="${DEVICE:-cuda:1}"
-CUDA="${CUDA:-0}"
+DEVICE="${DEVICE:-cuda:2}"
+CUDA="${CUDA:-2}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 MAX_TURN="${MAX_TURN:-30}"
-FORCE_LENGTH="${FORCE_LENGTH:-10}"
+FORCE_LENGTH="${FORCE_LENGTH:-${MAX_TURN}}"
 NUM_LEAVE_COMPUTE="${NUM_LEAVE_COMPUTE:-9}"
 LEAVE_THRESHOLD="${LEAVE_THRESHOLD:-1.0}"
+INVALID_ACTION_PENALTY="${INVALID_ACTION_PENALTY:--1.0}"
 
 # 默认为空表示使用全量离线轨迹和全量 action chunks。
 MAX_TRAJECTORIES="${MAX_TRAJECTORIES:-}"
 MAX_CHUNKS="${MAX_CHUNKS:-}"
 ITEM_EMBEDDING_PATH="${ITEM_EMBEDDING_PATH:-}"
 PREDICTED_MAT_PATH="${PREDICTED_MAT_PATH:-}"
+MAXVAR_MAT_PATH="${MAXVAR_MAT_PATH:-}"
+
+USE_ENTROPY_REWARD="${USE_ENTROPY_REWARD:-1}"
+USE_UNCERTAINTY_PENALTY="${USE_UNCERTAINTY_PENALTY:-1}"
+LAMBDA_ENTROPY="${LAMBDA_ENTROPY:-5.0}"
+LAMBDA_VARIANCE="${LAMBDA_VARIANCE:-0.05}"
+ENTROPY_WINDOW="${ENTROPY_WINDOW:-1 2}"
+FEATURE_LEVEL="${FEATURE_LEVEL:-1}"
+IS_SORTED="${IS_SORTED:-1}"
+DYNAMICS_LOSS_WEIGHT="${DYNAMICS_LOSS_WEIGHT:-1.0}"
 
 ACTOR_BACKEND="${ACTOR_BACKEND:-flow}"
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-100000}"
@@ -68,6 +80,8 @@ MAC_SAVE_DIR="${MAC_SAVE_DIR:-${RUN_DIR}/mac_agent}"
 EVAL_SAVE_DIR="${EVAL_SAVE_DIR:-${RUN_DIR}/eval}"
 FLOW_ACTOR_CKPT="${FLOW_ACTOR_CKPT:-}"
 
+read -r -a ENTROPY_WINDOW_ARGS <<< "${ENTROPY_WINDOW}"
+
 COMMON_ARGS=(
   --env "${ENV_NAME}"
   --user_model_name "${USER_MODEL_NAME}"
@@ -86,6 +100,11 @@ COMMON_ARGS=(
   --leave_threshold "${LEAVE_THRESHOLD}"
   --max_turn "${MAX_TURN}"
   --force_length "${FORCE_LENGTH}"
+  --invalid_action_penalty "${INVALID_ACTION_PENALTY}"
+  --lambda_entropy "${LAMBDA_ENTROPY}"
+  --lambda_variance "${LAMBDA_VARIANCE}"
+  --entropy_window "${ENTROPY_WINDOW_ARGS[@]}"
+  --dynamics_loss_weight "${DYNAMICS_LOSS_WEIGHT}"
 )
 
 if [[ -n "${MAX_TRAJECTORIES}" ]]; then
@@ -100,12 +119,58 @@ fi
 if [[ -n "${PREDICTED_MAT_PATH}" ]]; then
   COMMON_ARGS+=(--predicted_mat_path "${PREDICTED_MAT_PATH}")
 fi
+if [[ -n "${MAXVAR_MAT_PATH}" ]]; then
+  COMMON_ARGS+=(--maxvar_mat_path "${MAXVAR_MAT_PATH}")
+fi
+if [[ "${USE_ENTROPY_REWARD}" == "1" || "${USE_ENTROPY_REWARD}" == "true" || "${USE_ENTROPY_REWARD}" == "True" ]]; then
+  COMMON_ARGS+=(--use_entropy_reward)
+else
+  COMMON_ARGS+=(--no_entropy_reward)
+fi
+if [[ "${USE_UNCERTAINTY_PENALTY}" == "1" || "${USE_UNCERTAINTY_PENALTY}" == "true" || "${USE_UNCERTAINTY_PENALTY}" == "True" ]]; then
+  COMMON_ARGS+=(--use_uncertainty_penalty)
+else
+  COMMON_ARGS+=(--no_uncertainty_penalty)
+fi
+if [[ "${FEATURE_LEVEL}" == "1" || "${FEATURE_LEVEL}" == "true" || "${FEATURE_LEVEL}" == "True" ]]; then
+  COMMON_ARGS+=(--feature_level)
+else
+  COMMON_ARGS+=(--no_feature_level)
+fi
+if [[ "${IS_SORTED}" == "1" || "${IS_SORTED}" == "true" || "${IS_SORTED}" == "True" ]]; then
+  COMMON_ARGS+=(--is_sorted)
+else
+  COMMON_ARGS+=(--no_sorted)
+fi
 
 run_command() {
   local cmd=("$@")
   printf '\n[run_dorl_mac_kuai_train] %s\n' "${cmd[*]}"
   if [[ "${DRY_RUN}" != "1" ]]; then
     "${cmd[@]}"
+  fi
+}
+
+is_truthy() {
+  local raw_value="$1"
+  [[ "${raw_value}" == "1" || "${raw_value}" == "true" || "${raw_value}" == "True" || "${raw_value}" == "yes" || "${raw_value}" == "YES" ]]
+}
+
+reset_metrics_log() {
+  local metrics_path="$1"
+  local stage_name="$2"
+
+  if ! is_truthy "${RESET_METRICS}"; then
+    printf '[run_dorl_mac_kuai_train] keep existing %s metrics: %s\n' \
+      "${stage_name}" "${metrics_path}"
+    return 0
+  fi
+
+  printf '[run_dorl_mac_kuai_train] reset %s metrics: %s\n' \
+    "${stage_name}" "${metrics_path}"
+  if [[ "${DRY_RUN}" != "1" ]]; then
+    mkdir -p "$(dirname "${metrics_path}")"
+    : > "${metrics_path}"
   fi
 }
 
@@ -138,6 +203,9 @@ printf '[run_dorl_mac_kuai_train] actor_backend=%s, pretrain_steps=%s, flow_step
   "${ACTOR_BACKEND}" "${PRETRAIN_STEPS}" "${FLOW_STEPS}"
 printf '[run_dorl_mac_kuai_train] epoch=%s, step_per_epoch=%s, test_num=%s\n' \
   "${EPOCH}" "${STEP_PER_EPOCH}" "${TEST_NUM}"
+printf '[run_dorl_mac_kuai_train] reward: entropy=%s(lambda=%s, window=%s), uncertainty=%s(lambda=%s), invalid_penalty=%s\n' \
+  "${USE_ENTROPY_REWARD}" "${LAMBDA_ENTROPY}" "${ENTROPY_WINDOW}" \
+  "${USE_UNCERTAINTY_PENALTY}" "${LAMBDA_VARIANCE}" "${INVALID_ACTION_PENALTY}"
 printf '[run_dorl_mac_kuai_train] swanlab projects: flow=%s, qv=%s, eval=%s\n' \
   "${FLOW_SWANLAB_PROJECT}" "${QV_SWANLAB_PROJECT}" "${EVAL_SWANLAB_PROJECT}"
 
@@ -169,6 +237,7 @@ if [[ "${DRY_RUN}" != "1" && ! -f "${FLOW_ACTOR_CKPT}" ]]; then
   exit 1
 fi
 
+reset_metrics_log "${MAC_SAVE_DIR}/metrics.jsonl" "qv"
 run_command \
   "${PYTHON_BIN}" examples/our_model/runners/train_dorl_mac_qv.py \
   "${COMMON_ARGS[@]}" \
@@ -189,6 +258,7 @@ run_command \
   --eval_save_dir "${MAC_SAVE_DIR}/eval_during_train" \
   --log_interval "${QV_LOG_INTERVAL}"
 
+reset_metrics_log "${EVAL_SAVE_DIR}/metrics.jsonl" "eval"
 run_command \
   "${PYTHON_BIN}" examples/our_model/runners/eval_dorl_mac.py \
   "${COMMON_ARGS[@]}" \

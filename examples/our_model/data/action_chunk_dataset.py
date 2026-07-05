@@ -25,6 +25,9 @@ INVALID_ITEM_ID = -1
 ACTION_MATCH_ATOL = 1e-6
 """action embedding 精确反查失败时允许的数值误差上限。"""
 
+LOCAL_ROLLOUT_START_STEP = 0
+"""Q/V 局部 chunk rollout 的默认起始底层 action 计数。"""
+
 
 class ActionChunkDataset(Dataset):
     """从离线用户轨迹在线派生 action chunk 样本。
@@ -115,7 +118,7 @@ class ActionChunkDataset(Dataset):
 
         Returns:
             Dict[str, torch.Tensor]: 包含 state、chunk action、K 步 next state、
-            reward、history 和 mask 的张量字典。
+            reward、history、mask、离线绝对起点和局部 rollout 起点的张量字典。
 
         Raises:
             IndexError: 当索引越界时抛出。
@@ -179,7 +182,9 @@ class ActionChunkDataset(Dataset):
             "chunk_item_ids": item_chunk.astype(np.int64),
             "user_id": np.asarray([int(trajectory["user_id"])], dtype=np.int64),
             "start_index": np.asarray([start_index], dtype=np.int64),
-            "env_step": np.asarray([start_index], dtype=np.int64),
+            # `start_index` 是离线长轨迹中的绝对位置；Q/V 训练的 chunk rollout
+            # 从当前采样状态作为局部起点开始，不能用绝对位置和 max_turn 比较。
+            "env_step": np.asarray([LOCAL_ROLLOUT_START_STEP], dtype=np.int64),
         }
         return {key: torch.as_tensor(value) for key, value in sample.items()}
 

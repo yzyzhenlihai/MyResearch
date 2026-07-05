@@ -95,7 +95,12 @@ def main(argv: Optional[list[str]] = None) -> Path:
     env, env_dataset, kwargs_um = build_env_assets(args)
     item_embeddings = load_item_embeddings(args.item_embedding_path)
     action_mapper = ActionMapper(item_embeddings=item_embeddings, device=device)
-    reward_model, leave_model = build_reward_and_leave(args, env=env, device=device)
+    reward_model, leave_model = build_reward_and_leave(
+        args,
+        env=env,
+        dataset=env_dataset,
+        device=device,
+    )
     agent = build_agent(
         args,
         device=device,

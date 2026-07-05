@@ -33,6 +33,6 @@ PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/pytho
   --flow_steps 2 \
   --actor_backend mlp_bc \
   --max_turn 5 \
-  --force_length 1 \
+  --force_length 5 \
   --swanlab_project DORL-MAC \
   --run_name dorl-mac

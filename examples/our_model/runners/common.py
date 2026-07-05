@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple
 
@@ -23,6 +24,10 @@ for relative_path in ["./src", "./src/DeepCTR-Torch", "./src/tianshou", "./examp
         sys.path.insert(0, resolved)
 
 from src.core.util.data import get_env_args, get_true_env  # noqa: E402
+from src.core.util.entropy_penalty import (  # noqa: E402
+    accumulate_entropy_counts_for_row,
+    finalize_entropy_map,
+)
 
 from examples.our_model.data import ActionChunkDataset, TrajectoryLoader  # noqa: E402
 import examples.our_model.models.mac_agent as mac_agent_module  # noqa: E402
@@ -180,6 +185,28 @@ def default_predicted_mat_path(env: str, user_model_name: str, read_message: str
     )
 
 
+def default_maxvar_mat_path(env: str, user_model_name: str, read_message: str) -> str:
+    """构造默认 user model variance matrix 路径。
+
+    Args:
+        env (str): 环境名。
+        user_model_name (str): user model 名称。
+        read_message (str): user model 训练标识。
+
+    Returns:
+        str: max variance matrix 路径。
+    """
+
+    return str(
+        PROJECT_ROOT
+        / "saved_models"
+        / env
+        / user_model_name
+        / "matsVar"
+        / f"[{read_message}]_matVar.pickle"
+    )
+
+
 def load_item_embeddings(item_embedding_path: str) -> torch.Tensor:
     """加载 item embedding 表。
 
@@ -229,6 +256,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--random_init", action="store_true", default=False)
     parser.add_argument("--item_embedding_path", type=str, default="")
     parser.add_argument("--predicted_mat_path", type=str, default="")
+    parser.add_argument("--maxvar_mat_path", type=str, default="")
     parser.add_argument("--save_root", type=str, default=DEFAULT_SAVE_ROOT)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--max_trajectories", type=int, default=None)
@@ -240,9 +268,25 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num_leave_compute", type=int, default=9)
     parser.add_argument("--leave_threshold", type=float, default=1.0)
     parser.add_argument("--max_turn", type=int, default=30)
-    parser.add_argument("--force_length", type=int, default=10)
+    parser.add_argument("--force_length", type=int, default=30)
+    parser.add_argument("--invalid_action_penalty", type=float, default=-1.0)
     parser.add_argument("--use_exposure_intervention", action="store_true", default=False)
-    parser.add_argument("--use_entropy_reward", action="store_true", default=False)
+    parser.add_argument("--use_entropy_reward", dest="use_entropy_reward", action="store_true")
+    parser.add_argument("--no_entropy_reward", dest="use_entropy_reward", action="store_false")
+    parser.set_defaults(use_entropy_reward=True)
+    parser.add_argument("--use_uncertainty_penalty", dest="use_uncertainty_penalty", action="store_true")
+    parser.add_argument("--no_uncertainty_penalty", dest="use_uncertainty_penalty", action="store_false")
+    parser.set_defaults(use_uncertainty_penalty=True)
+    parser.add_argument("--lambda_entropy", type=float, default=5.0)
+    parser.add_argument("--lambda_variance", type=float, default=0.05)
+    parser.add_argument("--entropy_window", type=int, nargs="*", default=[1, 2])
+    parser.add_argument("--feature_level", dest="feature_level", action="store_true")
+    parser.add_argument("--no_feature_level", dest="feature_level", action="store_false")
+    parser.set_defaults(feature_level=True)
+    parser.add_argument("--is_sorted", dest="is_sorted", action="store_true")
+    parser.add_argument("--no_sorted", dest="is_sorted", action="store_false")
+    parser.set_defaults(is_sorted=True)
+    parser.add_argument("--dynamics_loss_weight", type=float, default=1.0)
 
 
 def resolve_common_paths(args: argparse.Namespace) -> None:
@@ -267,6 +311,12 @@ def resolve_common_paths(args: argparse.Namespace) -> None:
             args.user_model_name,
             args.read_message,
         )
+    if not args.maxvar_mat_path:
+        args.maxvar_mat_path = default_maxvar_mat_path(
+            args.env,
+            args.user_model_name,
+            args.read_message,
+        )
 
 
 def build_dataset_and_mapper(
@@ -285,13 +335,14 @@ def build_dataset_and_mapper(
 
     item_embeddings = load_item_embeddings(args.item_embedding_path)
     bundle = TrajectoryLoader(args.dataset_path).load(max_trajectories=args.max_trajectories)
+    entropy_history_size = max([args.num_leave_compute, args.max_turn] + list(args.entropy_window or [0]))
     dataset = ActionChunkDataset(
         bundle=bundle,
         item_embeddings=item_embeddings,
         chunk_size=args.chunk_size,
         gamma=args.gamma,
         window_size=args.window_size,
-        leave_history_size=args.num_leave_compute,
+        leave_history_size=entropy_history_size,
         max_chunks=args.max_chunks,
     )
     dataset.validate_action_lookup(max_trajectories=args.max_trajectories)
@@ -309,14 +360,31 @@ def build_env_assets(args: argparse.Namespace) -> Tuple[Any, Any, Dict[str, Any]
         Tuple[Any, Any, Dict[str, Any]]: env、dataset 和 env kwargs。
     """
 
+    preserved_names = (
+        "num_leave_compute",
+        "leave_threshold",
+        "max_turn",
+        "force_length",
+        "entropy_window",
+    )
+    preserved_values = {
+        name: getattr(args, name)
+        for name in preserved_names
+        if hasattr(args, name)
+    }
     env_args = get_env_args(args)
+    for name, value in preserved_values.items():
+        setattr(env_args, name, value)
+    LOGGER.info("开始构造 DORL true env：env=%s", env_args.env)
     env, dataset, kwargs_um = get_true_env(env_args)
+    LOGGER.info("DORL true env 构造完成：env=%s", env_args.env)
     return env, dataset, kwargs_um
 
 
 def build_reward_and_leave(
     args: argparse.Namespace,
     env: Any,
+    dataset: Any,
     device: torch.device,
 ) -> Tuple[DORLRewardModel, RuleBasedLeaveModel]:
     """构造 reward model 和 leave model。
@@ -324,6 +392,7 @@ def build_reward_and_leave(
     Args:
         args (argparse.Namespace): 命令行参数。
         env (Any): KuaiEnv 实例。
+        dataset (Any): 原项目数据集对象，用于构造 entropy 统计。
         device (torch.device): 计算设备。
 
     Returns:
@@ -334,13 +403,29 @@ def build_reward_and_leave(
         int(raw_user_id): int(index)
         for index, raw_user_id in enumerate(env.lbe_user.classes_)
     }
+    entropy_map, map_item_feat, entropy_min = build_entropy_reward_assets(args, dataset)
+    if hasattr(env, "lbe_item") and env.lbe_item is not None:
+        internal_to_raw_item_ids = [int(item_id) for item_id in env.lbe_item.classes_]
+    else:
+        internal_to_raw_item_ids = list(range(env.mat.shape[1]))
     reward_model = DORLRewardModel(
         predicted_mat_path=args.predicted_mat_path,
+        maxvar_mat_path=args.maxvar_mat_path,
         raw_user_to_index=raw_user_to_index,
+        internal_to_raw_item_ids=internal_to_raw_item_ids,
         device=device,
         reward_shift=True,
         use_exposure_intervention=args.use_exposure_intervention,
         use_entropy_reward=args.use_entropy_reward,
+        entropy_map=entropy_map,
+        entropy_window=args.entropy_window,
+        lambda_entropy=args.lambda_entropy,
+        entropy_min=entropy_min,
+        feature_level=args.feature_level,
+        map_item_feat=map_item_feat,
+        is_sorted=args.is_sorted,
+        use_uncertainty_penalty=args.use_uncertainty_penalty,
+        lambda_variance=args.lambda_variance,
     )
     leave_model = RuleBasedLeaveModel(
         list_feat_small=env.list_feat_small,
@@ -349,6 +434,66 @@ def build_reward_and_leave(
         max_turn=args.max_turn,
     )
     return reward_model, leave_model
+
+
+def build_entropy_reward_assets(
+    args: argparse.Namespace,
+    dataset: Any,
+) -> Tuple[Dict[Tuple[int, ...], float], Dict[int, Any], float]:
+    """构造 DORL entropy reward 所需查表和下界。
+
+    Args:
+        args (argparse.Namespace): 命令行参数。
+        dataset (Any): 原项目数据集对象。
+
+    Returns:
+        Tuple[Dict[Tuple[int, ...], float], Dict[int, Any], float]: entropy 查表、
+        raw item 到特征列表的映射和 entropy 下界。
+    """
+
+    if not args.use_entropy_reward:
+        return {}, {}, 0.0
+    LOGGER.info("开始构造 DORL entropy reward assets")
+    df_train, _, df_item, _ = dataset.get_train_data()
+    if "timestamp" in df_train.columns:
+        df_uit = df_train[["user_id", "item_id", "timestamp"]].sort_values(["user_id", "timestamp"])
+    elif "time_ms" in df_train.columns:
+        df_uit = df_train[["user_id", "item_id", "time_ms"]].sort_values(["user_id", "time_ms"])
+    else:
+        df_uit = df_train[["user_id", "item_id"]].sort_values(["user_id"])
+
+    map_item_feat = dict(zip(df_item.index, df_item["tags"])) if args.feature_level else {}
+    map_hist_count = defaultdict(lambda: defaultdict(int))
+    last_user = None
+    history_items = []
+    for row in df_uit.to_numpy():
+        user_id = int(row[0])
+        item_id = int(row[1])
+        if user_id != last_user:
+            last_user = user_id
+            history_items = []
+        accumulate_entropy_counts_for_row(
+            map_hist_count=map_hist_count,
+            hist_tra=history_items,
+            item=item_id,
+            entropy_window=args.entropy_window,
+            feature_level=args.feature_level,
+            map_item_feat=map_item_feat if args.feature_level else None,
+            is_sorted=args.is_sorted,
+        )
+        history_items.append(item_id)
+
+    entropy_map = finalize_entropy_map(map_hist_count)
+    entropy_min = 0.0
+    for entropy_term in set(args.entropy_window) - {0}:
+        values = [value for key, value in entropy_map.items() if len(key) == entropy_term]
+        entropy_min += min(values + [1.0])
+    LOGGER.info(
+        "DORL entropy reward assets 构造完成：entries=%s, entropy_min=%s",
+        len(entropy_map),
+        entropy_min,
+    )
+    return entropy_map, map_item_feat, float(entropy_min)
 
 
 def build_agent(
@@ -390,6 +535,8 @@ def build_agent(
         reward_model=reward_model,
         leave_model=leave_model,
         target_tau=getattr(args, "target_tau", 0.005),
+        invalid_action_penalty=getattr(args, "invalid_action_penalty", -1.0),
+        dynamics_loss_weight=getattr(args, "dynamics_loss_weight", 1.0),
     )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +46,15 @@ LEGACY_EPOCH_SENTINEL = 0
 
 DEFAULT_EVAL_EPISODES_SENTINEL = 0
 """评估 episode 为 0 时复用 DORL 的 `test_num` 语义。"""
+
+METRICS_TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+"""Q/V 本地指标日志文件名使用的时间戳格式。"""
+
+METRICS_LOG_PREFIX = "metrics"
+"""Q/V 本地指标日志文件名前缀。"""
+
+METRICS_LOG_SUFFIX = ".jsonl"
+"""Q/V 本地指标日志文件后缀。"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,6 +127,31 @@ def resolve_epoch_schedule(args: argparse.Namespace) -> tuple[int, int, int]:
     return epoch, step_per_epoch, total_steps
 
 
+def build_timestamped_metrics_path(save_dir: Path) -> Path:
+    """构造本次 Q/V 训练独立使用的时间戳指标日志路径。
+
+    Args:
+        save_dir (Path): Q/V 训练输出目录。
+
+    Returns:
+        Path: 形如 `metrics_YYYYMMDD_HHMMSS.jsonl` 的日志路径。
+        如果同一秒内已有同名文件，则追加递增后缀避免覆盖。
+    """
+
+    timestamp = datetime.now().strftime(METRICS_TIMESTAMP_FORMAT)
+    base_path = save_dir / f"{METRICS_LOG_PREFIX}_{timestamp}{METRICS_LOG_SUFFIX}"
+    if not base_path.exists():
+        return base_path
+    suffix_index = 1
+    while True:
+        candidate_path = save_dir / (
+            f"{METRICS_LOG_PREFIX}_{timestamp}_{suffix_index:03d}{METRICS_LOG_SUFFIX}"
+        )
+        if not candidate_path.exists():
+            return candidate_path
+        suffix_index += 1
+
+
 def main(argv: Optional[list[str]] = None) -> Path:
     """执行 Q/V 训练。
 
@@ -156,12 +191,19 @@ def main(argv: Optional[list[str]] = None) -> Path:
         args.save_dir
         or Path(args.save_root) / args.env / "DORL_MAC" / "mac_agent"
     )
+    metrics_log_path = build_timestamped_metrics_path(save_dir)
+    args.metrics_log_path = str(metrics_log_path)
     config = namespace_to_dict(args)
     save_resolved_config(save_dir, config)
 
     dataset, action_mapper, _ = build_dataset_and_mapper(args, device=device)
     env, env_dataset, kwargs_um = build_env_assets(args)
-    reward_model, leave_model = build_reward_and_leave(args, env=env, device=device)
+    reward_model, leave_model = build_reward_and_leave(
+        args,
+        env=env,
+        dataset=env_dataset,
+        device=device,
+    )
     agent = build_agent(
         args,
         device=device,
@@ -197,8 +239,9 @@ def main(argv: Optional[list[str]] = None) -> Path:
         project=args.swanlab_project,
         run_name=default_run_name("qv", args),
         config=config,
-        log_path=str(save_dir / "metrics.jsonl"),
+        log_path=str(metrics_log_path),
     )
+    LOGGER.info("Q/V 本地指标日志路径：%s", metrics_log_path)
 
     LOGGER.info(
         "开始 DORL-MAC Q/V 训练：epoch=%s, step_per_epoch=%s, total_steps=%s",

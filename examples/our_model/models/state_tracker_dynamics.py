@@ -3,28 +3,38 @@
 from __future__ import annotations
 
 import torch
+from torch import nn
 
 
-class StateTrackerDynamics:
+class StateTrackerDynamics(nn.Module):
     """用历史向量追加 action chunk 后重算推荐状态。
 
-    第一版只实现 `avg_direct`：状态向量由最近 `window_size` 个
-    `(item_embedding, reward)` 或 reset dummy 向量求平均得到，不训练额外
-    dynamics 网络。
+    基础状态沿用 `avg_direct`：状态向量由最近 `window_size` 个
+    `(item_embedding, reward)` 或 reset dummy 向量求平均得到。为满足与 Q/V
+    一起训练的需求，模块额外提供一个零初始化 residual 网络；训练初始时
+    完全等价于原 avg dynamics，后续可通过监督 next-state loss 学习修正项。
     """
 
-    def __init__(self, window_size: int, action_dim: int, state_dim: int) -> None:
+    def __init__(
+        self,
+        window_size: int,
+        action_dim: int,
+        state_dim: int,
+        use_trainable_residual: bool = True,
+    ) -> None:
         """初始化显式 dynamics。
 
         Args:
             window_size (int): StateTrackerAvg 历史窗口长度。
             action_dim (int): action embedding 维度。
             state_dim (int): state 维度，当前应为 `action_dim + 1`。
+            use_trainable_residual (bool): 是否启用可学习 residual 修正。
 
         Raises:
             ValueError: 当维度不合法时抛出。
         """
 
+        super().__init__()
         if window_size <= 0:
             raise ValueError("window_size must be positive.")
         if state_dim != action_dim + 1:
@@ -32,6 +42,18 @@ class StateTrackerDynamics:
         self.window_size = int(window_size)
         self.action_dim = int(action_dim)
         self.state_dim = int(state_dim)
+        self.use_trainable_residual = bool(use_trainable_residual)
+        if self.use_trainable_residual:
+            self.residual = nn.Sequential(
+                nn.Linear(self.state_dim, self.state_dim),
+                nn.Tanh(),
+                nn.Linear(self.state_dim, self.state_dim),
+            )
+            # 零初始化最后一层，保证初始行为与 avg_direct 完全一致。
+            nn.init.zeros_(self.residual[-1].weight)
+            nn.init.zeros_(self.residual[-1].bias)
+        else:
+            self.residual = nn.Identity()
 
     def next_state(
         self,
@@ -71,7 +93,10 @@ class StateTrackerDynamics:
                 raise ValueError("StateTrackerDynamics received no valid history or chunk rows.")
             recent_rows = combined[-self.window_size :]
             next_states.append(recent_rows.mean(dim=0))
-        return torch.stack(next_states, dim=0).to(device=device)
+        avg_states = torch.stack(next_states, dim=0).to(device=device)
+        if not self.use_trainable_residual:
+            return avg_states
+        return avg_states + self.residual(avg_states)
 
     def _validate_inputs(
         self,

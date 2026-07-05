@@ -24,13 +24,13 @@ ACTOR_BACKEND_MLP_BC = "mlp_bc"
 """smoke test 使用的普通 MLP BC actor 后端名称。"""
 
 REPEAT_POLICY_TRUNCATE = "truncate"
-"""训练 rollout 默认重复推荐处理：立即截断 chunk。"""
+"""兼容旧 CLI 的训练策略名；当前语义为重复/退出违规只惩罚不截断。"""
 
 REPEAT_POLICY_MASK = "mask"
 """评估 rollout 默认重复推荐处理：映射时屏蔽已推荐 item。"""
 
 DEFAULT_INVALID_ACTION_PENALTY = -1.0
-"""重复推荐被截断时的固定惩罚。"""
+"""重复 item 或类别退出规则违规时的固定 reward 惩罚。"""
 
 
 @dataclass
@@ -45,7 +45,11 @@ class RolloutResult:
         selected_item_ids (torch.Tensor): 每个 chunk step 映射出的 item id，形状为 `(B, K)`。
         step_rewards (torch.Tensor): 每个有效 step 的 reward，形状为 `(B, K)`。
         chunk_valid (torch.Tensor): 每个 step 是否实际执行，形状为 `(B, K)`。
-        repeat_ratio (torch.Tensor): 当前 batch 中重复截断比例。
+        pred_rewards (torch.Tensor): user model 原始预测 reward，形状为 `(B, K)`。
+        entropy_rewards (torch.Tensor): DORL entropy 项，形状为 `(B, K)`。
+        uncertainty_penalties (torch.Tensor): uncertainty 数值，形状为 `(B, K)`。
+        repeat_ratio (torch.Tensor): 当前 batch 中类别退出规则违规比例。
+        exact_repeat_ratio (torch.Tensor): 当前 batch 中 exact item 重复比例。
     """
 
     next_states: torch.Tensor
@@ -55,7 +59,11 @@ class RolloutResult:
     selected_item_ids: torch.Tensor
     step_rewards: torch.Tensor
     chunk_valid: torch.Tensor
+    pred_rewards: torch.Tensor
+    entropy_rewards: torch.Tensor
+    uncertainty_penalties: torch.Tensor
     repeat_ratio: torch.Tensor
+    exact_repeat_ratio: torch.Tensor
 
 
 class MACAgent(nn.Module):
@@ -81,6 +89,7 @@ class MACAgent(nn.Module):
         leave_model: Optional[RuleBasedLeaveModel] = None,
         target_tau: float = 0.005,
         invalid_action_penalty: float = DEFAULT_INVALID_ACTION_PENALTY,
+        dynamics_loss_weight: float = 1.0,
     ) -> None:
         """初始化 DORL-MAC agent。
 
@@ -97,7 +106,8 @@ class MACAgent(nn.Module):
             reward_model (Optional[DORLRewardModel]): DORL reward 模型。
             leave_model (Optional[RuleBasedLeaveModel]): 规则退出模型。
             target_tau (float): target value 软更新系数。
-            invalid_action_penalty (float): 重复推荐截断惩罚。
+            invalid_action_penalty (float): 重复 item 或类别退出规则违规惩罚。
+            dynamics_loss_weight (float): dynamics 监督 next-state loss 权重。
 
         Raises:
             ValueError: 当关键超参数非法时抛出。
@@ -117,11 +127,12 @@ class MACAgent(nn.Module):
         self.gamma = float(gamma)
         self.device = device
         self.action_mapper = action_mapper
-        self.dynamics = dynamics
+        self.dynamics = dynamics.to(device) if dynamics is not None else None
         self.reward_model = reward_model
         self.leave_model = leave_model
         self.target_tau = float(target_tau)
         self.invalid_action_penalty = float(invalid_action_penalty)
+        self.dynamics_loss_weight = float(dynamics_loss_weight)
 
         self.flow_actor = ChunkFlowActor(
             self.state_dim,
@@ -158,7 +169,10 @@ class MACAgent(nn.Module):
             Iterable[nn.Parameter]: critic 与 value 参数。
         """
 
-        return list(self.critic.parameters()) + list(self.value.parameters())
+        parameters = list(self.critic.parameters()) + list(self.value.parameters())
+        if self.dynamics is not None:
+            parameters += list(self.dynamics.parameters())
+        return parameters
 
     def pretrain_actor_update(
         self,
@@ -343,20 +357,55 @@ class MACAgent(nn.Module):
         value_predictions = self.value(states)
         critic_loss = F.mse_loss(q_values, target_q)
         value_loss = F.mse_loss(value_predictions, target_q)
-        loss = critic_loss + value_loss
+        dynamics_loss = self.supervised_dynamics_loss(batch)
+        loss = critic_loss + value_loss + self.dynamics_loss_weight * dynamics_loss
         loss.backward()
         optimizer.step()
         self.soft_update_target_value()
         return {
             "critic/critic_loss": float(critic_loss.detach().cpu()),
             "value/value_loss": float(value_loss.detach().cpu()),
+            "state_tracker/dynamics_loss": float(dynamics_loss.detach().cpu()),
             "critic/q_mean": float(q_values.detach().mean().cpu()),
             "critic/target_q_mean": float(target_q.detach().mean().cpu()),
             "rollout/reward_chunk": float(rollout.reward_chunks.detach().mean().cpu()),
+            "rollout/pred_reward": self._masked_mean(rollout.pred_rewards, rollout.chunk_valid),
+            "rollout/entropy": self._masked_mean(rollout.entropy_rewards, rollout.chunk_valid),
+            "rollout/uncertainty": self._masked_mean(rollout.uncertainty_penalties, rollout.chunk_valid),
             "rollout/effective_steps": float(rollout.effective_steps.float().detach().mean().cpu()),
             "rollout/done_ratio": float(rollout.done_chunks.float().detach().mean().cpu()),
             "rollout/repeat_ratio": float(rollout.repeat_ratio.detach().cpu()),
+            "rollout/exact_repeat_ratio": float(rollout.exact_repeat_ratio.detach().cpu()),
         }
+
+    def supervised_dynamics_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """用离线真实 chunk 监督训练 StateTrackerDynamics。
+
+        Args:
+            batch (Dict[str, torch.Tensor]): ActionChunkDataset 输出 batch。
+
+        Returns:
+            torch.Tensor: next-state MSE loss；未配置 dynamics 时为 0。
+        """
+
+        if self.dynamics is None or self.dynamics_loss_weight <= 0:
+            return torch.zeros((), device=self.device)
+        target_next_states = self._batch_tensor(batch, "next_observations").float()
+        chunk_actions = self._batch_tensor(batch, "actions").float().view(
+            -1,
+            self.chunk_size,
+            self.action_dim,
+        )
+        chunk_rewards = self._batch_tensor(batch, "chunk_step_rewards").float()
+        chunk_valid = torch.ones_like(chunk_rewards, dtype=torch.bool)
+        predicted_next_states = self.dynamics.next_state(
+            self._batch_tensor(batch, "history_vectors").float(),
+            self._batch_tensor(batch, "history_valid").float(),
+            chunk_actions,
+            chunk_rewards,
+            chunk_valid,
+        )
+        return F.mse_loss(predicted_next_states, target_next_states)
 
     @torch.no_grad()
     def rollout_chunks(
@@ -397,20 +446,27 @@ class MACAgent(nn.Module):
             dtype=torch.long,
             device=self.device,
         )
+        pred_rewards = torch.zeros(batch_size, self.chunk_size, device=self.device)
+        entropy_rewards = torch.zeros(batch_size, self.chunk_size, device=self.device)
+        uncertainty_penalties = torch.zeros(batch_size, self.chunk_size, device=self.device)
         reward_chunks = torch.zeros(batch_size, device=self.device)
         effective_steps = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-        done_chunks = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-        active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
-        repeat_events = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        exact_repeat_events = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        leave_violation_events = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
 
         recommended_mask = self._batch_tensor(batch, "recommended_mask").bool().clone()
         leave_history = self._batch_tensor(batch, "leave_history_item_ids").long().clone()
         raw_user_ids = self._batch_tensor(batch, "user_id").long().view(-1)
-        env_steps = self._batch_tensor(batch, "env_step").long().view(-1)
+        rollout_start_steps = self._batch_tensor(batch, "env_step").long().view(-1)
+        terminal_flags = self._batch_tensor(batch, "terminals").float().view(-1) > 0
+        row_indices = torch.arange(batch_size, device=self.device)
 
         for step_index in range(self.chunk_size):
-            if not bool(active.any().item()):
-                break
+            # `rollout_start_steps` 表示当前 chunk rollout 已经产生的底层 action 数，
+            # 不能使用离线长轨迹中的绝对 start_index，否则会误判超过 max_turn。
+            executable = rollout_start_steps + step_index < self.leave_model.max_turn
+            if not bool(executable.any().item()):
+                continue
             mapper_mask = recommended_mask if repeat_policy == REPEAT_POLICY_MASK else None
             item_ids, _ = self.action_mapper.map_embeddings(
                 chunk_actions_raw[:, step_index, :],
@@ -418,50 +474,52 @@ class MACAgent(nn.Module):
                 topk=1,
             )
             item_ids = item_ids.squeeze(1)
-            selected_item_ids[:, step_index] = item_ids
-            row_indices = torch.arange(batch_size, device=self.device)
-            repeated = recommended_mask[row_indices, item_ids]
-            invalid = active & repeated & (repeat_policy == REPEAT_POLICY_TRUNCATE)
-            if invalid.any():
-                discount = torch.pow(
-                    torch.full_like(effective_steps[invalid].float(), self.gamma),
-                    effective_steps[invalid].float(),
-                )
-                reward_chunks[invalid] += discount * self.invalid_action_penalty
-                repeat_events[invalid] = True
-                done_chunks[invalid] = True
-
-            executable = active & ~invalid
+            selected_item_ids[executable, step_index] = item_ids[executable]
             if executable.any():
-                rewards = self.reward_model.reward(raw_user_ids[executable], item_ids[executable])
+                repeated = recommended_mask[row_indices, item_ids] & executable
+                exact_repeat_events |= repeated
+                leave_violation = self.leave_model.first_violation_steps(
+                    leave_history[executable],
+                    item_ids[executable].unsqueeze(1),
+                ) == 0
+                executable_indices = torch.nonzero(executable, as_tuple=False).view(-1)
+                leave_violation_full = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+                leave_violation_full[executable_indices] = leave_violation
+                leave_violation_events |= leave_violation_full
+
+                history_with_current = self.leave_model.append_items(
+                    leave_history[executable],
+                    item_ids[executable],
+                    torch.ones_like(item_ids[executable], dtype=torch.bool),
+                )
+                reward_components = self.reward_model.reward_components(
+                    raw_user_ids[executable],
+                    item_ids[executable],
+                    history_item_ids=history_with_current,
+                )
+                rewards = reward_components["reward"]
+                penalty_mask = repeated[executable] | leave_violation
+                rewards = rewards + penalty_mask.float() * self.invalid_action_penalty
                 discount = torch.pow(
                     torch.full_like(effective_steps[executable].float(), self.gamma),
                     effective_steps[executable].float(),
                 )
                 reward_chunks[executable] += discount * rewards
                 step_rewards[executable, step_index] = rewards
+                pred_rewards[executable, step_index] = reward_components["pred_reward"]
+                entropy_rewards[executable, step_index] = reward_components["entropy"]
+                uncertainty_penalties[executable, step_index] = reward_components["uncertainty"]
                 chunk_valid[executable, step_index] = True
                 executed_action_embeddings[executable, step_index] = self.action_mapper.item_embeddings[
                     item_ids[executable]
                 ]
-                leave_done = self.leave_model.should_leave_batch(
-                    leave_history[executable],
-                    item_ids[executable],
-                    env_steps[executable],
-                )
                 effective_steps[executable] += 1
                 recommended_mask[executable, item_ids[executable]] = True
-                leave_history[executable] = self.leave_model.append_items(
-                    leave_history[executable],
-                    item_ids[executable],
-                    torch.ones_like(item_ids[executable], dtype=torch.bool),
-                )
-                env_steps[executable] += 1
-                executable_indices = torch.nonzero(executable, as_tuple=False).view(-1)
-                done_chunks[executable_indices[leave_done]] = True
+                leave_history[executable] = history_with_current
 
-            active = active & ~done_chunks
-
+        done_chunks = terminal_flags | (
+            rollout_start_steps + effective_steps >= self.leave_model.max_turn
+        )
         next_states = self.dynamics.next_state(
             self._batch_tensor(batch, "history_vectors").float(),
             self._batch_tensor(batch, "history_valid").float(),
@@ -469,7 +527,8 @@ class MACAgent(nn.Module):
             step_rewards,
             chunk_valid,
         )
-        repeat_ratio = repeat_events.float().mean()
+        repeat_ratio = leave_violation_events.float().mean()
+        exact_repeat_ratio = exact_repeat_events.float().mean()
         return RolloutResult(
             next_states=next_states,
             reward_chunks=reward_chunks,
@@ -478,7 +537,11 @@ class MACAgent(nn.Module):
             selected_item_ids=selected_item_ids,
             step_rewards=step_rewards,
             chunk_valid=chunk_valid,
+            pred_rewards=pred_rewards,
+            entropy_rewards=entropy_rewards,
+            uncertainty_penalties=uncertainty_penalties,
             repeat_ratio=repeat_ratio,
+            exact_repeat_ratio=exact_repeat_ratio,
         )
 
     @torch.no_grad()
@@ -509,6 +572,7 @@ class MACAgent(nn.Module):
             "critic": self.critic.state_dict(),
             "value": self.value.state_dict(),
             "target_value": self.target_value.state_dict(),
+            "dynamics": self.dynamics.state_dict() if self.dynamics is not None else None,
         }
 
     def load_checkpoint_state(self, checkpoint: Dict[str, object], strict: bool = True) -> None:
@@ -538,6 +602,25 @@ class MACAgent(nn.Module):
             self.target_value.load_state_dict(checkpoint["target_value"], strict=strict)
         else:
             self.target_value.load_state_dict(self.value.state_dict(), strict=strict)
+        if self.dynamics is not None and checkpoint.get("dynamics") is not None:
+            self.dynamics.load_state_dict(checkpoint["dynamics"], strict=strict)
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+        """计算有效 step 上的均值。
+
+        Args:
+            values (torch.Tensor): 待统计数值。
+            mask (torch.Tensor): bool 有效标记。
+
+        Returns:
+            float: 有效位置均值；没有有效位置时返回 0。
+        """
+
+        valid_values = values.detach()[mask.detach().bool()]
+        if valid_values.numel() == 0:
+            return 0.0
+        return float(valid_values.mean().cpu())
 
     def _batch_tensor(self, batch: Dict[str, torch.Tensor], key: str) -> torch.Tensor:
         """从 batch 中取张量并移动到 agent 设备。
