@@ -49,6 +49,29 @@ class SwanLabLogger:
         self._swanlab = None
         self._run = None
         self._init_online_if_available()
+        # 在指标日志开头写入一条 event=config 记录，把本次训练的完整超参配置直接
+        # 存到 metrics_*.jsonl 头部；无需再额外查 resolved_config.json，便于事后
+        # 定位与复现。写在 SwanLab 在线初始化之后，兼顾 SwanLab 面板的 config 面板。
+        self._write_config_header()
+
+    def _write_config_header(self) -> None:
+        """把本次训练的配置作为 metrics 日志首行写入。
+
+        Returns:
+            None.
+        """
+
+        header = {
+            "step": 0,
+            "event": "config",
+            "project": self.project,
+            "run_name": self.run_name,
+            "mode": self.mode,
+            "config": self._to_jsonable(self.config),
+        }
+        self._file_obj.write(json.dumps(header, ensure_ascii=False) + "\n")
+        self._file_obj.flush()
+        # 兼容旧下游解析：保留一条 metrics 事件表明 config 已落盘。
         self.log({"event/config_saved": 1.0}, step=0)
 
     def log(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
@@ -103,22 +126,48 @@ class SwanLabLogger:
         )
         LOGGER.info("SwanLab 初始化完成：project=%s, run=%s", self.project, self.run_name)
 
-    @staticmethod
-    def _to_jsonable(metrics: Dict[str, Any]) -> Dict[str, Any]:
-        """把指标转换为 JSON 可序列化对象。
+    @classmethod
+    def _to_jsonable(cls, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """把指标/配置转换为 JSON 可序列化对象。
 
         Args:
-            metrics (Dict[str, Any]): 原始指标。
+            metrics (Dict[str, Any]): 原始指标或配置。
 
         Returns:
-            Dict[str, Any]: JSON 友好的指标。
+            Dict[str, Any]: JSON 友好的字典。
         """
 
-        jsonable = {}
-        for key, value in metrics.items():
-            if hasattr(value, "item"):
-                jsonable[key] = value.item()
-            else:
-                jsonable[key] = value
-        return jsonable
+        return {key: cls._json_safe(value) for key, value in metrics.items()}
+
+    @classmethod
+    def _json_safe(cls, value: Any) -> Any:
+        """递归把任意值转换为 JSON 可序列化对象。
+
+        Args:
+            value (Any): 原始值。
+
+        Returns:
+            Any: JSON 友好的值；对无法序列化的对象退化为其 `str(...)`。
+        """
+
+        # 0 维张量 / numpy 标量 / torch 标量都实现了 .item()
+        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+            try:
+                return value.item()
+            except (TypeError, ValueError):
+                pass
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        if isinstance(value, dict):
+            return {str(k): cls._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [cls._json_safe(v) for v in value]
+        # numpy array 等
+        if hasattr(value, "tolist"):
+            try:
+                return cls._json_safe(value.tolist())
+            except (TypeError, ValueError):
+                pass
+        # Path、torch.device、其它自定义对象降级为字符串
+        return str(value)
 

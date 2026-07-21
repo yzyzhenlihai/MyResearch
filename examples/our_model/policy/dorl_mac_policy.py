@@ -1,4 +1,4 @@
-"""DORL-MAC 到现有 CollectorSet 的策略适配器。"""
+"""DORL-MAC 到现有 CollectorSet 的策略适配器（离散 Categorical + rejection sampling）。"""
 
 from __future__ import annotations
 
@@ -14,11 +14,14 @@ from examples.our_model.policy.action_mapper import ActionMapper
 
 
 class DORLMACPolicyAdapter:
-    """把 MACAgent 适配成现有推荐 Collector 可调用的 policy。
+    """把离散版 MACAgent 适配成现有推荐 Collector 可调用的 policy。
 
-    Collector 需要两个阶段：先调用 `__call__` 生成连续 action embedding，
-    再调用 `map_action` 映射为环境可执行 item id。本适配器复用已有
-    StateTracker 构造 state embedding，不引入 Tianshou A2C 训练链路。
+    Collector 需要两个阶段：先调用 `__call__` 生成 action，再调用 `map_action` 得到
+    环境可执行的 item id。在离散 Categorical MAC 下这两步都直接以 item id 为输出
+    格式：`__call__` 使用 `MACAgent.select_chunks` 采样 K 组 item id 并用 critic
+    打分选出最优 chunk，然后按 chunk 内 step 顺序返回每步的 item id；`map_action`
+    直接返回 identity。因此评估路径不再存在"连续向量 → 相似度点积 → top-1 item"
+    的映射失真环节。
     """
 
     def __init__(
@@ -34,7 +37,8 @@ class DORLMACPolicyAdapter:
         Args:
             agent (MACAgent): 已训练或已加载 checkpoint 的 DORL-MAC agent。
             state_tracker (torch.nn.Module): 与离线数据一致的 StateTrackerAvg。
-            action_mapper (ActionMapper): action embedding 到 item id 的映射器。
+            action_mapper (ActionMapper): 只提供 `num_items` 与 item embedding 表；
+                本适配器不使用它做相似度映射。
             num_samples_test (int): 评估时 rejection sampling 候选数。
             device (torch.device): 计算设备。
 
@@ -52,7 +56,8 @@ class DORLMACPolicyAdapter:
         self.n_items = action_mapper.num_items
         self.action_dim = action_mapper.action_dim
         self.chunk_size = agent.chunk_size
-        self._cached_chunks: Optional[torch.Tensor] = None
+        # chunk 内每步的 item id 缓存，`(B, K)`；`positions` 指向下一步应该出的 chunk step。
+        self._cached_item_ids: Optional[torch.Tensor] = None
         self._cached_positions: Optional[torch.Tensor] = None
 
     def __call__(
@@ -67,21 +72,21 @@ class DORLMACPolicyAdapter:
         use_batch_in_statetracker: bool = True,
         **kwargs: Any,
     ) -> Batch:
-        """生成当前环境步的第一个 chunk action embedding。
+        """生成当前环境步要执行的离散 item id。
 
         Args:
             batch (Batch): Collector 当前 batch。
             buffer (Optional[ReplayBuffer]): Collector replay buffer。
             indices (Optional[np.ndarray]): 当前环境对应的 buffer last indices。
             is_obs (bool): 是否构造 obs state。
-            remove_recommended_ids (bool): 是否启用已推荐 item mask。
+            remove_recommended_ids (bool): 是否在 chunk 边界的候选采样阶段屏蔽已推荐 item。
             is_train (bool): Collector 当前是否训练模式。
             state (Optional[Any]): 兼容 Collector 的 hidden state 参数，当前未使用。
             use_batch_in_statetracker (bool): 是否允许 StateTracker 使用当前 batch。
             **kwargs (Any): 兼容旧 policy 接口的额外参数。
 
         Returns:
-            Batch: 包含连续 action embedding 和推荐 mask 的结果。
+            Batch: `act` 字段为整数 item id，形状 `(B,)`；`policy` 记录当前 chunk 内位置。
         """
 
         del state, kwargs
@@ -99,14 +104,14 @@ class DORLMACPolicyAdapter:
             buffer=buffer,
             indices=indices,
         )
-        chunk_actions = self._next_chunk_actions(
+        item_ids = self._next_chunk_item_ids(
             states=states.float(),
             reset_mask=self._get_reset_mask(batch=batch, batch_size=states.shape[0]),
+            recommended_mask=recommended_mask if remove_recommended_ids else None,
         )
         return Batch(
-            act=chunk_actions.detach().cpu().numpy(),
+            act=item_ids.detach().cpu().numpy().astype(np.int64),
             policy=Batch(
-                mac_recommended_mask=recommended_mask.detach().cpu().numpy(),
                 mac_chunk_position=self._cached_positions.detach().cpu().numpy()
                 if self._cached_positions is not None
                 else None,
@@ -114,29 +119,19 @@ class DORLMACPolicyAdapter:
         )
 
     def map_action(self, batch: Batch) -> np.ndarray:
-        """把连续 action embedding 映射为 item id。
+        """直接返回 `batch.act` 中的 item id。
+
+        离散 Categorical MAC 下 `__call__` 已经输出离散 item id，因此这里只做
+        dtype 与形状规范化，不再执行"连续向量 → 相似度点积 → top-1"的映射。
 
         Args:
-            batch (Batch): Collector 当前数据，其中 `act` 是连续 action embedding。
+            batch (Batch): Collector 当前数据，其中 `act` 是离散 item id。
 
         Returns:
             np.ndarray: 环境可执行 item id，形状为 `(B,)`。
         """
 
-        action_embeddings = torch.as_tensor(batch.act, dtype=torch.float32, device=self.device)
-        recommended_mask = None
-        if hasattr(batch, "policy") and hasattr(batch.policy, "mac_recommended_mask"):
-            recommended_mask = torch.as_tensor(
-                batch.policy.mac_recommended_mask,
-                dtype=torch.bool,
-                device=self.device,
-            )
-        item_ids, _ = self.action_mapper.map_embeddings(
-            action_embeddings,
-            recommended_mask=recommended_mask,
-            topk=1,
-        )
-        return item_ids.squeeze(1).detach().cpu().numpy()
+        return np.asarray(batch.act, dtype=np.int64).reshape(-1)
 
     def map_action_inverse(self, actions: Any) -> Any:
         """兼容 Collector 随机动作接口。
@@ -203,37 +198,43 @@ class DORLMACPolicyAdapter:
         self.reset_chunk_cache()
 
     def reset_chunk_cache(self) -> None:
-        """清空评估期 action chunk 缓存。
+        """清空评估期 chunk item id 缓存。
 
         Returns:
             None.
         """
 
-        self._cached_chunks = None
+        self._cached_item_ids = None
         self._cached_positions = None
 
-    def _next_chunk_actions(self, states: torch.Tensor, reset_mask: torch.Tensor) -> torch.Tensor:
-        """按 chunk 缓存顺序返回当前步 action embedding。
+    def _next_chunk_item_ids(
+        self,
+        states: torch.Tensor,
+        reset_mask: torch.Tensor,
+        recommended_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """按 chunk 缓存顺序返回当前步 item id。
 
         Args:
             states (torch.Tensor): 当前状态，形状为 `(B, state_dim)`。
             reset_mask (torch.Tensor): 哪些行是新 episode，需要丢弃旧缓存。
+            recommended_mask (Optional[torch.Tensor]): 若非空，则在 chunk 边界重新
+                做 rejection sampling 时屏蔽已推荐 item。
 
         Returns:
-            torch.Tensor: 当前步 action embedding，形状为 `(B, action_dim)`。
+            torch.Tensor: 当前步 item id，形状为 `(B,)`。
         """
 
         batch_size = int(states.shape[0])
         if (
-            self._cached_chunks is None
+            self._cached_item_ids is None
             or self._cached_positions is None
-            or self._cached_chunks.shape[0] != batch_size
+            or self._cached_item_ids.shape[0] != batch_size
         ):
-            self._cached_chunks = torch.zeros(
-                batch_size,
-                self.chunk_size,
-                self.action_dim,
-                dtype=torch.float32,
+            self._cached_item_ids = torch.full(
+                (batch_size, self.chunk_size),
+                -1,
+                dtype=torch.long,
                 device=self.device,
             )
             self._cached_positions = torch.full(
@@ -248,15 +249,24 @@ class DORLMACPolicyAdapter:
         refill_mask = self._cached_positions >= self.chunk_size
         if refill_mask.any():
             refill_states = states[refill_mask].to(device=self.device, dtype=torch.float32)
-            new_chunks = self.agent.select_chunks(refill_states, num_samples=self.num_samples_test)
-            self._cached_chunks[refill_mask] = new_chunks.view(-1, self.chunk_size, self.action_dim)
+            refill_recommended_mask = None
+            if recommended_mask is not None:
+                refill_recommended_mask = recommended_mask.to(
+                    device=self.device, dtype=torch.bool
+                )[refill_mask]
+            new_item_ids, _ = self.agent.select_chunks(
+                refill_states,
+                num_samples=self.num_samples_test,
+                recommended_mask=refill_recommended_mask,
+            )
+            self._cached_item_ids[refill_mask] = new_item_ids
             self._cached_positions[refill_mask] = 0
 
         row_indices = torch.arange(batch_size, device=self.device)
         positions = self._cached_positions.clamp(min=0, max=self.chunk_size - 1)
-        actions = self._cached_chunks[row_indices, positions]
+        item_ids = self._cached_item_ids[row_indices, positions]
         self._cached_positions = self._cached_positions + 1
-        return actions
+        return item_ids
 
     def _get_reset_mask(self, batch: Batch, batch_size: int) -> torch.Tensor:
         """从 Collector batch 中读取 episode 起始标记。

@@ -30,8 +30,6 @@ PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/pytho
   --test-num 1 \
   --num_samples_train 2 \
   --num_samples_test 2 \
-  --flow_steps 2 \
-  --actor_backend mlp_bc \
   --max_turn 5 \
   --force_length 5 \
   --swanlab_project DORL-MAC \

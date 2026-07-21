@@ -82,18 +82,33 @@ class StateTrackerDynamics(nn.Module):
         self._validate_inputs(history_vectors, history_valid, chunk_actions, chunk_rewards, chunk_valid)
         device = history_vectors.device
         batch_size = int(history_vectors.shape[0])
-        next_states = []
+        window_size = int(self.window_size)
         chunk_vectors = torch.cat([chunk_actions, chunk_rewards.unsqueeze(-1)], dim=-1)
-        for batch_index in range(batch_size):
-            # 逐样本处理便于保留“只追加有效 chunk 前缀”的推荐状态语义。
-            valid_history = history_vectors[batch_index][history_valid[batch_index].bool()]
-            valid_chunk = chunk_vectors[batch_index][chunk_valid[batch_index].bool()]
-            combined = torch.cat([valid_history, valid_chunk], dim=0)
-            if combined.numel() == 0:
-                raise ValueError("StateTrackerDynamics received no valid history or chunk rows.")
-            recent_rows = combined[-self.window_size :]
-            next_states.append(recent_rows.mean(dim=0))
-        avg_states = torch.stack(next_states, dim=0).to(device=device)
+        history_valid_bool = history_valid.bool()
+        chunk_valid_bool = chunk_valid.bool()
+
+        # 拼接完整历史 + 本 chunk 的向量与有效标记。
+        combined_vectors = torch.cat([history_vectors, chunk_vectors], dim=1)  # (B, W+K, D)
+        combined_valid = torch.cat(
+            [history_valid_bool, chunk_valid_bool], dim=1
+        ).to(dtype=combined_vectors.dtype)  # (B, W+K)
+        # 只保留每个位置的向量并把无效位置置零，便于后续 masked mean。
+        masked_vectors = combined_vectors * combined_valid.unsqueeze(-1)
+
+        # 为每个 batch 计算「保留最近 window_size 个有效位置」对应的 mask。
+        # 方法：从右往左累计有效位置计数（reverse cumsum），值 <= window_size 且原本有效的位置即为"最近的 window_size 个"。
+        valid_int = combined_valid.to(torch.int64)
+        # reverse cumsum: 每个位置右侧（含自身）的有效数量。
+        reverse_cum = torch.flip(torch.cumsum(torch.flip(valid_int, dims=[1]), dim=1), dims=[1])
+        recent_mask = (reverse_cum <= window_size) & (valid_int > 0)  # (B, W+K)
+        recent_mask_f = recent_mask.to(dtype=combined_vectors.dtype)
+
+        denom = recent_mask_f.sum(dim=1, keepdim=True)  # (B, 1)
+        if (denom == 0).any():
+            raise ValueError("StateTrackerDynamics received no valid history or chunk rows.")
+        numer = (masked_vectors * recent_mask_f.unsqueeze(-1)).sum(dim=1)  # (B, D)
+        avg_states = numer / denom
+        avg_states = avg_states.to(device=device)
         if not self.use_trainable_residual:
             return avg_states
         return avg_states + self.residual(avg_states)

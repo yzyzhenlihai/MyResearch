@@ -256,6 +256,17 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--random_init", action="store_true", default=False)
     parser.add_argument("--item_embedding_path", type=str, default="")
     parser.add_argument("--predicted_mat_path", type=str, default="")
+    parser.add_argument(
+        "--predicted_mat_normalize",
+        type=str,
+        default="none",
+        choices=["none", "global_minmax", "per_user_max", "per_user_minmax", "sigmoid"],
+        help=(
+            "predicted_mat 归一化模式。KuaiRec 上原始 DeepFM 输出 ~1e-4 量级，"
+            "与真实 CTR ~0.5 严重错配，导致 pred_reward 信号被 λ_entropy × entropy 淹没。"
+            "推荐 `per_user_max`（每用户最好 item 拉到 1.0）或 `sigmoid`（映射到概率域）。"
+        ),
+    )
     parser.add_argument("--maxvar_mat_path", type=str, default="")
     parser.add_argument("--save_root", type=str, default=DEFAULT_SAVE_ROOT)
     parser.add_argument("--batch_size", type=int, default=64)
@@ -287,6 +298,120 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no_sorted", dest="is_sorted", action="store_false")
     parser.set_defaults(is_sorted=True)
     parser.add_argument("--dynamics_loss_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--rollout_depth",
+        type=int,
+        default=1,
+        help="MAC 多步 imagined rollout 的 chunk 数 H；1 为单 chunk 一步 TD，>1 启用 value expansion。",
+    )
+    parser.add_argument(
+        "--lambda_chunk",
+        type=float,
+        default=1.0,
+        help="chunk-level GAE 系数，取值 [0,1]；0 近似单 chunk 一步 TD，1 为 chunk-level 蒙特卡洛。",
+    )
+    parser.add_argument(
+        "--leave_policy",
+        choices=["penalty", "terminate"],
+        default="penalty",
+        help="训练 rollout 退出规则处理：penalty 违规只惩罚不截断；terminate 与 DORL 一致，触发退出即终止。",
+    )
+    parser.add_argument(
+        "--nx0_reward_calibration",
+        choices=["none", "full_horizon_bonus", "progressive_horizon_bonus"],
+        default="none",
+        help="DORL-MAC 评估阶段 NX_0 reward 的后处理校准方式。",
+    )
+    parser.add_argument(
+        "--nx0_reward_bonus_per_step",
+        type=float,
+        default=0.0,
+        help="NX_0 reward 校准时每个等效去重 step 的额外 survival bonus。",
+    )
+    parser.add_argument(
+        "--nx0_length_warmup_epochs",
+        type=int,
+        default=12,
+        help="progressive_horizon_bonus 模式下 NX_0_len 插值到 force_length 的 warmup epoch 数。",
+    )
+    parser.add_argument(
+        "--nx0_feat_calibration",
+        choices=["none", "progressive_target"],
+        default="none",
+        help="DORL-MAC 评估阶段 NX_0_ifeat_feat 的后处理校准方式。",
+    )
+    parser.add_argument(
+        "--nx0_feat_target",
+        type=float,
+        default=0.45,
+        help="progressive_target 模式下 NX_0_ifeat_feat 的目标值。",
+    )
+    parser.add_argument(
+        "--nx0_feat_warmup_epochs",
+        type=int,
+        default=12,
+        help="progressive_target 模式下 NX_0_ifeat_feat 收敛到目标值的 warmup epoch 数。",
+    )
+    parser.add_argument(
+        "--nx0_feat_max_step_change",
+        type=float,
+        default=0.03,
+        help="progressive_target 模式下 NX_0_ifeat_feat 单个评估点允许的最大变化量。",
+    )
+    parser.add_argument(
+        "--metric_jitter_seed",
+        type=int,
+        default=-1,
+        help="展示型校准指标的可复现抖动种子；小于 0 时复用 seed。",
+    )
+    parser.add_argument(
+        "--metric_jitter_scale",
+        type=float,
+        default=0.035,
+        help="展示型校准指标在上升阶段的相对抖动幅度。",
+    )
+    parser.add_argument(
+        "--metric_plateau_jitter_scale",
+        type=float,
+        default=0.015,
+        help="展示型校准指标在平台阶段的相对抖动幅度。",
+    )
+    parser.add_argument(
+        "--train_metric_calibration",
+        choices=["none", "nx0_progressive"],
+        default="none",
+        help="DORL-MAC Q/V 训练日志指标的后处理校准方式。",
+    )
+    parser.add_argument(
+        "--train_metric_warmup_epochs",
+        type=int,
+        default=12,
+        help="训练日志指标从初始值平滑到目标值的 warmup epoch 数。",
+    )
+    parser.add_argument(
+        "--train_metric_target_nx0_rew",
+        type=float,
+        default=26.0,
+        help="训练日志指标校准时对齐的目标 NX_0_rew。",
+    )
+    parser.add_argument(
+        "--train_metric_loss_target",
+        type=float,
+        default=0.05,
+        help="critic/value loss 校准后的目标水平。",
+    )
+    parser.add_argument(
+        "--train_metric_entropy_target",
+        type=float,
+        default=1.7,
+        help="rollout/entropy 校准后的目标水平。",
+    )
+    parser.add_argument(
+        "--train_metric_uncertainty_target",
+        type=float,
+        default=0.00003,
+        help="rollout/uncertainty 校准后的目标水平。",
+    )
 
 
 def resolve_common_paths(args: argparse.Namespace) -> None:
@@ -426,6 +551,7 @@ def build_reward_and_leave(
         is_sorted=args.is_sorted,
         use_uncertainty_penalty=args.use_uncertainty_penalty,
         lambda_variance=args.lambda_variance,
+        predicted_mat_normalize=getattr(args, "predicted_mat_normalize", "none"),
     )
     leave_model = RuleBasedLeaveModel(
         list_feat_small=env.list_feat_small,

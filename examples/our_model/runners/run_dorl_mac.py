@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from examples.our_model.runners.common import add_common_args, configure_logging, ensure_dir
 from examples.our_model.runners.eval_dorl_mac import main as eval_main
-from examples.our_model.runners.pretrain_flow_bc import main as pretrain_main
+from examples.our_model.runners.pretrain_categorical_bc import main as pretrain_main
 from examples.our_model.runners.train_dorl_mac_qv import main as train_qv_main
 
 LOGGER = logging.getLogger(__name__)
@@ -52,8 +52,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-num", "--test_num", dest="test_num", type=int, default=1)
     parser.add_argument("--num_samples_train", type=int, default=2)
     parser.add_argument("--num_samples_test", type=int, default=2)
-    parser.add_argument("--flow_steps", type=int, default=2)
-    parser.add_argument("--actor_backend", type=str, default="mlp_bc")
     parser.add_argument("--smoke_dir", type=str, default="")
     return parser
 
@@ -173,20 +171,16 @@ def main(argv: Optional[list[str]] = None) -> None:
     common_argv = build_common_argv(args)
     LOGGER.info("开始 DORL-MAC smoke pipeline，输出目录：%s", smoke_root)
 
-    flow_dir = smoke_root / "flow_bc"
+    bc_dir = smoke_root / "categorical_bc"
     qv_dir = smoke_root / "mac_agent"
     eval_dir = smoke_root / "eval"
-    flow_ckpt = pretrain_main(
+    bc_ckpt = pretrain_main(
         common_argv
         + [
-            "--actor_backend",
-            args.actor_backend,
             "--pretrain_steps",
             str(args.pretrain_steps),
-            "--flow_steps",
-            str(args.flow_steps),
             "--save_dir",
-            str(flow_dir),
+            str(bc_dir),
             "--log_interval",
             "1",
         ]
@@ -194,8 +188,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     mac_ckpt = train_qv_main(
         common_argv
         + [
-            "--flow_actor_ckpt",
-            str(flow_ckpt),
+            "--bc_actor_ckpt",
+            str(bc_ckpt),
             "--epoch",
             str(args.epoch),
             "--step-per-epoch",

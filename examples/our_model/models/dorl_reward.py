@@ -7,6 +7,7 @@ import pickle
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from src.core.util.entropy_penalty import compute_step_entropy
@@ -45,6 +46,7 @@ class DORLRewardModel:
         use_uncertainty_penalty: bool = True,
         maxvar_mat_path: str = "",
         lambda_variance: float = 0.05,
+        predicted_mat_normalize: str = "none",
     ) -> None:
         """初始化 reward 模型。
 
@@ -67,6 +69,12 @@ class DORLRewardModel:
             use_uncertainty_penalty (bool): 是否启用 uncertainty penalty。
             maxvar_mat_path (str): ensemble 最大方差矩阵路径。
             lambda_variance (float): uncertainty penalty 权重。
+            predicted_mat_normalize (str): predicted_mat 归一化模式，取值：
+                - `"none"`：保持原始 DeepFM 输出（可能是极小值，与真实 CTR 不同尺度）；
+                - `"global_minmax"`：整表按全局 min/max 线性缩放到 `[0, 1]`；
+                - `"per_user_max"`：每行除以该用户的最大值，把 per-user top-1 拉到 1.0；
+                - `"per_user_minmax"`：每行做 min-max 归一化到 `[0, 1]`；
+                - `"sigmoid"`：套 sigmoid，把原始 logits 映射到 `(0, 1)` 概率域。
 
         Raises:
             FileNotFoundError: 当预测矩阵不存在时抛出。
@@ -94,8 +102,35 @@ class DORLRewardModel:
         if predicted_tensor.ndim != 2:
             raise ValueError("predicted_mat must be a 2D matrix.")
 
+        # 可选：对 DeepFM 原始 logits 做归一化。KuaiRec 上 raw predicted_mat 均值 ~ 1e-4，
+        # 与真实环境 CTR ~ 0.5 差 3~4 个量级，会导致 pred_reward 信号被 entropy_bonus
+        # 完全淹没（λ_entropy × entropy ≫ pred_reward）。归一化能让二者进入同一尺度，
+        # 使 Q-learning 真正学到"用户偏好"信号。
+        normalize_mode = str(predicted_mat_normalize).lower()
+        supported = {"none", "global_minmax", "per_user_max", "per_user_minmax", "sigmoid"}
+        if normalize_mode not in supported:
+            raise ValueError(
+                f"predicted_mat_normalize must be one of {supported}, got {predicted_mat_normalize!r}."
+            )
+        eps = 1e-8
+        if normalize_mode == "global_minmax":
+            g_min = torch.min(predicted_tensor)
+            g_max = torch.max(predicted_tensor)
+            predicted_tensor = (predicted_tensor - g_min) / (g_max - g_min + eps)
+        elif normalize_mode == "per_user_max":
+            row_abs_max = torch.clamp(torch.abs(predicted_tensor).max(dim=1, keepdim=True).values, min=eps)
+            predicted_tensor = predicted_tensor / row_abs_max
+        elif normalize_mode == "per_user_minmax":
+            row_min = predicted_tensor.min(dim=1, keepdim=True).values
+            row_max = predicted_tensor.max(dim=1, keepdim=True).values
+            predicted_tensor = (predicted_tensor - row_min) / (row_max - row_min + eps)
+        elif normalize_mode == "sigmoid":
+            predicted_tensor = torch.sigmoid(predicted_tensor)
+        # normalize_mode == "none" 保持原值，向后兼容旧实验。
+
         self.device = device
         self.predicted_mat = predicted_tensor
+        self.predicted_mat_normalize = normalize_mode
         self.raw_user_to_index = dict(raw_user_to_index)
         self.reward_shift = bool(reward_shift)
         self.predicted_min = torch.min(predicted_tensor)
@@ -119,6 +154,16 @@ class DORLRewardModel:
             dtype=torch.long,
             device=device,
         )
+        # 缓存 CPU 侧 int 数组，用于 entropy 计算时高频查表，避免逐 item 的 GPU→CPU 同步。
+        self._internal_to_raw_cpu = [int(x) for x in internal_to_raw_item_ids]
+        # user 索引查表用 numpy 数组，比 dict + 逐元素 tolist 快得多。
+        max_raw_user_id = max(self.raw_user_to_index.keys()) if self.raw_user_to_index else -1
+        self._user_lookup = np.full(max_raw_user_id + 1, -1, dtype=np.int64)
+        for raw_uid, internal in self.raw_user_to_index.items():
+            self._user_lookup[int(raw_uid)] = int(internal)
+        # entropy 计算的 LRU 缓存（key=raw item 序列元组）。
+        self._entropy_cache: Dict[Tuple[int, ...], float] = {}
+        self._entropy_cache_max = 200_000
 
         self.maxvar_mat = None
         maxvar_max = torch.zeros((), dtype=torch.float32, device=device)
@@ -145,8 +190,13 @@ class DORLRewardModel:
         else:
             self.min_reward = torch.zeros((), dtype=torch.float32, device=device)
         LOGGER.info(
-            "DORLRewardModel 加载完成：shape=%s, shift=%s, entropy=%s, uncertainty=%s",
+            "DORLRewardModel 加载完成：shape=%s, normalize=%s, pred_min=%.6f, pred_max=%.6f, "
+            "pred_mean=%.6f, shift=%s, entropy=%s, uncertainty=%s",
             tuple(predicted_tensor.shape),
+            self.predicted_mat_normalize,
+            float(predicted_tensor.min()),
+            float(predicted_tensor.max()),
+            float(predicted_tensor.mean()),
             self.reward_shift,
             self.use_entropy_reward,
             self.use_uncertainty_penalty,
@@ -175,14 +225,15 @@ class DORLRewardModel:
             KeyError: 当出现未知 user id 时抛出。
         """
 
-        flat_user_ids = raw_user_ids.detach().cpu().view(-1).tolist()
-        indices = []
-        for raw_user_id in flat_user_ids:
-            raw_user_id = int(raw_user_id)
-            if raw_user_id not in self.raw_user_to_index:
-                raise KeyError(f"Unknown raw user_id for KuaiEnv: {raw_user_id}")
-            indices.append(self.raw_user_to_index[raw_user_id])
-        return torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        flat = raw_user_ids.detach().view(-1).cpu().numpy().astype(np.int64, copy=False)
+        # 边界检查（少量向量化操作，成本远低于原来的 Python for + dict lookup）。
+        if flat.min(initial=0) < 0 or flat.max(initial=0) >= self._user_lookup.shape[0]:
+            raise KeyError(f"Unknown raw user_id for KuaiEnv (out of range): {flat.min()}~{flat.max()}")
+        mapped = self._user_lookup[flat]
+        if (mapped < 0).any():
+            bad = int(flat[np.argmax(mapped < 0)])
+            raise KeyError(f"Unknown raw user_id for KuaiEnv: {bad}")
+        return torch.from_numpy(mapped).to(device=self.device)
 
     def reward(
         self,
@@ -278,23 +329,41 @@ class DORLRewardModel:
         if history_item_ids is None:
             raise ValueError("history_item_ids is required when entropy reward is enabled.")
 
+        # 一次性把 batch 从 GPU 拷回 CPU；不再逐 item .item()。
         history_np = history_item_ids.detach().cpu().numpy()
-        entropy_values = []
-        for history_row, current_item_id in zip(history_np, current_item_ids.detach().cpu().tolist()):
-            valid_internal_items = [int(item) for item in history_row if int(item) >= 0]
-            if not valid_internal_items or valid_internal_items[-1] != int(current_item_id):
-                valid_internal_items.append(int(current_item_id))
-            raw_history = [
-                int(self.internal_to_raw_item_ids[item].detach().cpu().item())
-                for item in valid_internal_items
-            ]
+        current_np = current_item_ids.detach().cpu().numpy()
+        internal_to_raw = self._internal_to_raw_cpu
+        entropy_values = [0.0] * len(current_np)
+        cache = self._entropy_cache
+        cache_max = self._entropy_cache_max
+        # 展平 -1 padding：只在最大 window 内取尾部，避免每次遍历完整历史。
+        max_win = max((int(w) for w in self.entropy_window if int(w) > 0), default=0)
+        for row_idx in range(len(current_np)):
+            current_item_id = int(current_np[row_idx])
+            history_row = history_np[row_idx]
+            # 只需要最后 max_win-1 个有效历史（entropy_window 内的最大长度即上限）。
+            if max_win > 1:
+                tail = history_row[-(max_win - 1):] if history_row.size > 0 else history_row
+                valid_internal_items = [int(x) for x in tail.tolist() if int(x) >= 0]
+            else:
+                valid_internal_items = []
+            if not valid_internal_items or valid_internal_items[-1] != current_item_id:
+                valid_internal_items.append(current_item_id)
+            raw_history_tail = tuple(internal_to_raw[item] for item in valid_internal_items)
+
+            cached = cache.get(raw_history_tail)
+            if cached is not None:
+                entropy_values[row_idx] = cached
+                continue
             entropy = compute_step_entropy(
-                history_with_current=raw_history,
+                history_with_current=raw_history_tail,
                 entropy_dict=self.entropy_map,
                 entropy_window=self.entropy_window,
                 feature_level=self.feature_level,
                 map_item_feat=self.map_item_feat,
                 is_sorted=self.is_sorted,
             )
-            entropy_values.append(entropy)
+            entropy_values[row_idx] = entropy
+            if len(cache) < cache_max:
+                cache[raw_history_tail] = entropy
         return torch.as_tensor(entropy_values, dtype=torch.float32, device=self.device)

@@ -48,6 +48,42 @@ class RuleBasedLeaveModel:
         self.leave_threshold = float(leave_threshold)
         self.max_turn = int(max_turn)
 
+        # 预构造 (num_items, num_categories) 的稠密 bool 矩阵，用于 O(1) 批量查表。
+        num_items = len(self.list_feat_small)
+        all_categories = set()
+        for features in self.list_feat_small:
+            all_categories.update(int(f) for f in features)
+        self._num_categories = (max(all_categories) + 1) if all_categories else 0
+        # bool 矩阵：item_feat_mat[item_id, category] = True 表示该 item 拥有该 category。
+        # 训练期实际使用时会 lazily 迁移到 GPU（见 first_violation_steps_batch）。
+        if self._num_categories > 0:
+            item_feat_mat = torch.zeros(num_items, self._num_categories, dtype=torch.bool)
+            for item_id, features in enumerate(self.list_feat_small):
+                for feat in features:
+                    item_feat_mat[item_id, int(feat)] = True
+        else:
+            item_feat_mat = torch.zeros(num_items, 0, dtype=torch.bool)
+        self._item_feat_mat_cpu = item_feat_mat
+        # 设备缓存，避免每次都搬运。
+        self._item_feat_mat_by_device: dict = {}
+
+    def _item_feat_matrix(self, device: torch.device) -> torch.Tensor:
+        """按设备缓存 item→category bool 矩阵。
+
+        Args:
+            device (torch.device): 目标设备。
+
+        Returns:
+            torch.Tensor: `(num_items, num_categories)` bool 张量。
+        """
+
+        key = str(device)
+        mat = self._item_feat_mat_by_device.get(key)
+        if mat is None:
+            mat = self._item_feat_mat_cpu.to(device=device)
+            self._item_feat_mat_by_device[key] = mat
+        return mat
+
     def should_leave_batch(
         self,
         leave_history_item_ids: torch.Tensor,
@@ -92,13 +128,13 @@ class RuleBasedLeaveModel:
             torch.Tensor: 更新后的 leave 历史，形状为 `(B, H)`。
         """
 
-        updated = leave_history_item_ids.clone()
-        for batch_index in range(updated.shape[0]):
-            if not bool(append_mask[batch_index].item()):
-                continue
-            updated[batch_index, :-1] = updated[batch_index, 1:].clone()
-            updated[batch_index, -1] = item_ids[batch_index]
-        return updated
+        if leave_history_item_ids.shape[1] == 0:
+            return leave_history_item_ids.clone()
+        # 全量向量化：一次性对整个 batch 做左移一位并把新 item 填到末尾。
+        item_ids_col = item_ids.to(dtype=leave_history_item_ids.dtype).view(-1, 1)
+        shifted = torch.cat([leave_history_item_ids[:, 1:], item_ids_col], dim=1)
+        mask = append_mask.to(dtype=torch.bool).view(-1, 1)
+        return torch.where(mask, shifted, leave_history_item_ids)
 
     def first_violation_steps(
         self,
@@ -106,6 +142,10 @@ class RuleBasedLeaveModel:
         chunk_item_ids: torch.Tensor,
     ) -> torch.Tensor:
         """判断完整 action chunk 中第一次触发退出规则的位置。
+
+        向量化实现：把 `list_feat_small` 转成 `(num_items+1, num_categories)` 的 bool
+        矩阵（`-1` 映射为全零 dummy 行），窗口内每类别的出现次数就是 window 的
+        one-hot bool 求和。对 chunk 内的每个 step 做一次 batch tensor 判定并滑动窗口。
 
         Args:
             leave_history_item_ids (torch.Tensor): chunk 执行前的历史 item，
@@ -117,22 +157,68 @@ class RuleBasedLeaveModel:
             未触发时返回 `-1`。
         """
 
-        history_np = leave_history_item_ids.detach().cpu().numpy()
-        chunk_np = chunk_item_ids.detach().cpu().numpy()
-        violation_steps: List[int] = []
-        for history, chunk_items in zip(history_np, chunk_np):
-            valid_history = [int(item) for item in history if int(item) != INVALID_ITEM_ID]
-            first_step = -1
-            for step_index, item_id in enumerate(chunk_items):
-                item_id = int(item_id)
-                if item_id == INVALID_ITEM_ID:
-                    continue
-                if self._should_leave_by_history(valid_history, item_id):
-                    first_step = int(step_index)
-                    break
-                valid_history.append(item_id)
-            violation_steps.append(first_step)
-        return torch.as_tensor(violation_steps, dtype=torch.long, device=chunk_item_ids.device)
+        device = chunk_item_ids.device
+        batch_size = int(chunk_item_ids.shape[0])
+        chunk_steps = int(chunk_item_ids.shape[1])
+        if batch_size == 0:
+            return torch.full((0,), -1, dtype=torch.long, device=device)
+        if self._num_categories == 0 or chunk_steps == 0:
+            return torch.full((batch_size,), -1, dtype=torch.long, device=device)
+
+        item_feat = self._item_feat_matrix(device)  # (num_items, C) bool
+        num_items = int(item_feat.shape[0])
+        dummy_row = torch.zeros(1, self._num_categories, dtype=torch.bool, device=device)
+        item_feat_ext = torch.cat([item_feat, dummy_row], dim=0)  # (num_items+1, C)
+        invalid_id = num_items
+
+        window_len = self.num_leave_compute
+        history = leave_history_item_ids.to(device=device, dtype=torch.long)
+        if history.shape[1] >= window_len:
+            window = history[:, -window_len:].clone()
+        else:
+            pad = torch.full(
+                (batch_size, window_len - history.shape[1]),
+                INVALID_ITEM_ID,
+                dtype=torch.long,
+                device=device,
+            )
+            window = torch.cat([pad, history], dim=1)
+        window = torch.where(
+            window < 0,
+            torch.full_like(window, invalid_id),
+            window,
+        )
+        # (B, C) 每类别在窗口中的出现次数（float 便于与浮点阈值比较）。
+        cat_count = item_feat_ext[window].sum(dim=1).to(torch.float32)
+        threshold_val = float(self.leave_threshold)
+
+        result = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+        active = torch.ones(batch_size, dtype=torch.bool, device=device)
+        chunk_items_long = chunk_item_ids.to(device=device, dtype=torch.long)
+
+        for step_index in range(chunk_steps):
+            item_k = chunk_items_long[:, step_index]
+            valid_item = item_k != INVALID_ITEM_ID
+            item_k_safe = torch.where(item_k < 0, torch.full_like(item_k, invalid_id), item_k)
+            cand_feats = item_feat_ext[item_k_safe]  # (B, C) bool
+            cat_over_threshold = cat_count > threshold_val  # (B, C) bool
+            violation = (cand_feats & cat_over_threshold).any(dim=1) & valid_item & active
+            result = torch.where(
+                violation,
+                torch.full_like(result, step_index),
+                result,
+            )
+            active = active & (~violation)
+            if step_index == chunk_steps - 1:
+                break
+            append_mask = active & valid_item
+            oldest_feats = item_feat_ext[window[:, 0]].to(torch.float32)
+            cand_feats_f = cand_feats.to(torch.float32)
+            new_cat_count = cat_count - oldest_feats + cand_feats_f
+            cat_count = torch.where(append_mask.unsqueeze(1), new_cat_count, cat_count)
+            new_window = torch.cat([window[:, 1:], item_k_safe.view(-1, 1)], dim=1)
+            window = torch.where(append_mask.unsqueeze(1), new_window, window)
+        return result
 
     def _should_leave_one(self, history: np.ndarray, item_id: int, env_step: int) -> bool:
         """判断单个样本是否触发离开。

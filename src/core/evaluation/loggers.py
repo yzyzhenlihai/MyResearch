@@ -1,5 +1,49 @@
 from logzero import logger
+from pathlib import Path
 import re
+
+from src.core.util.wandb_utils import load_wandb
+
+# 训练入口（如 run_DORL_continuous.py）会在 swanlab.init 之后把本模块的
+# `wandb` 变量重绑定为 swanlab，从而让每轮评估指标写入同一个 run。
+wandb = load_wandb(repo_root=Path(__file__).resolve().parents[3])
+
+
+def _to_scalar(value):
+    """把评估指标值转换成适合上传的标量；无法转换时返回 None。"""
+
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    return None
+
+
+def _log_eval_metrics_to_wandb(results_all, epoch):
+    """把每个 epoch 的评估指标上传到 wandb/swanlab（run 未激活时安全跳过）。"""
+
+    if wandb is None:
+        return
+    if getattr(wandb, "run", None) is None:
+        return
+
+    metrics = {}
+    for key, value in results_all.items():
+        scalar_value = _to_scalar(value)
+        if scalar_value is None:
+            continue
+        metrics[f"eval/{key}"] = scalar_value
+
+    if not metrics:
+        return
+
+    try:
+        wandb.log(metrics, step=int(epoch))
+    except (TypeError, ValueError, AttributeError):
+        wandb.log(metrics)
 
 
 class LoggerEval_UserModel():
@@ -83,6 +127,6 @@ class LoggerEval_Policy():
         # 1. write logger
         logger.info("Epoch: [{}], Info: [{}]".format(epoch, results_all))
 
-        # 2. upload logger
-        # self.upload_logger()
+        # 2. upload logger（每个 epoch 把评估指标写入 wandb/swanlab 曲线）
+        _log_eval_metrics_to_wandb(results_all, epoch)
         return results_all

@@ -43,5 +43,11 @@ temp.*
 
 
 wandb/
+swanlog/
 docs/
 
+docs/
+MAC/
+.agents/
+.codex/
+reports/

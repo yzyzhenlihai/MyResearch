@@ -1,4 +1,4 @@
-"""DORL-MAC action chunk actor 离线预训练入口。"""
+"""DORL-MAC 离散 Categorical chunk actor 离线预训练入口。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from examples.our_model.logging import SwanLabLogger
-from examples.our_model.models.mac_agent import ACTOR_BACKEND_FLOW, ACTOR_BACKEND_MLP_BC
 from examples.our_model.runners.common import (
     add_common_args,
     build_agent,
@@ -36,8 +35,8 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_PRETRAIN_STEPS = 200_000
 """正式 actor 预训练默认步数。"""
 
-DEFAULT_FLOW_STEPS = 10
-"""flow actor Euler 采样默认步数。"""
+DEFAULT_BC_SUBDIR = "categorical_bc"
+"""actor checkpoint 默认保存子目录。"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,13 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
         argparse.ArgumentParser: 参数解析器。
     """
 
-    parser = argparse.ArgumentParser(description="Pretrain DORL-MAC chunk actor.")
+    parser = argparse.ArgumentParser(description="Pretrain DORL-MAC discrete categorical chunk actor.")
     add_common_args(parser)
-    parser.add_argument("--actor_backend", choices=[ACTOR_BACKEND_FLOW, ACTOR_BACKEND_MLP_BC], default=ACTOR_BACKEND_FLOW)
     parser.add_argument("--pretrain_steps", type=int, default=DEFAULT_PRETRAIN_STEPS)
-    parser.add_argument("--flow_steps", type=int, default=DEFAULT_FLOW_STEPS)
     parser.add_argument("--actor_lr", type=float, default=3e-4)
-    parser.add_argument("--bc_weight", type=float, default=1.0)
     parser.add_argument("--save_dir", type=str, default="")
     parser.add_argument("--log_interval", type=int, default=100)
     return parser
@@ -100,7 +96,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
 
     save_dir = ensure_dir(
         args.save_dir
-        or Path(args.save_root) / args.env / "DORL_MAC" / "flow_bc"
+        or Path(args.save_root) / args.env / "DORL_MAC" / DEFAULT_BC_SUBDIR
     )
     config = namespace_to_dict(args)
     save_resolved_config(save_dir, config)
@@ -116,12 +112,12 @@ def main(argv: Optional[list[str]] = None) -> Path:
     optimizer = torch.optim.Adam(agent.actor_parameters(), lr=args.actor_lr)
     logger = SwanLabLogger(
         project=args.swanlab_project,
-        run_name=default_run_name("flow-bc", args),
+        run_name=default_run_name("categorical-bc", args),
         config=config,
         log_path=str(save_dir / "metrics.jsonl"),
     )
 
-    LOGGER.info("开始 DORL-MAC actor 预训练：steps=%s", args.pretrain_steps)
+    LOGGER.info("开始 DORL-MAC categorical BC 预训练：steps=%s", args.pretrain_steps)
     batch_iterator = cycle_dataloader(dataloader)
     last_metrics = {}
     for step in range(1, args.pretrain_steps + 1):
@@ -129,9 +125,6 @@ def main(argv: Optional[list[str]] = None) -> Path:
         last_metrics = agent.pretrain_actor_update(
             batch=batch,
             optimizer=optimizer,
-            actor_backend=args.actor_backend,
-            flow_steps=args.flow_steps,
-            bc_weight=args.bc_weight,
         )
         if step == 1 or step % args.log_interval == 0 or step == args.pretrain_steps:
             logger.log(last_metrics, step=step)
@@ -144,6 +137,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
             "state_dim": agent.state_dim,
             "action_dim": agent.action_dim,
             "chunk_action_dim": agent.chunk_action_dim,
+            "num_items": agent.num_items,
         }
     )
     torch.save(agent.checkpoint_state(checkpoint_config), checkpoint_path)
