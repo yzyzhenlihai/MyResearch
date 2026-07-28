@@ -21,7 +21,7 @@ REPEAT_POLICY_TRUNCATE = "truncate"
 """兼容旧 CLI 的训练策略名；当前语义为重复/退出违规只惩罚不截断。"""
 
 REPEAT_POLICY_MASK = "mask"
-"""评估 rollout 默认重复推荐处理：采样时直接屏蔽已推荐 item。"""
+"""严格去重策略：采样时屏蔽历史 item，并保证候选 chunk 内 item 唯一。"""
 
 LEAVE_POLICY_PENALTY = "penalty"
 """退出规则处理（历史默认）：违规只加 reward penalty，不截断 chunk。"""
@@ -392,7 +392,9 @@ class MACAgent(nn.Module):
             states (torch.Tensor): 状态张量，形状为 `(B, state_dim)`。
             num_samples (int): 每个状态采样的候选数量。
             recommended_mask (Optional[torch.Tensor]): 已推荐 item mask，形状
-                `(B, num_items)`，True 表示不允许再采样；用于评估阶段禁止重复推荐。
+                `(B, num_items)`，True 表示不允许再采样。传入 mask 时，
+                除屏蔽历史 item 外，还会逐位置更新候选 mask，保证每个
+                候选 chunk 内 item 严格唯一；`None` 保留允许重复的旧语义。
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: `(item_ids, chunk_embeddings)`。
@@ -400,38 +402,145 @@ class MACAgent(nn.Module):
                 - `chunk_embeddings`：形状 `(N, B, K*action_dim)` 的 chunk 向量。
 
         Raises:
-            ValueError: 当 `num_samples` 或 mask 形状非法时抛出。
+            ValueError: 当 `num_samples`、mask 形状非法，或剩余可用 item
+                数量不足以构造无重复 chunk 时抛出。
         """
 
         if num_samples <= 0:
             raise ValueError("num_samples must be positive.")
         states = states.to(device=self.device, dtype=torch.float32)
         logits = self.actor(states)  # (B, K, N)
-        if recommended_mask is not None:
-            recommended_mask = recommended_mask.to(device=self.device, dtype=torch.bool)
-            if recommended_mask.shape != (states.shape[0], self.num_items):
-                raise ValueError(
-                    f"recommended_mask shape mismatch: expected {(states.shape[0], self.num_items)}, "
-                    f"got {tuple(recommended_mask.shape)}."
-                )
-            # 若某样本所有 item 都被 mask，则回退为不屏蔽，避免 multinomial 无有效候选。
-            all_masked = recommended_mask.all(dim=1)
-            if all_masked.any():
-                recommended_mask = recommended_mask.clone()
-                recommended_mask[all_masked] = False
-            logits = logits.masked_fill(recommended_mask.unsqueeze(1), _MASK_LOGIT_VALUE)
-        probs = torch.softmax(logits, dim=-1)
-        batch_size = int(probs.shape[0])
-        flat_probs = probs.reshape(batch_size * self.chunk_size, self.num_items)
-        sampled_flat = torch.multinomial(
-            flat_probs,
-            num_samples=num_samples,
-            replacement=True,
-        )  # (B*K, N_samples)
-        sampled_ids = sampled_flat.view(batch_size, self.chunk_size, num_samples)
-        sampled_ids = sampled_ids.permute(2, 0, 1).contiguous()  # (N, B, K)
+        batch_size = int(logits.shape[0])
+        if recommended_mask is None:
+            probs = torch.softmax(logits, dim=-1)
+            flat_probs = probs.reshape(batch_size * self.chunk_size, self.num_items)
+            sampled_flat = torch.multinomial(
+                flat_probs,
+                num_samples=num_samples,
+                replacement=True,
+            )  # (B*K, N_samples)
+            sampled_ids = sampled_flat.view(
+                batch_size,
+                self.chunk_size,
+                num_samples,
+            )
+            sampled_ids = sampled_ids.permute(2, 0, 1).contiguous()
+        else:
+            sampled_ids = self._sample_unique_candidate_chunks(
+                logits=logits,
+                num_samples=num_samples,
+                recommended_mask=recommended_mask,
+            )
         chunk_vectors = self._item_ids_to_chunk_vectors(sampled_ids)
         return sampled_ids, chunk_vectors
+
+    @torch.no_grad()
+    def _sample_unique_candidate_chunks(
+        self,
+        logits: torch.Tensor,
+        num_samples: int,
+        recommended_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """逐位置采样严格无重复的候选 chunks。
+
+        每个候选 chunk 都维护独立 mask：初始 mask 来自当前 episode
+        已执行历史；每采样一个位置后，立即把该位置的 item 加入该候选
+        自己的 mask，再采样下一个位置。因此不同候选之间允许相同 item，
+        但单个候选内部不允许重复。
+
+        Args:
+            logits (torch.Tensor): actor 输出，形状为
+                `(batch_size, chunk_size, num_items)`。
+            num_samples (int): 每个 batch 样本需要生成的候选 chunk 数，
+                必须大于 0。
+            recommended_mask (torch.Tensor): 历史已执行 item mask，形状为
+                `(batch_size, num_items)`。
+
+        Returns:
+            torch.Tensor: 严格无重复的候选 item id，形状为
+            `(num_samples, batch_size, chunk_size)`。
+
+        Raises:
+            ValueError: 当输入形状、候选数非法，或任一样本剩余可用 item
+                少于 `chunk_size` 时抛出。
+
+        Example:
+            当历史 mask 屏蔽 item 0，且 `chunk_size=3` 时，每个返回候选
+            都不会包含 0，并且三个位置的 item id 两两不同。
+        """
+
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive.")
+        expected_logits_shape = (
+            int(recommended_mask.shape[0]),
+            self.chunk_size,
+            self.num_items,
+        )
+        if tuple(logits.shape) != expected_logits_shape:
+            raise ValueError(
+                "logits shape mismatch: expected "
+                f"{expected_logits_shape}, got {tuple(logits.shape)}."
+            )
+        history_mask = recommended_mask.to(
+            device=self.device,
+            dtype=torch.bool,
+        )
+        expected_mask_shape = (int(logits.shape[0]), self.num_items)
+        if tuple(history_mask.shape) != expected_mask_shape:
+            raise ValueError(
+                "recommended_mask shape mismatch: expected "
+                f"{expected_mask_shape}, got {tuple(history_mask.shape)}."
+            )
+
+        available_counts = (~history_mask).sum(dim=1)
+        insufficient_rows = torch.nonzero(
+            available_counts < self.chunk_size,
+            as_tuple=False,
+        ).flatten()
+        if insufficient_rows.numel() > 0:
+            row_indices = insufficient_rows.detach().cpu().tolist()
+            row_counts = available_counts[insufficient_rows].detach().cpu().tolist()
+            raise ValueError(
+                "Not enough unmasked items to sample unique chunks: "
+                f"chunk_size={self.chunk_size}, rows={row_indices}, "
+                f"available_counts={row_counts}."
+            )
+
+        batch_size = int(logits.shape[0])
+        candidate_masks = history_mask.unsqueeze(0).expand(
+            num_samples,
+            -1,
+            -1,
+        ).clone()
+        sampled_steps = []
+        for step_index in range(self.chunk_size):
+            # 每个候选使用同一位置的 actor logits，但拥有独立的动态 mask。
+            step_logits = logits[:, step_index, :].unsqueeze(0).expand(
+                num_samples,
+                -1,
+                -1,
+            )
+            masked_logits = step_logits.masked_fill(
+                candidate_masks,
+                _MASK_LOGIT_VALUE,
+            )
+            step_probs = torch.softmax(masked_logits, dim=-1).reshape(
+                num_samples * batch_size,
+                self.num_items,
+            )
+            sampled_step = torch.multinomial(
+                step_probs,
+                num_samples=1,
+                replacement=False,
+            ).view(num_samples, batch_size)
+            sampled_steps.append(sampled_step)
+            candidate_masks.scatter_(
+                dim=2,
+                index=sampled_step.unsqueeze(-1),
+                value=True,
+            )
+
+        return torch.stack(sampled_steps, dim=-1).contiguous()
 
     @torch.no_grad()
     def select_chunks(
@@ -618,6 +727,68 @@ class MACAgent(nn.Module):
             terminated=self._batch_tensor(batch, "terminals").float().view(-1) > 0,
         )
 
+    def _prepare_rollout_sampling_mask(
+        self,
+        history_state: RolloutHistoryState,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """构造严格去重 rollout 的采样 mask，并处理候选耗尽样本。
+
+        已经没有任何未推荐 item 的样本不能再产生有效动作。该函数先把这些
+        样本标记为终止；随后仅为所有已终止行解除采样 mask，使批量候选采样
+        保持张量形状一致。占位候选会在 `_rollout_one_chunk()` 中被
+        `terminated` 状态屏蔽，因此不会执行、计 reward 或写回推荐历史。
+
+        Args:
+            history_state (RolloutHistoryState): 当前 imagined rollout 的历史状态。
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: 更新后的活跃行标记和供候选采样
+            使用的 mask，二者形状分别为 `(B,)` 与 `(B, num_items)`。
+
+        Raises:
+            ValueError: 当推荐历史 mask 的形状与 agent item 数不一致时抛出。
+        """
+
+        recommended_mask = history_state.recommended_mask
+        expected_mask_shape = (int(recommended_mask.shape[0]), self.num_items)
+        if tuple(recommended_mask.shape) != expected_mask_shape:
+            raise ValueError(
+                "recommended_mask shape mismatch: expected "
+                f"{expected_mask_shape}, got {tuple(recommended_mask.shape)}."
+            )
+
+        exhausted_rows = recommended_mask.all(dim=1)
+        # 无合法候选的样本在本次及后续 rollout chunk 中均不应再执行动作。
+        history_state.terminated = history_state.terminated | exhausted_rows
+        active_rows = ~history_state.terminated
+        sampling_mask = recommended_mask.clone()
+        # 非活跃行的候选仅用于维持批量张量形状，后续执行路径会完全屏蔽它们。
+        sampling_mask[~active_rows] = False
+        return active_rows, sampling_mask
+
+    def _reset_local_rollout_recommended_mask(
+        self,
+        history_state: RolloutHistoryState,
+    ) -> None:
+        """清空局部 imagined rollout 的 item 重复记录。
+
+        Q/V 训练从任意离线状态切入，离线轨迹在 `start_index` 之前的 item
+        仅用于构造状态和退出历史，不属于本次新生成的 imagined trajectory。
+        因此严格去重只从当前 rollout 的第一步开始累计。
+
+        Args:
+            history_state (RolloutHistoryState): 将被原地清空推荐 item mask 的
+                局部 rollout 历史状态。
+
+        Returns:
+            None.
+        """
+
+        history_state.recommended_mask = torch.zeros_like(
+            history_state.recommended_mask,
+            dtype=torch.bool,
+        )
+
     @torch.no_grad()
     def _rollout_one_chunk(
         self,
@@ -628,9 +799,10 @@ class MACAgent(nn.Module):
     ) -> tuple[RolloutResult, RolloutHistoryState]:
         """执行单个 chunk，直接消费离散 item id，不再走连续→离散映射。
 
-        `repeat_policy` 语义在离散版下的作用略有差异：`mask` 时候选采样阶段已经
-        屏蔽已推荐 item，因此 chunk 内 step 触发 exact repeat 的概率显著降低；
-        `truncate` 时不预先屏蔽，但仍在 rollout 内检测并施加惩罚。
+        `repeat_policy` 语义在离散版下的作用略有差异：`mask` 时候选采样阶段
+        同时屏蔽历史 item，并通过逐位置动态 mask 保证采样 chunk 内 item
+        严格唯一；`truncate` 时不预先屏蔽。该函数仍检测 exact repeat，
+        以兼容外部直接传入的任意 chunk 和离线行为数据。
 
         `leave_policy` 控制触发退出规则时的行为：
         - `penalty`：违规只在当前 step reward 上加 `invalid_action_penalty`，
@@ -927,7 +1099,8 @@ class MACAgent(nn.Module):
             batch (Dict[str, torch.Tensor]): ActionChunkDataset 输出 batch。
             num_samples (int): 每个 chunk 边界 rejection sampling 候选数。
             rollout_depth (int): imagined rollout 的 chunk 数 `H`，必须为正。
-            repeat_policy (str): 重复推荐处理策略；`mask` 时候选采样阶段屏蔽已推荐 item。
+            repeat_policy (str): 重复推荐处理策略；`mask` 只屏蔽本次 imagined
+                rollout 已执行 item 和当前候选 chunk 内已选择 item。
             leave_policy (str): 退出规则处理策略，支持 `penalty` 和 `terminate`。
 
         Returns:
@@ -944,6 +1117,8 @@ class MACAgent(nn.Module):
 
         self._batch_user_ids = self._batch_tensor(batch, "user_id").long().view(-1)
         history_state = self._initial_history_state(batch)
+        if repeat_policy == REPEAT_POLICY_MASK:
+            self._reset_local_rollout_recommended_mask(history_state)
         batch_size = int(history_state.env_step.shape[0])
         steps: list = []
         trajectory_returns = torch.zeros(batch_size, device=self.device)
@@ -951,7 +1126,12 @@ class MACAgent(nn.Module):
         cumulative_discount = torch.ones(batch_size, device=self.device)
 
         for _ in range(rollout_depth):
-            active = ~history_state.terminated
+            if repeat_policy == REPEAT_POLICY_MASK:
+                active, candidate_mask = self._prepare_rollout_sampling_mask(history_state)
+            else:
+                # truncate 策略允许重复推荐，不能因历史 mask 已满而提前终止。
+                active = ~history_state.terminated
+                candidate_mask = None
             # rollout_depth 通常很小（默认 1）；跳过 `.item()` 同步以让 GPU 流水连续。
             states = self.dynamics.next_state(
                 history_state.history_vectors,
@@ -959,9 +1139,6 @@ class MACAgent(nn.Module):
                 torch.zeros(batch_size, self.chunk_size, self.action_dim, device=self.device),
                 torch.zeros(batch_size, self.chunk_size, device=self.device),
                 torch.zeros(batch_size, self.chunk_size, dtype=torch.bool, device=self.device),
-            )
-            candidate_mask = (
-                history_state.recommended_mask if repeat_policy == REPEAT_POLICY_MASK else None
             )
             selected_item_ids, selected_chunks = self.select_chunks(
                 states,

@@ -53,14 +53,20 @@ class RuleBasedLeaveModel:
         all_categories = set()
         for features in self.list_feat_small:
             all_categories.update(int(f) for f in features)
-        self._num_categories = (max(all_categories) + 1) if all_categories else 0
+        # KuaiRand 使用 -1 表示缺失标签，类别值也不保证稠密连续，因此先压缩到
+        # `[0, num_categories)`；直接把原值作为列下标会令 -1 与最后一列错误碰撞。
+        category_to_index = {
+            category: index
+            for index, category in enumerate(sorted(all_categories))
+        }
+        self._num_categories = len(category_to_index)
         # bool 矩阵：item_feat_mat[item_id, category] = True 表示该 item 拥有该 category。
         # 训练期实际使用时会 lazily 迁移到 GPU（见 first_violation_steps_batch）。
         if self._num_categories > 0:
             item_feat_mat = torch.zeros(num_items, self._num_categories, dtype=torch.bool)
             for item_id, features in enumerate(self.list_feat_small):
                 for feat in features:
-                    item_feat_mat[item_id, int(feat)] = True
+                    item_feat_mat[item_id, category_to_index[int(feat)]] = True
         else:
             item_feat_mat = torch.zeros(num_items, 0, dtype=torch.bool)
         self._item_feat_mat_cpu = item_feat_mat

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -83,6 +83,107 @@ DORL_POLICY_METRICS = [
 SKIPPED_ARRAY_SUFFIXES = ("rews", "lens", "idxs")
 """与原 trainer SwanLab 记录逻辑一致，跳过 episode 明细数组。"""
 
+OPEN_LOOP_BRANCH_FB = "FB"
+"""使用环境自然退出语义的 FB 评估分支名。"""
+
+OPEN_LOOP_BRANCH_NX0 = "NX_0"
+"""屏蔽已推荐 item 但不强制轨迹长度的 NX_0 分支名。"""
+
+
+class _PreloadedEmbeddingProvider:
+    """为无参数 StateTrackerAvg 提供预加载的 user/item embedding。"""
+
+    def __init__(self, user_embeddings: torch.Tensor, item_embeddings: torch.Tensor) -> None:
+        """保存已校验的 embedding 张量。
+
+        Args:
+            user_embeddings (torch.Tensor): 用户 embedding 表。
+            item_embeddings (torch.Tensor): 物品 embedding 表。
+        """
+
+        self.user_embeddings = user_embeddings
+        self.item_embeddings = item_embeddings
+
+    def load_val_user_item_embedding(
+        self,
+        model_i: int = 0,
+        freeze_emb: bool = True,
+    ) -> torch.nn.ModuleDict:
+        """返回与 `EnsembleModel` 相同接口的验证集 embedding。
+
+        Args:
+            model_i (int): 兼容原接口的模型编号；预加载版本仅支持 M0。
+            freeze_emb (bool): 是否冻结 embedding 参数。
+
+        Returns:
+            torch.nn.ModuleDict: 包含 `feat_user` 和 `feat_item` 的 embedding 模块。
+
+        Raises:
+            ValueError: 当请求 M0 之外的模型编号时抛出。
+        """
+
+        if model_i != 0:
+            raise ValueError("Preloaded StateTrackerAvg embeddings only provide model M0.")
+        return torch.nn.ModuleDict(
+            {
+                "feat_user": torch.nn.Embedding.from_pretrained(
+                    self.user_embeddings,
+                    freeze=freeze_emb,
+                ),
+                "feat_item": torch.nn.Embedding.from_pretrained(
+                    self.item_embeddings,
+                    freeze=freeze_emb,
+                ),
+            }
+        )
+
+
+def load_avg_embedding_provider(args: Any, env: Any) -> _PreloadedEmbeddingProvider:
+    """直接加载 StateTrackerAvg 所需 embedding，避免重载可训练 user model。
+
+    Args:
+        args (Any): 含 `user_embedding_path` 和 `item_embedding_path` 的参数对象。
+        env (Any): 当前推荐环境，用于校验 user/item 数量。
+
+    Returns:
+        _PreloadedEmbeddingProvider: 与旧 `EnsembleModel` embedding 接口兼容的提供器。
+
+    Raises:
+        FileNotFoundError: 当 user 或 item embedding 文件不存在时抛出。
+        ValueError: 当 embedding 维度或行数与环境不一致时抛出。
+    """
+
+    user_path = Path(args.user_embedding_path)
+    item_path = Path(args.item_embedding_path)
+    for asset_name, asset_path in (
+        ("User embedding", user_path),
+        ("Item embedding", item_path),
+    ):
+        if not asset_path.is_file():
+            raise FileNotFoundError(f"{asset_name} file does not exist: {asset_path}")
+
+    user_embeddings = torch.load(user_path, map_location="cpu")
+    item_embeddings = torch.load(item_path, map_location="cpu")
+    if not isinstance(user_embeddings, torch.Tensor) or user_embeddings.ndim != 2:
+        raise ValueError(f"User embedding file must contain a 2D Tensor: {user_path}")
+    if not isinstance(item_embeddings, torch.Tensor) or item_embeddings.ndim != 2:
+        raise ValueError(f"Item embedding file must contain a 2D Tensor: {item_path}")
+    expected_users, expected_items = map(int, env.mat.shape)
+    if int(user_embeddings.shape[0]) != expected_users:
+        raise ValueError(
+            "User embedding rows must match environment users: "
+            f"rows={user_embeddings.shape[0]}, users={expected_users}."
+        )
+    if int(item_embeddings.shape[0]) != expected_items:
+        raise ValueError(
+            "Item embedding rows must match environment items: "
+            f"rows={item_embeddings.shape[0]}, items={expected_items}."
+        )
+    return _PreloadedEmbeddingProvider(
+        user_embeddings=user_embeddings.float(),
+        item_embeddings=item_embeddings.float(),
+    )
+
 
 @dataclass
 class DORLMACEvaluator:
@@ -95,17 +196,8 @@ class DORLMACEvaluator:
         eval_episodes (int): 每次评估采样的 episode 数量。
         save_dir (Path): 评估 summary 保存目录。
         force_length (int): `NX_force_length` 评估分支长度。
-        nx0_reward_calibration (str): NX_0 指标校准方式。
-        nx0_reward_bonus_per_step (float): 满长等效 reward 每步额外 bonus。
-        nx0_length_warmup_epochs (int): progressive 模式下长度增长 warmup epoch 数。
-        nx0_feat_calibration (str): NX_0_ifeat_feat 校准方式。
-        nx0_feat_target (float): NX_0_ifeat_feat 目标值。
-        nx0_feat_warmup_epochs (int): NX_0_ifeat_feat 收敛 warmup epoch 数。
-        nx0_feat_max_step_change (float): NX_0_ifeat_feat 单评估点最大变化量。
-        metric_jitter_seed (int): 展示型指标可复现抖动种子。
-        metric_jitter_scale (float): 上升阶段展示型指标抖动幅度。
-        metric_plateau_jitter_scale (float): 平台阶段展示型指标抖动幅度。
-        last_calibrated_nx0_feat (Optional[float]): 上一次校准后的 NX_0_ifeat_feat。
+        completion_window (int): CCR@W 的固定环境步窗口 W。
+        max_turn (int): FB/NX_0 分支的最大轨迹长度，用于识别右删失窗口。
     """
 
     policy: DORLMACPolicyAdapter
@@ -114,17 +206,8 @@ class DORLMACEvaluator:
     eval_episodes: int
     save_dir: Path
     force_length: int
-    nx0_reward_calibration: str = NX0_CALIBRATION_NONE
-    nx0_reward_bonus_per_step: float = 0.0
-    nx0_length_warmup_epochs: int = DEFAULT_NX0_LENGTH_WARMUP_EPOCHS
-    nx0_feat_calibration: str = NX0_FEAT_CALIBRATION_NONE
-    nx0_feat_target: float = DEFAULT_NX0_FEAT_TARGET
-    nx0_feat_warmup_epochs: int = DEFAULT_NX0_FEAT_WARMUP_EPOCHS
-    nx0_feat_max_step_change: float = DEFAULT_NX0_FEAT_MAX_STEP_CHANGE
-    metric_jitter_seed: int = DEFAULT_METRIC_JITTER_SEED
-    metric_jitter_scale: float = DEFAULT_METRIC_JITTER_SCALE
-    metric_plateau_jitter_scale: float = DEFAULT_METRIC_PLATEAU_JITTER_SCALE
-    last_calibrated_nx0_feat: Optional[float] = field(default=None, init=False, repr=False)
+    completion_window: int
+    max_turn: int
 
     def evaluate(self, epoch: int, global_step: int | None = None) -> Dict[str, Any]:
         """按原 DORL trainer 的 test step 语义执行一次评估。
@@ -138,13 +221,48 @@ class DORLMACEvaluator:
             的基础指标和覆盖率、特征、多样性、新颖度指标。
         """
 
-        LOGGER.info("开始 DORL-MAC epoch 评估：epoch=%s, episodes=%s", epoch, self.eval_episodes)
+        LOGGER.info(
+            "开始 DORL-MAC epoch 评估：epoch=%s, episodes=%s, K=%s, H=%s, "
+            "candidates=%s, CCR_window=%s, ADR=%s",
+            epoch,
+            self.eval_episodes,
+            self.policy.chunk_size,
+            self.policy.execution_horizon,
+            self.policy.num_samples_test,
+            self.completion_window,
+            self.policy.enable_open_loop_diagnostics,
+        )
         self.collector_set.reset_env()
         self.collector_set.reset_buffer()
         self.policy.eval()
         results = self.collector_set.collect(n_episode=self.eval_episodes)
         summary = self._run_callbacks(epoch=epoch, results=results)
         summary.setdefault("trainer/epoch", int(epoch))
+        summary.setdefault("evaluation/chunk_size", int(self.policy.chunk_size))
+        summary.setdefault(
+            "evaluation/execution_horizon",
+            int(self.policy.execution_horizon),
+        )
+        summary.setdefault(
+            "evaluation/num_samples_test",
+            int(self.policy.num_samples_test),
+        )
+        summary.setdefault(
+            "evaluation/completion_window",
+            int(self.completion_window),
+        )
+        summary.setdefault(
+            "evaluation/adr_enabled",
+            int(self.policy.enable_open_loop_diagnostics),
+        )
+        summary.setdefault(
+            "evaluation/adr_comparison",
+            self.policy.adr_comparison,
+        )
+        summary.setdefault(
+            "evaluation/adr_num_categories",
+            int(self.policy.adr_num_categories),
+        )
         if global_step is not None:
             summary.setdefault("trainer/env_step", int(global_step))
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -173,31 +291,13 @@ class DORLMACEvaluator:
             sanitized_log_data = sanitize_dorl_metrics(callback_results)
             add_ctr_aliases(sanitized_log_data, force_length=self.force_length)
             epoch_log_data.update(sanitized_log_data)
-        # 先给校准前的真实评估指标打上 raw/ 命名空间快照，保持与训练侧一致：
-        # raw/<key> 一律是环境真实值，display/<key> 一律是带目标的展示值。
-        mirror_metrics_to_raw_namespace(epoch_log_data)
-        calibrate_nx0_metrics(
-            epoch_log_data,
-            force_length=self.force_length,
-            mode=self.nx0_reward_calibration,
-            bonus_per_step=self.nx0_reward_bonus_per_step,
-            epoch=epoch,
-            warmup_epochs=self.nx0_length_warmup_epochs,
-            jitter_seed=self.metric_jitter_seed,
-            jitter_scale=self.metric_jitter_scale,
-            plateau_jitter_scale=self.metric_plateau_jitter_scale,
-        )
-        self.last_calibrated_nx0_feat = calibrate_nx0_feat_metric(
-            epoch_log_data,
-            mode=self.nx0_feat_calibration,
-            target_value=self.nx0_feat_target,
-            epoch=epoch,
-            warmup_epochs=self.nx0_feat_warmup_epochs,
-            max_step_change=self.nx0_feat_max_step_change,
-            previous_value=self.last_calibrated_nx0_feat,
-            jitter_seed=self.metric_jitter_seed,
-            jitter_scale=self.metric_jitter_scale,
-            plateau_jitter_scale=self.metric_plateau_jitter_scale,
+        epoch_log_data.update(
+            build_open_loop_metrics(
+                results=results,
+                completion_window=self.completion_window,
+                max_turn=self.max_turn,
+                force_length=self.force_length,
+            )
         )
         return epoch_log_data
 
@@ -224,6 +324,143 @@ def mirror_metrics_to_raw_namespace(metrics: Dict[str, Any]) -> None:
             continue
         if isinstance(value, (int, float)):
             metrics.setdefault(f"raw/{key}", float(value))
+
+
+def compute_window_completion_metrics(
+    episode_lengths: np.ndarray,
+    completion_window: int,
+    censor_limit: int,
+) -> Dict[str, Optional[float]]:
+    """从逐 episode 长度计算固定窗口 CCR@W。
+
+    每条轨迹被切分为不重叠的 W 步窗口。完整执行 W 步的
+    窗口计为完成；用户在 W 步内自然退出时计为失败；轨迹达到
+    `censor_limit` 时未满 W 步的尾窗口计为右删失，不进入分母。
+
+    Args:
+        episode_lengths (np.ndarray): 逐 episode 已执行环境步数，
+            应为非负整数数组。
+        completion_window (int): 完成窗口 W，必须大于 0。
+        censor_limit (int): 该评估分支的强制最大步数，必须
+            不小于 `completion_window`。
+
+    Returns:
+        Dict[str, Optional[float]]: `rate`、完成窗口数、可评估
+        窗口数和右删失窗口数；无可评估窗口时 `rate=None`。
+
+    Raises:
+        ValueError: 当 W、删失上限或 episode length 非法时抛出。
+
+    Example:
+        >>> values = compute_window_completion_metrics(
+        ...     np.asarray([12, 5, 3]), completion_window=5, censor_limit=100
+        ... )
+        >>> values["completed_windows"], values["eligible_windows"]
+        (3.0, 5.0)
+    """
+
+    if completion_window <= 0:
+        raise ValueError("completion_window must be positive.")
+    if censor_limit < completion_window:
+        raise ValueError(
+            "censor_limit must be greater than or equal to completion_window, "
+            f"got censor_limit={censor_limit}, window={completion_window}."
+        )
+    lengths = np.asarray(episode_lengths).reshape(-1)
+    if np.any(~np.isfinite(lengths)) or np.any(lengths < 0):
+        raise ValueError("episode_lengths must contain finite non-negative values.")
+
+    completed_windows = 0
+    eligible_windows = 0
+    censored_windows = 0
+    for raw_length in lengths:
+        episode_length = int(raw_length)
+        full_windows, remaining_steps = divmod(episode_length, completion_window)
+        completed_windows += full_windows
+        eligible_windows += full_windows
+        if remaining_steps <= 0:
+            continue
+        if episode_length >= censor_limit:
+            censored_windows += 1
+        else:
+            eligible_windows += 1
+
+    completion_rate: Optional[float] = None
+    if eligible_windows > 0:
+        completion_rate = float(completed_windows) / float(eligible_windows)
+    return {
+        "rate": completion_rate,
+        "completed_windows": float(completed_windows),
+        "eligible_windows": float(eligible_windows),
+        "censored_windows": float(censored_windows),
+    }
+
+
+def build_open_loop_metrics(
+    results: Dict[str, Any],
+    completion_window: int,
+    max_turn: int,
+    force_length: int,
+) -> Dict[str, Any]:
+    """构造 FB/NX 分支的 CCR@W 与 ADR 评估指标。
+
+    Args:
+        results (Dict[str, Any]): `CollectorSet.collect` 返回的原始结果，
+            包含逐 episode `lens` 与 policy 诊断 hook 输出。
+        completion_window (int): CCR 的固定步数窗口 W。
+        max_turn (int): FB/NX_0 分支的最大轨迹长度。
+        force_length (int): `NX_force_length` 分支的强制长度。
+
+    Returns:
+        Dict[str, Any]: 可直接合并到 evaluator summary 的动态
+        `CCR@W`、计数与 ADR 指标。
+
+    Raises:
+        ValueError: 当窗口或评估长度参数非法时抛出。
+    """
+
+    if max_turn <= 0:
+        raise ValueError("max_turn must be positive.")
+    if force_length <= 0:
+        raise ValueError("force_length must be positive.")
+    branch_specs = {
+        OPEN_LOOP_BRANCH_FB: ("lens", max_turn),
+        OPEN_LOOP_BRANCH_NX0: ("NX_0_lens", max_turn),
+        f"NX_{force_length}": (f"NX_{force_length}_lens", force_length),
+    }
+    metrics: Dict[str, Any] = {}
+    for branch_name, (length_key, censor_limit) in branch_specs.items():
+        if length_key not in results:
+            continue
+        metric_prefix = f"open_loop/{branch_name}"
+        if censor_limit < completion_window:
+            metrics[f"{metric_prefix}/CCR@{completion_window}"] = None
+            metrics[f"{metric_prefix}/CCR_completed_windows"] = 0.0
+            metrics[f"{metric_prefix}/CCR_eligible_windows"] = 0.0
+            metrics[f"{metric_prefix}/CCR_censored_windows"] = float(
+                np.asarray(results[length_key]).size
+            )
+            continue
+        completion = compute_window_completion_metrics(
+            episode_lengths=np.asarray(results[length_key]),
+            completion_window=completion_window,
+            censor_limit=censor_limit,
+        )
+        metrics[f"{metric_prefix}/CCR@{completion_window}"] = completion["rate"]
+        metrics[f"{metric_prefix}/CCR_completed_windows"] = completion[
+            "completed_windows"
+        ]
+        metrics[f"{metric_prefix}/CCR_eligible_windows"] = completion[
+            "eligible_windows"
+        ]
+        metrics[f"{metric_prefix}/CCR_censored_windows"] = completion[
+            "censored_windows"
+        ]
+
+    for metric_name, metric_value in results.items():
+        if metric_name.startswith("open_loop/"):
+            metrics[metric_name] = metric_value
+    return metrics
 
 
 def sanitize_dorl_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -723,6 +960,97 @@ def apply_state_tracker_defaults(args: Any, device: torch.device) -> None:
     args.top_rate = 0.8
 
 
+def build_dorl_mac_state_tracker(
+    args: Any,
+    env: Any,
+    device: torch.device,
+) -> torch.nn.Module:
+    """加载一次 user model 并构造 DORL-MAC 评估 StateTracker。
+
+    单进程多 H 消融可以复用本函数返回的 StateTracker，避免每个
+    execution horizon 重复加载 user model。StateTracker 在评估路径
+    中只根据当前 Collector buffer 构造状态，不保存跨 episode 隐状态。
+
+    Args:
+        args (Any): 命令行参数对象，会补齐旧 StateTracker 所需字段。
+        env (Any): 当前真实推荐环境实例。
+        device (torch.device): StateTracker 所在设备。
+
+    Returns:
+        torch.nn.Module: 已切换到 eval 模式的 StateTracker。
+    """
+
+    apply_state_tracker_defaults(args, device=device)
+    if str(args.which_tracker).lower() == "avg":
+        ensemble_models = load_avg_embedding_provider(args=args, env=env)
+        LOGGER.info(
+            "StateTrackerAvg 直接加载 embedding，不加载 DeepFM 可训练参数：env=%s",
+            args.env,
+        )
+    else:
+        ensemble_models = prepare_user_model(args)
+    args.device = device
+    state_tracker = setup_state_tracker(
+        args,
+        ensemble_models,
+        env,
+        train_envs=None,
+        test_envs_dict=None,
+    )
+    state_tracker.eval()
+    return state_tracker
+
+
+def resolve_evaluation_collection_config(
+    eval_episodes: int,
+    requested_env_num: int,
+    max_turn: int,
+    force_length: int,
+    buffer_size: int,
+) -> tuple[int, int]:
+    """确定多轨迹评估的并行环境数和 replay buffer 容量。
+
+    每个评估分支都会保留全部采样轨迹供 callback 计算覆盖率、特征和
+    用户体验指标。因此默认 buffer 容量按所有轨迹的最长可能步数估计，
+    避免较早轨迹被环形 buffer 覆盖后产生不完整的汇总结果。
+
+    Args:
+        eval_episodes (int): 每个分支要采样的独立轨迹数，必须大于 0。
+        requested_env_num (int): 用户请求的并行测试环境数，必须大于 0。
+        max_turn (int): FB/NX_0 分支的最大轨迹长度，必须大于 0。
+        force_length (int): 强制长度分支的轨迹长度，必须大于 0。
+        buffer_size (int): 用户指定的总 buffer 容量；小于等于 0 时自动计算。
+
+    Returns:
+        tuple[int, int]: `(parallel_env_num, resolved_buffer_size)`。
+
+    Raises:
+        ValueError: 当输入不为正，或显式 buffer 无法容纳全部最长轨迹时抛出。
+    """
+
+    if eval_episodes <= 0:
+        raise ValueError("eval_episodes must be positive.")
+    if requested_env_num <= 0:
+        raise ValueError("test_num must be positive.")
+    if max_turn <= 0 or force_length <= 0:
+        raise ValueError("max_turn and force_length must be positive.")
+
+    parallel_env_num = min(int(requested_env_num), int(eval_episodes))
+    max_episode_steps = max(int(max_turn), int(force_length))
+    minimum_buffer_size = int(eval_episodes) * max_episode_steps
+    if buffer_size > 0:
+        if int(buffer_size) < minimum_buffer_size:
+            raise ValueError(
+                "buffer_size is too small to retain all evaluation trajectories: "
+                f"got {buffer_size}, need at least {minimum_buffer_size}."
+            )
+        return parallel_env_num, int(buffer_size)
+    return (
+        parallel_env_num,
+        minimum_buffer_size * DEFAULT_BUFFER_MULTIPLIER,
+    )
+
+
 def build_dorl_policy_callbacks(
     args: Any,
     env: Any,
@@ -787,6 +1115,10 @@ def build_dorl_mac_evaluator(
     eval_episodes: int,
     save_dir: Path,
     buffer_size: int = 0,
+    execution_horizon: Optional[int] = None,
+    completion_window: int = 5,
+    enable_open_loop_diagnostics: bool = False,
+    state_tracker: Optional[torch.nn.Module] = None,
 ) -> DORLMACEvaluator:
     """构造可在训练中重复调用的 DORL-MAC 评估器。
 
@@ -802,28 +1134,40 @@ def build_dorl_mac_evaluator(
         eval_episodes (int): 每次评估 episode 数。
         save_dir (Path): summary 保存目录。
         buffer_size (int): Collector replay buffer 大小；小于等于 0 时自动推断。
+        execution_horizon (Optional[int]): 每次 chunk 规划后连续执行的
+            前缀长度 `H`；为 `None` 时执行完整 chunk。
+        completion_window (int): CCR@W 的固定环境步窗口 W。
+        enable_open_loop_diagnostics (bool): 是否启用 ADR shadow replan。
+        state_tracker (Optional[torch.nn.Module]): 可选的预构造 StateTracker。
+            单进程多 H sweep 传入同一实例以避免重复加载 user model；
+            为 `None` 时保持原行为并在函数内构造。
 
     Returns:
         DORLMACEvaluator: 可复用评估器。
 
     Raises:
-        ValueError: 当评估 episode 或候选数非法时抛出。
+        ValueError: 当评估 episode、候选数或 CCR 窗口非法时抛出。
     """
 
     if eval_episodes <= 0:
         raise ValueError("eval_episodes must be positive.")
     if num_samples_test <= 0:
         raise ValueError("num_samples_test must be positive.")
-    apply_state_tracker_defaults(args, device=device)
-    ensemble_models = prepare_user_model(args)
-    args.device = device
-    state_tracker = setup_state_tracker(
-        args,
-        ensemble_models,
-        env,
-        train_envs=None,
-        test_envs_dict=None,
-    )
+    if completion_window <= 0:
+        raise ValueError("completion_window must be positive.")
+    if completion_window > int(args.max_turn):
+        raise ValueError(
+            "completion_window must not exceed max_turn, "
+            f"got window={completion_window}, max_turn={args.max_turn}."
+        )
+    if state_tracker is None:
+        state_tracker = build_dorl_mac_state_tracker(
+            args=args,
+            env=env,
+            device=device,
+        )
+    else:
+        args.device = device
     state_tracker.eval()
     policy = DORLMACPolicyAdapter(
         agent=agent,
@@ -831,15 +1175,33 @@ def build_dorl_mac_evaluator(
         action_mapper=action_mapper,
         num_samples_test=num_samples_test,
         device=device,
+        execution_horizon=execution_horizon,
+        enable_open_loop_diagnostics=enable_open_loop_diagnostics,
+        item_categories=(
+            getattr(env, "list_feat_small", None)
+            or getattr(env, "list_feat", None)
+            if enable_open_loop_diagnostics
+            else None
+        ),
     )
-    test_envs_dict = prepare_test_envs(args, env, kwargs_um)
-    if buffer_size <= 0:
-        buffer_size = max(args.test_num * args.max_turn * DEFAULT_BUFFER_MULTIPLIER, args.test_num * 8)
+    parallel_env_num, resolved_buffer_size = resolve_evaluation_collection_config(
+        eval_episodes=eval_episodes,
+        requested_env_num=int(args.test_num),
+        max_turn=int(args.max_turn),
+        force_length=int(args.force_length),
+        buffer_size=buffer_size,
+    )
+    original_test_num = int(args.test_num)
+    args.test_num = parallel_env_num
+    try:
+        test_envs_dict = prepare_test_envs(args, env, kwargs_um)
+    finally:
+        args.test_num = original_test_num
     collector_set = CollectorSet(
         policy,
         test_envs_dict,
-        buffer_size=buffer_size,
-        env_num=args.test_num,
+        buffer_size=resolved_buffer_size,
+        env_num=parallel_env_num,
         force_length=args.force_length,
     )
     callbacks = build_dorl_policy_callbacks(
@@ -856,33 +1218,6 @@ def build_dorl_mac_evaluator(
         eval_episodes=eval_episodes,
         save_dir=save_dir,
         force_length=args.force_length,
-        nx0_reward_calibration=getattr(args, "nx0_reward_calibration", NX0_CALIBRATION_NONE),
-        nx0_reward_bonus_per_step=getattr(args, "nx0_reward_bonus_per_step", 0.0),
-        nx0_length_warmup_epochs=getattr(
-            args,
-            "nx0_length_warmup_epochs",
-            DEFAULT_NX0_LENGTH_WARMUP_EPOCHS,
-        ),
-        nx0_feat_calibration=getattr(args, "nx0_feat_calibration", NX0_FEAT_CALIBRATION_NONE),
-        nx0_feat_target=getattr(args, "nx0_feat_target", DEFAULT_NX0_FEAT_TARGET),
-        nx0_feat_warmup_epochs=getattr(
-            args,
-            "nx0_feat_warmup_epochs",
-            DEFAULT_NX0_FEAT_WARMUP_EPOCHS,
-        ),
-        nx0_feat_max_step_change=getattr(
-            args,
-            "nx0_feat_max_step_change",
-            DEFAULT_NX0_FEAT_MAX_STEP_CHANGE,
-        ),
-        metric_jitter_seed=resolve_metric_jitter_seed(
-            seed=getattr(args, "seed", 0),
-            metric_jitter_seed=getattr(args, "metric_jitter_seed", DEFAULT_METRIC_JITTER_SEED),
-        ),
-        metric_jitter_scale=getattr(args, "metric_jitter_scale", DEFAULT_METRIC_JITTER_SCALE),
-        metric_plateau_jitter_scale=getattr(
-            args,
-            "metric_plateau_jitter_scale",
-            DEFAULT_METRIC_PLATEAU_JITTER_SCALE,
-        ),
+        completion_window=completion_window,
+        max_turn=args.max_turn,
     )

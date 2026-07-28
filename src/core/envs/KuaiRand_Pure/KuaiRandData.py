@@ -1,3 +1,4 @@
+import ast
 import os
 import sys
 import pickle
@@ -10,6 +11,9 @@ from src.core.envs.KuaiRand_Pure.preprocessing_kuairand import get_df_data
 
 sys.path.extend([".", "./src", "./src/DeepCTR-Torch", "./src/tianshou"])
 from src.core.envs.BaseData import BaseData, get_distance_mat
+
+ITEM_TAG_COLUMNS = ["feat0", "feat1", "feat2"]
+"""KuaiRand 每个物品最多保留的三个标签特征列。"""
 
 # ROOTPATH = os.path.dirname(__file__)
 ROOTPATH = "data/KuaiRand_Pure"
@@ -198,13 +202,28 @@ class KuaiRandData(BaseData):
         print("load item feature")
         filepath = os.path.join(DATAPATH, 'video_features_basic_pure.csv')
         df_item = pd.read_csv(filepath, usecols=["tag"], dtype=str)
-        ind = df_item['tag'].isna()
-        df_item['tag'].loc[~ind] = df_item['tag'].loc[~ind].map(lambda x: eval(f"[{x}]"))
-        df_item['tag'].loc[ind] = [[-1]] * ind.sum()
+        # 一次性生成解析后的标签列，避免 pandas 3.0 下链式赋值失效。
+        df_item["tag"] = df_item["tag"].map(
+            lambda raw_tag: (
+                [-1]
+                if pd.isna(raw_tag)
+                else ast.literal_eval(f"[{raw_tag}]")
+            )
+        )
 
         list_feat = df_item['tag'].to_list()
 
-        df_feat = pd.DataFrame(list_feat, columns=['feat0', 'feat1', 'feat2'])
+        max_tag_count = max((len(tags) for tags in list_feat), default=0)
+        if max_tag_count > len(ITEM_TAG_COLUMNS):
+            raise ValueError(
+                "KuaiRand item tag count exceeds supported feature columns: "
+                f"max_tags={max_tag_count}, supported={len(ITEM_TAG_COLUMNS)}."
+            )
+        # reindex 会为不足三个标签的测试子集补 NaN，避免 DataFrame 列数不匹配。
+        df_feat = pd.DataFrame(list_feat).reindex(
+            columns=range(len(ITEM_TAG_COLUMNS))
+        )
+        df_feat.columns = ITEM_TAG_COLUMNS
         df_feat.index.name = "item_id"
         df_feat[df_feat.isna()] = -1
         df_feat = df_feat + 1
@@ -223,9 +242,14 @@ class KuaiRandData(BaseData):
             small_duration = get_df_data(small_path, usecols=["item_id", 'duration_normed'])
             big_path = os.path.join(DATAPATH, "train_processed.csv")
             big_duration = get_df_data(big_path, usecols=["item_id", 'duration_normed'])
-            duration_all = small_duration.append(big_duration)
-            video_mean_duration = duration_all.groupby("item_id").agg(lambda x: sum(list(x)) / len(x))[
-                "duration_normed"]
+            # pandas 2.0 已移除 DataFrame.append，使用 concat 合并两份交互日志。
+            duration_all = pd.concat(
+                [small_duration, big_duration],
+                ignore_index=True,
+            )
+            video_mean_duration = duration_all.groupby("item_id")[
+                "duration_normed"
+            ].mean()
             video_mean_duration.to_csv(duration_path, index=False)
 
         video_mean_duration.index.name = "item_id"

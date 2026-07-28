@@ -33,15 +33,7 @@ from examples.our_model.runners.common import (
     save_resolved_config,
     set_seed,
 )
-from examples.our_model.runners.evaluation_utils import (
-    bounded_metric_multiplier,
-    build_dorl_mac_evaluator,
-    compute_jittered_metric_progress,
-    metric_jitter_amplitude,
-    resolve_metric_jitter_seed,
-    stable_metric_noise,
-    validate_metric_jitter_args,
-)
+from examples.our_model.runners.evaluation_utils import build_dorl_mac_evaluator
 from examples.our_model.runners.pretrain_categorical_bc import cycle_dataloader
 
 LOGGER = logging.getLogger(__name__)
@@ -739,6 +731,9 @@ def main(argv: Optional[list[str]] = None) -> Path:
         action_mapper=action_mapper,
         device=device,
         num_samples_test=args.num_samples_test,
+        execution_horizon=args.execution_horizon,
+        completion_window=args.completion_window,
+        enable_open_loop_diagnostics=args.enable_open_loop_diagnostics,
         eval_episodes=effective_eval_episodes,
         save_dir=eval_save_dir,
         buffer_size=args.buffer_size,
@@ -760,10 +755,6 @@ def main(argv: Optional[list[str]] = None) -> Path:
         run_name=default_run_name("qv", args),
         config=config,
         log_path=str(metrics_log_path),
-    )
-    train_metric_calibrator = QVTrainingMetricCalibrator.from_args(
-        args,
-        step_per_epoch=step_per_epoch,
     )
     LOGGER.info("Q/V 本地指标日志路径：%s", metrics_log_path)
 
@@ -815,7 +806,8 @@ def main(argv: Optional[list[str]] = None) -> Path:
                 or global_step == total_steps
             )
             if do_log:
-                train_metrics = train_metric_calibrator.calibrate(last_metrics, global_step=global_step)
+                # 训练日志只记录 `qv_update` 返回的真实统计量，不进行目标插值或抖动。
+                train_metrics = dict(last_metrics)
                 train_metrics["trainer/epoch"] = current_epoch
                 train_metrics["trainer/global_step"] = global_step
                 if _profile_enabled and _profile_accum["steps"] > 0:

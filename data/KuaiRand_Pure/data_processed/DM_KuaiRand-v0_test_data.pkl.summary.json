@@ -1,0 +1,22 @@
+{
+  "action_dim": 17,
+  "embedding_path": "/data/yuzhengyang/RL_Learning/EasyRL4Rec/saved_models/KuaiRand-v0/DeepFM/embeddings/[pointneg]_emb_item_val_M0.pt",
+  "embedding_sha256": "ec05f4da88a5066d99d167f4943f84916e8c772a4c9658913e4bf322b7dced1a",
+  "input_path": "/data/yuzhengyang/RL_Learning/EasyRL4Rec/data/KuaiRand_Pure/data_raw/test_processed.csv",
+  "input_sha256": "d7eb51261f65a16b84da7520142091b78a76b00cb694ea203132e7e27f87a7c8",
+  "max_trajectory_length": 1580,
+  "max_users": null,
+  "mean_trajectory_length": 43.46926882902694,
+  "min_trajectory_length": 10,
+  "num_trajectories": 27285,
+  "num_transitions": 1186059,
+  "output_path": "/data/yuzhengyang/RL_Learning/EasyRL4Rec/data/KuaiRand_Pure/data_processed/DM_KuaiRand-v0_test_data.pkl",
+  "output_sha256": "143c8e0d71117d2edd1ad25084c1ccae7952db37671a9c12bd4213fe424eab37",
+  "output_size_bytes": 261503417,
+  "padding_std": 0.01,
+  "reward_column": "is_click",
+  "seed": 2023,
+  "state_dim": 18,
+  "terminal_rule": "only_last_transition_true",
+  "window_size": 3
+}

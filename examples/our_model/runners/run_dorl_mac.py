@@ -118,6 +118,9 @@ def build_common_argv(args: argparse.Namespace) -> List[str]:
         "--run_name",
         args.run_name,
     ]
+    if args.execution_horizon is not None:
+        common_args.extend(["--execution_horizon", str(args.execution_horizon)])
+    common_args.extend(["--completion_window", str(args.completion_window)])
     common_args.append("--entropy_window")
     common_args.extend(str(window) for window in args.entropy_window)
     common_args.extend(
@@ -128,10 +131,15 @@ def build_common_argv(args: argparse.Namespace) -> List[str]:
             else "--no_uncertainty_penalty",
             "--feature_level" if args.feature_level else "--no_feature_level",
             "--is_sorted" if args.is_sorted else "--no_sorted",
+            "--enable_open_loop_diagnostics"
+            if args.enable_open_loop_diagnostics
+            else "--disable_open_loop_diagnostics",
         ]
     )
     if args.item_embedding_path:
         common_args.extend(["--item_embedding_path", args.item_embedding_path])
+    if args.user_embedding_path:
+        common_args.extend(["--user_embedding_path", args.user_embedding_path])
     if args.predicted_mat_path:
         common_args.extend(["--predicted_mat_path", args.predicted_mat_path])
     if args.maxvar_mat_path:

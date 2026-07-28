@@ -77,9 +77,27 @@ class CollectorSet(object):
     ) -> Dict[str, Any]:
         all_res = {}
         for name, collector in self.collector_dict.items():
+            # DORL-MAC 使用可选 hook 隔离 FB/NX 分支的开环诊断计数；
+            # 其他 policy 不实现该 hook 时保持原有语义。
+            reset_diagnostics = getattr(
+                self.policy,
+                "reset_open_loop_diagnostics",
+                None,
+            )
+            if callable(reset_diagnostics):
+                reset_diagnostics()
             res = collector.collect(n_step, n_episode, random, render, no_grad, is_train=False)
             res_k = {name + "_" + k: v for k, v in res.items()} if name != "FB" else res
             all_res.update(res_k)
+            get_diagnostics = getattr(
+                self.policy,
+                "get_open_loop_diagnostics",
+                None,
+            )
+            if callable(get_diagnostics):
+                diagnostics = get_diagnostics()
+                for metric_name, metric_value in diagnostics.items():
+                    all_res[f"open_loop/{name}/{metric_name}"] = metric_value
         self.collect_step = self.collector_dict["FB"].collect_step
         self.collect_episode = self.collector_dict["FB"].collect_episode
         self.collect_time = self.collector_dict["FB"].collect_time

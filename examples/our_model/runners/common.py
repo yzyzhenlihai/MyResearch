@@ -38,8 +38,14 @@ from examples.our_model.policy import ActionMapper  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_DATASET_PATH = "data/KuaiRec/data_processed/DM_KuaiEnv-v0_small_data.pkl"
-"""默认 KuaiRec small 离线轨迹路径。"""
+SUPPORTED_KUAI_DATASET_PATHS = {
+    "KuaiEnv-v0": "data/KuaiRec/data_processed/DM_KuaiEnv-v0_small_data.pkl",
+    "KuaiRand-v0": "data/KuaiRand_Pure/data_processed/DM_KuaiRand-v0_test_data.pkl",
+}
+"""DORL-MAC 支持的快手环境及其默认离线轨迹路径。"""
+
+DEFAULT_DATASET_PATH = SUPPORTED_KUAI_DATASET_PATHS["KuaiEnv-v0"]
+"""向后兼容的 KuaiRec 默认离线轨迹路径。"""
 
 DEFAULT_SAVE_ROOT = "saved_models"
 """默认模型保存根目录。"""
@@ -163,6 +169,51 @@ def default_item_embedding_path(env: str, user_model_name: str, read_message: st
     )
 
 
+def default_user_embedding_path(env: str, user_model_name: str, read_message: str) -> str:
+    """构造默认 user embedding 路径。
+
+    Args:
+        env (str): 环境名。
+        user_model_name (str): user model 名称。
+        read_message (str): user model 训练标识。
+
+    Returns:
+        str: user embedding 路径。
+    """
+
+    return str(
+        PROJECT_ROOT
+        / "saved_models"
+        / env
+        / user_model_name
+        / "embeddings"
+        / f"[{read_message}]_emb_user_val_M0.pt"
+    )
+
+
+def default_dataset_path(env: str) -> str:
+    """返回指定快手环境的默认离线轨迹路径。
+
+    Args:
+        env (str): Gym 环境名。
+
+    Returns:
+        str: 对应环境的用户级轨迹文件路径。
+
+    Raises:
+        ValueError: 当环境尚未被 DORL-MAC 数据配置支持时抛出。
+    """
+
+    try:
+        return SUPPORTED_KUAI_DATASET_PATHS[env]
+    except KeyError as exc:
+        supported = ", ".join(sorted(SUPPORTED_KUAI_DATASET_PATHS))
+        raise ValueError(
+            f"DORL-MAC does not define a default dataset for {env!r}; "
+            f"supported environments: {supported}."
+        ) from exc
+
+
 def default_predicted_mat_path(env: str, user_model_name: str, read_message: str) -> str:
     """构造默认 predicted reward matrix 路径。
 
@@ -243,11 +294,52 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--env", type=str, default="KuaiEnv-v0")
     parser.add_argument("--user_model_name", type=str, default="DeepFM")
     parser.add_argument("--read_message", type=str, default="pointneg")
-    parser.add_argument("--dataset_path", type=str, default=DEFAULT_DATASET_PATH)
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="",
+        help="离线轨迹路径；为空时根据 --env 自动选择 KuaiRec 或 KuaiRand 数据。",
+    )
     parser.add_argument("--which_tracker", type=str, default="avg")
     parser.add_argument("--reward_handle", type=str, default="cat")
     parser.add_argument("--window_size", type=int, default=3)
     parser.add_argument("--chunk_size", type=int, default=3)
+    parser.add_argument(
+        "--execution-horizon",
+        "--execution_horizon",
+        dest="execution_horizon",
+        type=int,
+        default=None,
+        help=(
+            "评估时每次规划后连续执行的 chunk 前缀长度 H；"
+            "必须满足 1 <= H <= chunk_size。未设置时默认 H=chunk_size，"
+            "保持完整 chunk 开环执行语义。"
+        ),
+    )
+    parser.add_argument(
+        "--completion-window",
+        "--completion_window",
+        dest="completion_window",
+        type=int,
+        default=5,
+        help=(
+            "CCR@W 的固定环境步窗口 W，必须为正数且不超过 "
+            "max_turn；该参数与 chunk_size 和 execution_horizon 独立。"
+        ),
+    )
+    parser.add_argument(
+        "--enable_open_loop_diagnostics",
+        dest="enable_open_loop_diagnostics",
+        action="store_true",
+        help="启用 ADR shadow replan 诊断；会增加评估期 actor/critic 前向开销。",
+    )
+    parser.add_argument(
+        "--disable_open_loop_diagnostics",
+        dest="enable_open_loop_diagnostics",
+        action="store_false",
+        help="禁用 ADR shadow replan 诊断。",
+    )
+    parser.set_defaults(enable_open_loop_diagnostics=False)
     parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=2023)
     parser.add_argument("--device", type=str, default="cpu")
@@ -255,6 +347,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument("--random_init", action="store_true", default=False)
     parser.add_argument("--item_embedding_path", type=str, default="")
+    parser.add_argument("--user_embedding_path", type=str, default="")
     parser.add_argument("--predicted_mat_path", type=str, default="")
     parser.add_argument(
         "--predicted_mat_normalize",
@@ -302,7 +395,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--rollout_depth",
         type=int,
         default=1,
-        help="MAC 多步 imagined rollout 的 chunk 数 H；1 为单 chunk 一步 TD，>1 启用 value expansion。",
+        help=(
+            "MAC 训练期多步 imagined rollout 的 chunk 数 D；"
+            "1 为单 chunk 一步 TD，>1 启用 value expansion。"
+        ),
     )
     parser.add_argument(
         "--lambda_chunk",
@@ -316,106 +412,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default="penalty",
         help="训练 rollout 退出规则处理：penalty 违规只惩罚不截断；terminate 与 DORL 一致，触发退出即终止。",
     )
-    parser.add_argument(
-        "--nx0_reward_calibration",
-        choices=["none", "full_horizon_bonus", "progressive_horizon_bonus"],
-        default="none",
-        help="DORL-MAC 评估阶段 NX_0 reward 的后处理校准方式。",
-    )
-    parser.add_argument(
-        "--nx0_reward_bonus_per_step",
-        type=float,
-        default=0.0,
-        help="NX_0 reward 校准时每个等效去重 step 的额外 survival bonus。",
-    )
-    parser.add_argument(
-        "--nx0_length_warmup_epochs",
-        type=int,
-        default=12,
-        help="progressive_horizon_bonus 模式下 NX_0_len 插值到 force_length 的 warmup epoch 数。",
-    )
-    parser.add_argument(
-        "--nx0_feat_calibration",
-        choices=["none", "progressive_target"],
-        default="none",
-        help="DORL-MAC 评估阶段 NX_0_ifeat_feat 的后处理校准方式。",
-    )
-    parser.add_argument(
-        "--nx0_feat_target",
-        type=float,
-        default=0.45,
-        help="progressive_target 模式下 NX_0_ifeat_feat 的目标值。",
-    )
-    parser.add_argument(
-        "--nx0_feat_warmup_epochs",
-        type=int,
-        default=12,
-        help="progressive_target 模式下 NX_0_ifeat_feat 收敛到目标值的 warmup epoch 数。",
-    )
-    parser.add_argument(
-        "--nx0_feat_max_step_change",
-        type=float,
-        default=0.03,
-        help="progressive_target 模式下 NX_0_ifeat_feat 单个评估点允许的最大变化量。",
-    )
-    parser.add_argument(
-        "--metric_jitter_seed",
-        type=int,
-        default=-1,
-        help="展示型校准指标的可复现抖动种子；小于 0 时复用 seed。",
-    )
-    parser.add_argument(
-        "--metric_jitter_scale",
-        type=float,
-        default=0.035,
-        help="展示型校准指标在上升阶段的相对抖动幅度。",
-    )
-    parser.add_argument(
-        "--metric_plateau_jitter_scale",
-        type=float,
-        default=0.015,
-        help="展示型校准指标在平台阶段的相对抖动幅度。",
-    )
-    parser.add_argument(
-        "--train_metric_calibration",
-        choices=["none", "nx0_progressive"],
-        default="none",
-        help="DORL-MAC Q/V 训练日志指标的后处理校准方式。",
-    )
-    parser.add_argument(
-        "--train_metric_warmup_epochs",
-        type=int,
-        default=12,
-        help="训练日志指标从初始值平滑到目标值的 warmup epoch 数。",
-    )
-    parser.add_argument(
-        "--train_metric_target_nx0_rew",
-        type=float,
-        default=26.0,
-        help="训练日志指标校准时对齐的目标 NX_0_rew。",
-    )
-    parser.add_argument(
-        "--train_metric_loss_target",
-        type=float,
-        default=0.05,
-        help="critic/value loss 校准后的目标水平。",
-    )
-    parser.add_argument(
-        "--train_metric_entropy_target",
-        type=float,
-        default=1.7,
-        help="rollout/entropy 校准后的目标水平。",
-    )
-    parser.add_argument(
-        "--train_metric_uncertainty_target",
-        type=float,
-        default=0.00003,
-        help="rollout/uncertainty 校准后的目标水平。",
-    )
-
-
 def resolve_common_paths(args: argparse.Namespace) -> None:
-    """补齐默认 item embedding 和 predicted matrix 路径。
+    """按环境补齐离线数据和 user model 资产路径。
 
     Args:
         args (argparse.Namespace): 命令行参数，会被原地更新。
@@ -424,8 +422,16 @@ def resolve_common_paths(args: argparse.Namespace) -> None:
         None.
     """
 
+    if not args.dataset_path:
+        args.dataset_path = default_dataset_path(args.env)
     if not args.item_embedding_path:
         args.item_embedding_path = default_item_embedding_path(
+            args.env,
+            args.user_model_name,
+            args.read_message,
+        )
+    if not args.user_embedding_path:
+        args.user_embedding_path = default_user_embedding_path(
             args.env,
             args.user_model_name,
             args.read_message,
@@ -524,15 +530,25 @@ def build_reward_and_leave(
         Tuple[DORLRewardModel, RuleBasedLeaveModel]: reward 与 leave 模型。
     """
 
+    user_encoder = getattr(env, "lbe_user", None)
+    if user_encoder is None:
+        raw_user_ids = range(int(env.mat.shape[0]))
+    else:
+        raw_user_ids = user_encoder.classes_
     raw_user_to_index = {
         int(raw_user_id): int(index)
-        for index, raw_user_id in enumerate(env.lbe_user.classes_)
+        for index, raw_user_id in enumerate(raw_user_ids)
     }
     entropy_map, map_item_feat, entropy_min = build_entropy_reward_assets(args, dataset)
-    if hasattr(env, "lbe_item") and env.lbe_item is not None:
-        internal_to_raw_item_ids = [int(item_id) for item_id in env.lbe_item.classes_]
+    item_encoder = getattr(env, "lbe_item", None)
+    if item_encoder is not None:
+        internal_to_raw_item_ids = [int(item_id) for item_id in item_encoder.classes_]
     else:
         internal_to_raw_item_ids = list(range(env.mat.shape[1]))
+    if len(raw_user_to_index) != int(env.mat.shape[0]):
+        raise ValueError("User id mapping size must match environment user dimension.")
+    if len(internal_to_raw_item_ids) != int(env.mat.shape[1]):
+        raise ValueError("Item id mapping size must match environment item dimension.")
     reward_model = DORLRewardModel(
         predicted_mat_path=args.predicted_mat_path,
         maxvar_mat_path=args.maxvar_mat_path,
@@ -553,8 +569,15 @@ def build_reward_and_leave(
         lambda_variance=args.lambda_variance,
         predicted_mat_normalize=getattr(args, "predicted_mat_normalize", "none"),
     )
+    item_categories = getattr(env, "list_feat_small", None)
+    if item_categories is None:
+        item_categories = getattr(env, "list_feat", None)
+    if item_categories is None or len(item_categories) != int(env.mat.shape[1]):
+        raise ValueError(
+            "Environment item categories must align with its internal item dimension."
+        )
     leave_model = RuleBasedLeaveModel(
-        list_feat_small=env.list_feat_small,
+        list_feat_small=item_categories,
         num_leave_compute=args.num_leave_compute,
         leave_threshold=args.leave_threshold,
         max_turn=args.max_turn,
@@ -711,7 +734,9 @@ def default_run_name(prefix: str, args: argparse.Namespace) -> str:
 
     if args.run_name:
         return args.run_name
-    return f"{prefix}-{args.env}-K{args.chunk_size}-seed{args.seed}"
+    execution_horizon = getattr(args, "execution_horizon", None)
+    horizon_suffix = "" if execution_horizon is None else f"-H{execution_horizon}"
+    return f"{prefix}-{args.env}-K{args.chunk_size}{horizon_suffix}-seed{args.seed}"
 
 
 def set_mpl_cache_to_tmp() -> None:

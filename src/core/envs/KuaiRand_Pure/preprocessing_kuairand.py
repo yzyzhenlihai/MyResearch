@@ -36,7 +36,13 @@ def get_normalized_data():
         df_train['duration_normed'] = (df_train['duration_ms'] - duration_min) / (duration_max - duration_min)
         df_val['duration_normed'] = (df_val['duration_ms'] - duration_min) / (duration_max - duration_min)
     else:
-        df_duration = df_train[["video_id",'duration_ms']].append(df_val[["video_id",'duration_ms']])
+        df_duration = pd.concat(
+            [
+                df_train[["video_id", "duration_ms"]],
+                df_val[["video_id", "duration_ms"]],
+            ],
+            ignore_index=True,
+        )
         df_item_duration = df_duration.groupby("video_id").agg(np.mean)
         res = df_item_duration.describe()
         duration_mean = res.loc["mean"][0]
@@ -45,7 +51,7 @@ def get_normalized_data():
         df_val['duration_normed'] = (df_val['duration_ms'] - duration_mean) / duration_std
 
 
-    df = df_train.append(df_val)
+    df = pd.concat([df_train, df_val], ignore_index=True)
 
     df['watch_ratio'] = df["play_time_ms"] / df["duration_ms"]
     df.loc[np.isinf(df['watch_ratio']), 'watch_ratio'] = 1
@@ -58,8 +64,8 @@ def get_normalized_data():
 
 
     if args.method == "maxmin":
-        max_y = df[["video_id", "watch_ratio"]].groupby("video_id").agg(max)["watch_ratio"]
-        min_y = df[["video_id", "watch_ratio"]].groupby("video_id").agg(min)["watch_ratio"]
+        max_y = df[["video_id", "watch_ratio"]].groupby("video_id").agg("max")["watch_ratio"]
+        min_y = df[["video_id", "watch_ratio"]].groupby("video_id").agg("min")["watch_ratio"]
         df_train["watch_ratio_normed"] = (df_train["watch_ratio"].to_numpy() - min_y.loc[df_train["video_id"]].to_numpy()) / \
                                        (max_y.loc[df_train["video_id"]].to_numpy() - min_y.loc[df_train["video_id"]].to_numpy())
         df_val["watch_ratio_normed"] = (df_val["watch_ratio"].to_numpy() - min_y.loc[df_val["video_id"]].to_numpy()) / \

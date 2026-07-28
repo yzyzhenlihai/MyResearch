@@ -12,30 +12,59 @@ PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/pytho
 DRY_RUN="${DRY_RUN:-0}"
 RESET_METRICS="${RESET_METRICS:-1}"
 
-ENV_NAME="${ENV_NAME:-KuaiEnv-v0}"
+ENV_NAME="${ENV_NAME:-KuaiEnv-v0}" # KuaiRand-v0  KuaiEnv-v0
 USER_MODEL_NAME="${USER_MODEL_NAME:-DeepFM}"
 READ_MESSAGE="${READ_MESSAGE:-pointneg}"
-DATASET_PATH="${DATASET_PATH:-data/KuaiRec/data_processed/DM_KuaiEnv-v0_small_data.pkl}"
+
+case "${ENV_NAME}" in
+  KuaiEnv-v0)
+    DEFAULT_DATASET_PATH="data/KuaiRec/data_processed/DM_KuaiEnv-v0_small_data.pkl"
+    DEFAULT_MAX_TURN=30
+    DEFAULT_NUM_LEAVE_COMPUTE=4
+    DEFAULT_LEAVE_THRESHOLD=0
+    DEFAULT_RUN_NAME="dorl-mac-kuai-catbc-qv"
+    ;;
+  KuaiRand-v0)
+    DEFAULT_DATASET_PATH="data/KuaiRand_Pure/data_processed/DM_KuaiRand-v0_test_data.pkl"
+    DEFAULT_MAX_TURN=30
+    DEFAULT_NUM_LEAVE_COMPUTE=4
+    DEFAULT_LEAVE_THRESHOLD=0
+    DEFAULT_RUN_NAME="dorl-mac-kuairand-catbc-qv"
+    ;;
+  *)
+    printf '[run_dorl_mac_kuai_train] ERROR: unsupported ENV_NAME=%s; choose KuaiEnv-v0 or KuaiRand-v0.\n' \
+      "${ENV_NAME}" >&2
+    exit 2
+    ;;
+esac
+
+DATASET_PATH="${DATASET_PATH:-${DEFAULT_DATASET_PATH}}"
 WHICH_TRACKER="${WHICH_TRACKER:-avg}"
 REWARD_HANDLE="${REWARD_HANDLE:-cat}"
 WINDOW_SIZE="${WINDOW_SIZE:-3}"
-CHUNK_SIZE="${CHUNK_SIZE:-1}"
+CHUNK_SIZE="${CHUNK_SIZE:-3}"
+# H 仅控制评估时每次规划后连续执行的前缀长度；默认 H=K 保持原开环语义。
+EXECUTION_HORIZON="${EXECUTION_HORIZON:-${CHUNK_SIZE}}"
+COMPLETION_WINDOW="${COMPLETION_WINDOW:-${CHUNK_SIZE}}"
+ENABLE_OPEN_LOOP_DIAGNOSTICS="${ENABLE_OPEN_LOOP_DIAGNOSTICS:-0}"
 GAMMA="${GAMMA:-0.9}"
 SEED="${SEED:-2023}"
-DEVICE="${DEVICE:-cuda:7}"
-CUDA="${CUDA:-7}"
+DEVICE="${DEVICE:-cuda:5}"
+CUDA="${CUDA:-5}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
-MAX_TURN="${MAX_TURN:-100}"
+MAX_TURN="${MAX_TURN:-${DEFAULT_MAX_TURN}}"
 FORCE_LENGTH="${FORCE_LENGTH:-${MAX_TURN}}"
-NUM_LEAVE_COMPUTE="${NUM_LEAVE_COMPUTE:-1}"
-LEAVE_THRESHOLD="${LEAVE_THRESHOLD:-0}"
+NUM_LEAVE_COMPUTE="${NUM_LEAVE_COMPUTE:-${DEFAULT_NUM_LEAVE_COMPUTE}}"
+LEAVE_THRESHOLD="${LEAVE_THRESHOLD:-${DEFAULT_LEAVE_THRESHOLD}}"
 INVALID_ACTION_PENALTY="${INVALID_ACTION_PENALTY:-0.0}"
 # 默认为空表示使用全量离线轨迹和全量 action chunks。
 MAX_TRAJECTORIES="${MAX_TRAJECTORIES:-}"
 MAX_CHUNKS="${MAX_CHUNKS:-}"
-ITEM_EMBEDDING_PATH="${ITEM_EMBEDDING_PATH:-}"
-PREDICTED_MAT_PATH="${PREDICTED_MAT_PATH:-}"
-MAXVAR_MAT_PATH="${MAXVAR_MAT_PATH:-}"
+USER_MODEL_ROOT="saved_models/${ENV_NAME}/${USER_MODEL_NAME}"
+ITEM_EMBEDDING_PATH="${ITEM_EMBEDDING_PATH:-${USER_MODEL_ROOT}/embeddings/[${READ_MESSAGE}]_emb_item_val_M0.pt}"
+USER_EMBEDDING_PATH="${USER_EMBEDDING_PATH:-${USER_MODEL_ROOT}/embeddings/[${READ_MESSAGE}]_emb_user_val_M0.pt}"
+PREDICTED_MAT_PATH="${PREDICTED_MAT_PATH:-${USER_MODEL_ROOT}/matsPre/[${READ_MESSAGE}]_matPre.pickle}"
+MAXVAR_MAT_PATH="${MAXVAR_MAT_PATH:-${USER_MODEL_ROOT}/matsVar/[${READ_MESSAGE}]_matVar.pickle}"
 
 USE_ENTROPY_REWARD="${USE_ENTROPY_REWARD:-1}"
 USE_UNCERTAINTY_PENALTY="${USE_UNCERTAINTY_PENALTY:-1}"
@@ -52,23 +81,6 @@ ENTROPY_WINDOW="${ENTROPY_WINDOW:-1 2}"
 FEATURE_LEVEL="${FEATURE_LEVEL:-1}"
 IS_SORTED="${IS_SORTED:-1}"
 DYNAMICS_LOSS_WEIGHT="${DYNAMICS_LOSS_WEIGHT:-1.0}"
-NX0_REWARD_CALIBRATION="${NX0_REWARD_CALIBRATION:-progressive_horizon_bonus}"
-NX0_REWARD_BONUS_PER_STEP="${NX0_REWARD_BONUS_PER_STEP:-0.1}"
-NX0_LENGTH_WARMUP_EPOCHS="${NX0_LENGTH_WARMUP_EPOCHS:-12}"
-NX0_FEAT_CALIBRATION="${NX0_FEAT_CALIBRATION:-progressive_target}"
-NX0_FEAT_TARGET="${NX0_FEAT_TARGET:-0.45}"
-NX0_FEAT_WARMUP_EPOCHS="${NX0_FEAT_WARMUP_EPOCHS:-12}"
-NX0_FEAT_MAX_STEP_CHANGE="${NX0_FEAT_MAX_STEP_CHANGE:-0.03}"
-METRIC_JITTER_SEED="${METRIC_JITTER_SEED:--1}"
-METRIC_JITTER_SCALE="${METRIC_JITTER_SCALE:-0.035}"
-METRIC_PLATEAU_JITTER_SCALE="${METRIC_PLATEAU_JITTER_SCALE:-0.015}"
-TRAIN_METRIC_CALIBRATION="${TRAIN_METRIC_CALIBRATION:-nx0_progressive}"
-TRAIN_METRIC_WARMUP_EPOCHS="${TRAIN_METRIC_WARMUP_EPOCHS:-${NX0_LENGTH_WARMUP_EPOCHS}}"
-TRAIN_METRIC_TARGET_NX0_REW="${TRAIN_METRIC_TARGET_NX0_REW:-26.0}"
-TRAIN_METRIC_LOSS_TARGET="${TRAIN_METRIC_LOSS_TARGET:-0.05}"
-TRAIN_METRIC_ENTROPY_TARGET="${TRAIN_METRIC_ENTROPY_TARGET:-1.7}"
-TRAIN_METRIC_UNCERTAINTY_TARGET="${TRAIN_METRIC_UNCERTAINTY_TARGET:-0.00003}"
-
 # 阶段 ①：Categorical BC 预训练
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-100000}"
 ACTOR_LR="${ACTOR_LR:-0.0003}"
@@ -91,7 +103,7 @@ REPEAT_POLICY="${REPEAT_POLICY:-mask}" # mask,采样阶段屏蔽已推荐 item
 ROLLOUT_DEPTH="${ROLLOUT_DEPTH:-3}"
 LAMBDA_CHUNK="${LAMBDA_CHUNK:-1.0}"
 LEAVE_POLICY="${LEAVE_POLICY:-terminate}"
-TEST_NUM="${TEST_NUM:-100}"
+TEST_NUM="${TEST_NUM:-10}"
 EVAL_EPISODES="${EVAL_EPISODES:-0}"
 EVAL_EVERY_N_EPOCHS="${EVAL_EVERY_N_EPOCHS:-1}"
 BUFFER_SIZE="${BUFFER_SIZE:-0}"
@@ -104,7 +116,7 @@ SWANLAB_PROJECT="${SWANLAB_PROJECT:-DORL-MAC}"
 BC_SWANLAB_PROJECT="${BC_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-CategoricalBC}"
 QV_SWANLAB_PROJECT="${QV_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-QV}"
 EVAL_SWANLAB_PROJECT="${EVAL_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-Eval}"
-RUN_NAME="${RUN_NAME:-dorl-mac-kuai-catbc-qv}"
+RUN_NAME="${RUN_NAME:-${DEFAULT_RUN_NAME}}"
 # 默认在 run_name / run_dir 里拼上 K=${CHUNK_SIZE}，让不同 K 的实验自动落到不同目录：
 #   - 相同 K 再次运行：BC 目录已有 latest.pt → 自动短路复用；
 #   - 不同 K 运行：BC / QV / eval 全部落到新目录，自动触发 BC 重训。
@@ -112,11 +124,11 @@ RUN_NAME="${RUN_NAME:-dorl-mac-kuai-catbc-qv}"
 RUN_NAME_WITH_K="${RUN_NAME}-K${CHUNK_SIZE}"
 BC_RUN_NAME="${BC_RUN_NAME:-${RUN_NAME_WITH_K}-bc}"
 QV_RUN_NAME="${QV_RUN_NAME:-${RUN_NAME_WITH_K}-qv}"
-EVAL_RUN_NAME="${EVAL_RUN_NAME:-${RUN_NAME_WITH_K}-eval}"
+EVAL_RUN_NAME="${EVAL_RUN_NAME:-${RUN_NAME_WITH_K}-H${EXECUTION_HORIZON}-eval}"
 RUN_DIR="${RUN_DIR:-saved_models/${ENV_NAME}/DORL_MAC/${RUN_NAME_WITH_K}}"
 BC_SAVE_DIR="${BC_SAVE_DIR:-${RUN_DIR}/categorical_bc}"
 MAC_SAVE_DIR="${MAC_SAVE_DIR:-${RUN_DIR}/mac_agent}"
-EVAL_SAVE_DIR="${EVAL_SAVE_DIR:-${RUN_DIR}/eval}"
+EVAL_SAVE_DIR="${EVAL_SAVE_DIR:-${RUN_DIR}/eval_H${EXECUTION_HORIZON}}"
 BC_ACTOR_CKPT="${BC_ACTOR_CKPT:-}"
 
 read -r -a ENTROPY_WINDOW_ARGS <<< "${ENTROPY_WINDOW}"
@@ -130,6 +142,8 @@ COMMON_ARGS=(
   --reward_handle "${REWARD_HANDLE}"
   --window_size "${WINDOW_SIZE}"
   --chunk_size "${CHUNK_SIZE}"
+  --execution_horizon "${EXECUTION_HORIZON}"
+  --completion_window "${COMPLETION_WINDOW}"
   --gamma "${GAMMA}"
   --seed "${SEED}"
   --device "${DEVICE}"
@@ -145,22 +159,6 @@ COMMON_ARGS=(
   --lambda_variance "${LAMBDA_VARIANCE}"
   --entropy_window "${ENTROPY_WINDOW_ARGS[@]}"
   --dynamics_loss_weight "${DYNAMICS_LOSS_WEIGHT}"
-  --nx0_reward_calibration "${NX0_REWARD_CALIBRATION}"
-  --nx0_reward_bonus_per_step "${NX0_REWARD_BONUS_PER_STEP}"
-  --nx0_length_warmup_epochs "${NX0_LENGTH_WARMUP_EPOCHS}"
-  --nx0_feat_calibration "${NX0_FEAT_CALIBRATION}"
-  --nx0_feat_target "${NX0_FEAT_TARGET}"
-  --nx0_feat_warmup_epochs "${NX0_FEAT_WARMUP_EPOCHS}"
-  --nx0_feat_max_step_change "${NX0_FEAT_MAX_STEP_CHANGE}"
-  --metric_jitter_seed "${METRIC_JITTER_SEED}"
-  --metric_jitter_scale "${METRIC_JITTER_SCALE}"
-  --metric_plateau_jitter_scale "${METRIC_PLATEAU_JITTER_SCALE}"
-  --train_metric_calibration "${TRAIN_METRIC_CALIBRATION}"
-  --train_metric_warmup_epochs "${TRAIN_METRIC_WARMUP_EPOCHS}"
-  --train_metric_target_nx0_rew "${TRAIN_METRIC_TARGET_NX0_REW}"
-  --train_metric_loss_target "${TRAIN_METRIC_LOSS_TARGET}"
-  --train_metric_entropy_target "${TRAIN_METRIC_ENTROPY_TARGET}"
-  --train_metric_uncertainty_target "${TRAIN_METRIC_UNCERTAINTY_TARGET}"
 )
 
 if [[ -n "${MAX_TRAJECTORIES}" ]]; then
@@ -169,15 +167,10 @@ fi
 if [[ -n "${MAX_CHUNKS}" ]]; then
   COMMON_ARGS+=(--max_chunks "${MAX_CHUNKS}")
 fi
-if [[ -n "${ITEM_EMBEDDING_PATH}" ]]; then
-  COMMON_ARGS+=(--item_embedding_path "${ITEM_EMBEDDING_PATH}")
-fi
-if [[ -n "${PREDICTED_MAT_PATH}" ]]; then
-  COMMON_ARGS+=(--predicted_mat_path "${PREDICTED_MAT_PATH}")
-fi
-if [[ -n "${MAXVAR_MAT_PATH}" ]]; then
-  COMMON_ARGS+=(--maxvar_mat_path "${MAXVAR_MAT_PATH}")
-fi
+COMMON_ARGS+=(--item_embedding_path "${ITEM_EMBEDDING_PATH}")
+COMMON_ARGS+=(--user_embedding_path "${USER_EMBEDDING_PATH}")
+COMMON_ARGS+=(--predicted_mat_path "${PREDICTED_MAT_PATH}")
+COMMON_ARGS+=(--maxvar_mat_path "${MAXVAR_MAT_PATH}")
 if [[ "${USE_ENTROPY_REWARD}" == "1" || "${USE_ENTROPY_REWARD}" == "true" || "${USE_ENTROPY_REWARD}" == "True" ]]; then
   COMMON_ARGS+=(--use_entropy_reward)
 else
@@ -197,6 +190,11 @@ if [[ "${IS_SORTED}" == "1" || "${IS_SORTED}" == "true" || "${IS_SORTED}" == "Tr
   COMMON_ARGS+=(--is_sorted)
 else
   COMMON_ARGS+=(--no_sorted)
+fi
+if [[ "${ENABLE_OPEN_LOOP_DIAGNOSTICS}" == "1" || "${ENABLE_OPEN_LOOP_DIAGNOSTICS}" == "true" || "${ENABLE_OPEN_LOOP_DIAGNOSTICS}" == "True" ]]; then
+  COMMON_ARGS+=(--enable_open_loop_diagnostics)
+else
+  COMMON_ARGS+=(--disable_open_loop_diagnostics)
 fi
 
 run_command() {
@@ -254,7 +252,14 @@ find_existing_bc_ckpt() {
   return 0
 }
 
-printf '[run_dorl_mac_kuai_train] run_dir=%s (chunk_size=K=%s)\n' "${RUN_DIR}" "${CHUNK_SIZE}"
+printf '[run_dorl_mac_kuai_train] run_dir=%s (chunk_size=K=%s, execution_horizon=H=%s)\n' \
+  "${RUN_DIR}" "${CHUNK_SIZE}" "${EXECUTION_HORIZON}"
+printf '[run_dorl_mac_kuai_train] dataset: env=%s, trajectories=%s\n' \
+  "${ENV_NAME}" "${DATASET_PATH}"
+printf '[run_dorl_mac_kuai_train] user model assets: item=%s, user=%s, prediction=%s, variance=%s\n' \
+  "${ITEM_EMBEDDING_PATH}" "${USER_EMBEDDING_PATH}" "${PREDICTED_MAT_PATH}" "${MAXVAR_MAT_PATH}"
+printf '[run_dorl_mac_kuai_train] open-loop diagnostics: CCR_window=%s, ADR=%s\n' \
+  "${COMPLETION_WINDOW}" "${ENABLE_OPEN_LOOP_DIAGNOSTICS}"
 printf '[run_dorl_mac_kuai_train] pretrain (categorical BC): steps=%s, actor_lr=%s\n' \
   "${PRETRAIN_STEPS}" "${ACTOR_LR}"
 printf '[run_dorl_mac_kuai_train] qv: epoch=%s, step_per_epoch=%s, test_num=%s, rollout_depth=%s, lambda_chunk=%s, leave_policy=%s, repeat_policy=%s\n' \
@@ -264,14 +269,6 @@ printf '[run_dorl_mac_kuai_train] reward: entropy=%s(lambda=%s, window=%s), unce
   "${USE_ENTROPY_REWARD}" "${LAMBDA_ENTROPY}" "${ENTROPY_WINDOW}" \
   "${USE_UNCERTAINTY_PENALTY}" "${LAMBDA_VARIANCE}" "${INVALID_ACTION_PENALTY}" \
   "${PREDICTED_MAT_NORMALIZE}"
-printf '[run_dorl_mac_kuai_train] nx0 calibration: mode=%s, bonus_per_step=%s, warmup_epochs=%s\n' \
-  "${NX0_REWARD_CALIBRATION}" "${NX0_REWARD_BONUS_PER_STEP}" "${NX0_LENGTH_WARMUP_EPOCHS}"
-printf '[run_dorl_mac_kuai_train] nx0 feat calibration: mode=%s, target=%s, warmup_epochs=%s, max_step_change=%s\n' \
-  "${NX0_FEAT_CALIBRATION}" "${NX0_FEAT_TARGET}" "${NX0_FEAT_WARMUP_EPOCHS}" "${NX0_FEAT_MAX_STEP_CHANGE}"
-printf '[run_dorl_mac_kuai_train] display metric jitter: seed=%s, rise_scale=%s, plateau_scale=%s\n' \
-  "${METRIC_JITTER_SEED}" "${METRIC_JITTER_SCALE}" "${METRIC_PLATEAU_JITTER_SCALE}"
-printf '[run_dorl_mac_kuai_train] train metric calibration: mode=%s, warmup_epochs=%s, target_nx0_rew=%s\n' \
-  "${TRAIN_METRIC_CALIBRATION}" "${TRAIN_METRIC_WARMUP_EPOCHS}" "${TRAIN_METRIC_TARGET_NX0_REW}"
 printf '[run_dorl_mac_kuai_train] swanlab projects: bc=%s, qv=%s, eval=%s\n' \
   "${BC_SWANLAB_PROJECT}" "${QV_SWANLAB_PROJECT}" "${EVAL_SWANLAB_PROJECT}"
 
@@ -325,7 +322,7 @@ run_command \
   --eval_every_n_epochs "${EVAL_EVERY_N_EPOCHS}" \
   --buffer-size "${BUFFER_SIZE}" \
   --save_dir "${MAC_SAVE_DIR}" \
-  --eval_save_dir "${MAC_SAVE_DIR}/eval_during_train" \
+  --eval_save_dir "${MAC_SAVE_DIR}/eval_during_train_H${EXECUTION_HORIZON}" \
   --log_interval "${QV_LOG_INTERVAL}" \
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
   $( [ "${ENABLE_STEP_PROFILER}" = "1" ] && echo "--enable_step_profiler" )
