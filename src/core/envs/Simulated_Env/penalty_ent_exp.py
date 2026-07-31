@@ -25,7 +25,9 @@ class PenaltyEntExpSimulatedEnv(BaseSimulatedEnv):
                  entropy_max=0,
                  feature_level=False,
                  map_item_feat=None,
-                 is_sorted=True
+                 is_sorted=True,
+                 maxvar_mat=None,
+                 lambda_variance=0.0,
                  ):
         super().__init__(ensemble_models, env_task_class, task_env_param, task_name, predicted_mat)
         self.feature_level = feature_level
@@ -42,7 +44,20 @@ class PenaltyEntExpSimulatedEnv(BaseSimulatedEnv):
         self.step_n_actions = step_n_actions
         self.lambda_entropy = lambda_entropy
 
-        self.MIN_R = predicted_mat.min() + lambda_entropy * entropy_min
+        # DORL 静态方差惩罚项 (来自 DeepFM ensemble 的最大方差矩阵).
+        # 默认 None 时回退到无 variance 惩罚，保持对旧调用的兼容。
+        self.maxvar_mat = maxvar_mat
+        self.lambda_variance = float(lambda_variance)
+        if self.maxvar_mat is not None:
+            assert self.maxvar_mat.shape == predicted_mat.shape, (
+                "maxvar_mat.shape must match predicted_mat.shape, "
+                f"got {self.maxvar_mat.shape} vs {predicted_mat.shape}."
+            )
+            variance_term_max = self.lambda_variance * float(self.maxvar_mat.max())
+        else:
+            variance_term_max = 0.0
+
+        self.MIN_R = predicted_mat.min() + lambda_entropy * entropy_min - variance_term_max
         self.MAX_R = predicted_mat.max() + lambda_entropy * entropy_max
 
         self._reset_history_exposure()
@@ -93,7 +108,13 @@ class PenaltyEntExpSimulatedEnv(BaseSimulatedEnv):
             # if len(action_trans) < self.step_n_actions:
             #     entropy += self.step_n_actions - len(action_trans)  # todo 补足差额
 
-        penalized_reward = pred_reward + self.lambda_entropy * entropy - self.MIN_R
+        # DORL 静态不确定性惩罚: r̂ - λ_U * P_U(u,i)  (P_U 取 ensemble 方差)
+        if self.maxvar_mat is not None:
+            variance_penalty = self.lambda_variance * float(self.maxvar_mat[self.cur_user, action])
+        else:
+            variance_penalty = 0.0
+
+        penalized_reward = pred_reward + self.lambda_entropy * entropy - variance_penalty - self.MIN_R
 
         ##############################
 

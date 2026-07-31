@@ -57,6 +57,49 @@ OFFPOLICY_COLLECT_MODES = (
 )
 """离策略训练允许的 collect 模式集合。"""
 
+BEST_METRIC_FB = "FB"
+"""按自由终止环境的平均累计奖励选优。"""
+
+BEST_METRIC_NX_0 = "NX_0"
+"""按论文主表使用的 NX_0 平均累计奖励选优。"""
+
+BEST_METRIC_NX_FORCE = "NX_force"
+"""按固定长度 NX 环境的平均累计奖励选优。"""
+
+BEST_METRIC_CHOICES = (
+    BEST_METRIC_FB,
+    BEST_METRIC_NX_0,
+    BEST_METRIC_NX_FORCE,
+)
+"""命令行允许的模型选优口径。"""
+
+
+def resolve_best_metric_key(args):
+    """把用户可读的评估口径解析成 trainer 结果字典键。
+
+    Args:
+        args (argparse.Namespace): 包含 ``best_metric``，并在选择
+            ``NX_force`` 时包含 ``force_length`` 的训练参数。
+
+    Returns:
+        str: ``test_episode`` 结果中对应的奖励均值键。
+
+    Raises:
+        ValueError: 当 ``best_metric`` 不在支持集合中时抛出。
+    """
+
+    best_metric = getattr(args, "best_metric", BEST_METRIC_FB)
+    if best_metric == BEST_METRIC_FB:
+        return "rew"
+    if best_metric == BEST_METRIC_NX_0:
+        return "NX_0_rew"
+    if best_metric == BEST_METRIC_NX_FORCE:
+        return f"NX_{int(args.force_length)}_rew"
+    raise ValueError(
+        f"Unsupported best_metric={best_metric!r}; "
+        f"expected one of {BEST_METRIC_CHOICES}."
+    )
+
 
 def _get_active_wandb_run():
     """返回当前激活的 wandb run；未初始化时返回空。"""
@@ -182,6 +225,25 @@ def get_args_all(trainer="onpolicy"):
     parser.add_argument('--is_save', dest='is_save', action='store_true')
     parser.add_argument('--no_save', dest='is_save', action='store_false')
     parser.set_defaults(is_save=False)
+    parser.add_argument(
+        '--save-best-only',
+        dest='save_best_only',
+        action='store_true',
+        help='Save only the checkpoint selected by --best-metric.',
+    )
+    parser.add_argument(
+        '--save-every-epoch',
+        dest='save_best_only',
+        action='store_false',
+        help='Save a separate checkpoint after every evaluation epoch.',
+    )
+    parser.set_defaults(save_best_only=False)
+    parser.add_argument(
+        '--best-metric',
+        choices=BEST_METRIC_CHOICES,
+        default=BEST_METRIC_FB,
+        help='Evaluation protocol used to select and report the best epoch.',
+    )
 
     parser.add_argument('--is_use_userEmbedding', dest='use_userEmbedding', action='store_true')
     parser.add_argument('--no_use_userEmbedding', dest='use_userEmbedding', action='store_false')
@@ -558,7 +620,10 @@ def learn_policy(args, env, dataset, policy, train_collector, test_collector_set
 
     metrics = ['len_tra', 'R_tra', 'ctr', 'CV', 'CV_turn', 'ifeat_', 'Diversity', 'Novelty']
 
-    policy.callbacks = [
+    # 保留算法入口预注册的训练回调，例如 DARLR selector 的 epoch
+    # 诊断聚合器；评估回调继续复用原有顺序与日志链路。
+    training_callbacks = list(getattr(policy, "training_callbacks", []))
+    policy.callbacks = training_callbacks + [
         Evaluator_Feat(test_collector_set, df_item_val, args.need_transform, item_feat_domination,
                        lbe_item=env.lbe_item if args.need_transform else None, top_rate=args.top_rate,
                        draw_bar=args.draw_bar),
@@ -567,6 +632,37 @@ def learn_policy(args, env, dataset, policy, train_collector, test_collector_set
                                   args.need_transform, lbe_item=env.lbe_item if args.need_transform else None),
         LoggerEval_Policy(args.force_length, metrics)]
     model_save_path = os.path.join(MODEL_SAVE_PATH, "{}_{}.pt".format(args.model_name, args.message))
+    best_metric_key = resolve_best_metric_key(args)
+    logger.info(
+        "Select best epoch by evaluation metric: %s (%s)",
+        args.best_metric,
+        best_metric_key,
+    )
+    save_model_kwargs = {
+        "model_save_path": model_save_path,
+        "state_tracker": state_tracker,
+        "optim": optim,
+        "is_save": args.is_save,
+    }
+    epoch_save_model_fn = None
+    save_best_model_fn = None
+    save_best_only = bool(getattr(args, "save_best_only", False))
+    if save_best_only:
+        save_best_model_fn = functools.partial(
+            save_model_fn,
+            "best",
+            **save_model_kwargs,
+        )
+    else:
+        epoch_save_model_fn = functools.partial(
+            save_model_fn,
+            **save_model_kwargs,
+        )
+    logger.info(
+        "Checkpoint policy: enabled=%s, best_only=%s",
+        args.is_save,
+        save_best_only,
+    )
 
     if trainer == "offline":
         buffer = train_collector
@@ -581,14 +677,11 @@ def learn_policy(args, env, dataset, policy, train_collector, test_collector_set
             args.step_per_epoch,
             args.test_num,
             args.batch_size,
-            # save_best_fn=save_best_fn,
+            best_metric_key=best_metric_key,
+            save_best_fn=save_best_model_fn,
             # stop_fn=stop_fn,
             # logger=logger1,
-            save_model_fn=functools.partial(save_model_fn,
-                                            model_save_path=model_save_path,
-                                            state_tracker=state_tracker,
-                                            optim=optim,
-                                            is_save=args.is_save)
+            save_model_fn=epoch_save_model_fn,
         )
 
     elif trainer == "onpolicy":
@@ -602,14 +695,11 @@ def learn_policy(args, env, dataset, policy, train_collector, test_collector_set
             args.test_num,
             args.batch_size,
             episode_per_collect=args.episode_per_collect,
+            best_metric_key=best_metric_key,
             # stop_fn=stop_fn,
-            # save_best_fn=save_best_fn,
+            save_best_fn=save_best_model_fn,
             # logger=logger1,
-            save_model_fn=functools.partial(save_model_fn,
-                                            model_save_path=model_save_path,
-                                            state_tracker=state_tracker,
-                                            optim=optim,
-                                            is_save=args.is_save)
+            save_model_fn=epoch_save_model_fn,
         )
 
     elif trainer == "offpolicy":
@@ -631,14 +721,11 @@ def learn_policy(args, env, dataset, policy, train_collector, test_collector_set
             args.batch_size,
             update_per_step=args.update_per_step,
             episode_per_collect=collect_kwargs["episode_per_collect"],
+            best_metric_key=best_metric_key,
             # stop_fn=stop_fn,	
-            # save_best_fn=save_best_fn,	
+            save_best_fn=save_best_model_fn,
             # logger=logger1,	
-            save_model_fn=functools.partial(save_model_fn,
-                                            model_save_path=model_save_path,
-                                            state_tracker=state_tracker,
-                                            optim=optim,
-                                            is_save=args.is_save)
+            save_model_fn=epoch_save_model_fn,
         )
 
     else:

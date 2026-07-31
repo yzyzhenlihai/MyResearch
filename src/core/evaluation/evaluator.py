@@ -229,10 +229,30 @@ def save_model_fn(epoch, policy, model_save_path, optim, state_tracker, is_save=
     if not is_save:
         return
     model_save_path = model_save_path[:-3] + "-e{}".format(epoch) + model_save_path[-3:]
-    # torch.save(model.state_dict(), model_save_path)
-    torch.save({
+
+    payload = {
         'policy': policy.state_dict(),
-        'optim_RL': optim[0].state_dict(),
-        'optim_state': optim[1].state_dict(),
         'state_tracker': state_tracker.state_dict(),
-    }, model_save_path)
+    }
+    # 兼容原本 [optim_RL, optim_state] 的两元素形式, 也支持后续可能扩展的多 optim.
+    if isinstance(optim, (list, tuple)):
+        if len(optim) >= 1:
+            payload['optim_RL'] = optim[0].state_dict()
+        if len(optim) >= 2:
+            payload['optim_state'] = optim[-1].state_dict()
+        for idx, single_optim in enumerate(optim):
+            payload[f'optim_{idx}'] = single_optim.state_dict()
+    else:
+        payload['optim_RL'] = optim.state_dict()
+
+    # DARLR 额外状态: dynamic reward store + selector optimizer state.
+    underlying_policy = getattr(policy, 'policy', policy)
+    extra_state_fn = getattr(underlying_policy, 'darlr_extra_state', None)
+    if callable(extra_state_fn):
+        try:
+            payload['darlr_extra'] = extra_state_fn()
+        except Exception as err:  # pragma: no cover - defensive
+            import warnings as _warnings
+            _warnings.warn(f"Failed to serialize DARLR extra state: {err}")
+
+    torch.save(payload, model_save_path)

@@ -239,6 +239,28 @@ class Collector(object):
         # self.data.obs_next[local_ids] = obs_reset
         # self.data[local_ids] = batched_data
 
+    def _refinalize_darlr_context_with_final_actions(self, final_actions) -> None:
+        """在最终动作确定后, 让 DARLR 策略重算 selector context 里依赖 action 的量.
+
+        DARLR 策略在 forward 时已用采样动作生成 selector 决策; 但真正送入
+        环境的动作可能会经过 `map_action` 或 `exploration_noise` 变换。
+        本函数将最终动作反向注回 context, 保持 base/dynamic/uncertainty 与
+        环境真实动作对齐。对非 DARLR 策略无副作用。
+        """
+
+        if not hasattr(self.data.policy, "darlr_context"):
+            return
+        underlying_policy = getattr(self.policy, "policy", self.policy)
+        recompute = getattr(underlying_policy, "recompute_context_with_final_actions", None)
+        if recompute is None:
+            return
+        try:
+            updated = recompute(self.data.policy.darlr_context, final_actions)
+            if updated is not None:
+                self.data.policy.darlr_context = updated
+        except Exception as err:  # pragma: no cover - defensive log; do not crash training
+            warnings.warn(f"DARLR context refinalize failed: {err}")
+
     def _inject_darlr_context(self, ready_env_ids: np.ndarray) -> None:
         """把 DARLR selector 上下文注入对应的向量环境。
 
@@ -407,6 +429,10 @@ class Collector(object):
 
             # get bounded and remapped actions first (not saved into buffer)
             action_remap = self.policy.map_action(self.data)  # RecPolicy transform!
+
+            # P0#6: 用最终实际送入环境的动作 (经过 map_action + exploration_noise)
+            # 重新聚合 DARLR selector context 中依赖 action 的量 (base/dynamic/uncertainty)。
+            self._refinalize_darlr_context_with_final_actions(action_remap)
             self._inject_darlr_context(ready_env_ids)
 
             obs_next, rew, terminated, truncated, info = self.env.step(action_remap, ready_env_ids)

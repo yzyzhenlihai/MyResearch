@@ -219,6 +219,30 @@ def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
     with open(ensemble_models.PREDICTION_MAT_PATH, "rb") as file:
         predicted_mat = pickle.load(file)
 
+    # DORL 论文公式:  r = r̂ - λ_U * P_U + λ_E * P_E
+    # 其中 P_U 使用 DeepFM ensemble 的最大方差矩阵。
+    # 历史 bug: 之前 --lambda_variance 参数存在但未加载 VAR_MAT_PATH，
+    # 导致静态不确定性完全没有进入奖励。此处修复该问题。
+    maxvar_mat = None
+    if getattr(args, "lambda_variance", 0.0) and args.lambda_variance > 0:
+        with open(ensemble_models.VAR_MAT_PATH, "rb") as file:
+            maxvar_mat = pickle.load(file)
+        assert maxvar_mat.shape == predicted_mat.shape, (
+            "VAR_MAT_PATH shape must match PREDICTION_MAT_PATH shape, "
+            f"got {maxvar_mat.shape} vs {predicted_mat.shape}."
+        )
+        logzero.logger.info(
+            "DORL variance penalty enabled: lambda_variance=%s, maxvar min/max=%.4f/%.4f",
+            args.lambda_variance,
+            float(maxvar_mat.min()),
+            float(maxvar_mat.max()),
+        )
+    else:
+        logzero.logger.warning(
+            "DORL variance penalty DISABLED (lambda_variance=%s).",
+            getattr(args, "lambda_variance", None),
+        )
+
     alpha_u, beta_i = None, None  ## TODO
 
     kwargs = {
@@ -241,7 +265,9 @@ def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
         "entropy_max": entropy_max,
         "feature_level": args.feature_level,
         "map_item_feat": map_item_feat,
-        "is_sorted": args.is_sorted
+        "is_sorted": args.is_sorted,
+        "maxvar_mat": maxvar_mat,
+        "lambda_variance": args.lambda_variance,
     }
 
     train_envs = DummyVectorEnv(
@@ -320,11 +346,23 @@ def main(args):
     state_tracker = setup_state_tracker(args, ensemble_models, env, train_envs, test_envs_dict)
     policy, train_collector, test_collector_set, optim = setup_policy_model(args, state_tracker, train_envs, test_envs_dict)
     set_wandb(args)
-    # %% 4. Learn policy
-    learn_policy(args, env, dataset, policy, train_collector, test_collector_set, state_tracker, optim, MODEL_SAVE_PATH,
-                 logger_path, trainer="onpolicy")
-
-    finish_wandb()
+    try:
+        # %% 4. Learn policy
+        learn_policy(
+            args,
+            env,
+            dataset,
+            policy,
+            train_collector,
+            test_collector_set,
+            state_tracker,
+            optim,
+            MODEL_SAVE_PATH,
+            logger_path,
+            trainer="onpolicy",
+        )
+    finally:
+        finish_wandb()
 if __name__ == '__main__':
     trainer = "onpolicy"
     args_all = get_args_all(trainer)
@@ -334,7 +372,8 @@ if __name__ == '__main__':
     args_all.__dict__.update(args_DORL.__dict__)
     try:
         main(args_all)
-    except Exception as e:
+    except Exception:
         var = traceback.format_exc()
         print(var)
         logzero.logger.error(var)
+        raise

@@ -27,6 +27,10 @@ from policy_utils import (  # noqa: E402
 
 from src.core.collector.collector import Collector  # noqa: E402
 from src.core.collector.collector_set import CollectorSet  # noqa: E402
+from src.core.darlr import (  # noqa: E402
+    DynamicRewardStore,
+    SelectorTrainingMetricsCallback,
+)
 from src.core.envs.Simulated_Env.darlr_dynamic_reward import DARLRDynamicRewardEnv  # noqa: E402
 from src.core.envs.Simulated_Env.penalty_ent_exp import (  # noqa: E402
     get_features_of_last_n_items_features,
@@ -59,6 +63,51 @@ DEFAULT_SELECTOR_CANDIDATE_SIZE = 512
 
 DEFAULT_SELECTOR_K = 10
 """selector 默认参考用户数量。"""
+
+
+def _positive_float(raw_value: str) -> float:
+    """解析严格为正的命令行浮点数。
+
+    Args:
+        raw_value (str): argparse 接收的原始字符串。
+
+    Returns:
+        float: 解析后的正浮点数。
+
+    Raises:
+        argparse.ArgumentTypeError: 当输入不是浮点数或数值不大于零时抛出。
+    """
+
+    try:
+        parsed_value = float(raw_value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected a floating-point number") from error
+    if parsed_value <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed_value
+
+
+def _nonnegative_float(raw_value: str) -> float:
+    """解析非负命令行浮点数。
+
+    Args:
+        raw_value (str): argparse 接收的原始字符串。
+
+    Returns:
+        float: 解析后的非负浮点数。
+
+    Raises:
+        argparse.ArgumentTypeError: 当输入不是浮点数或数值小于零时抛出。
+    """
+
+    try:
+        parsed_value = float(raw_value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected a floating-point number") from error
+    if parsed_value < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return parsed_value
+
 
 _SWANLAB_MODE = os.environ.get("SWANLAB_MODE", "").lower()
 _SWANLAB_DISABLE_LOGIN = _SWANLAB_MODE in {"offline", "disabled"}
@@ -130,15 +179,26 @@ def set_wandb(args: argparse.Namespace) -> None:
 
 
 def finish_wandb() -> None:
-    """安全结束 swanlab 记录。
+    """安全结束 swanlab 记录，不让观测后端故障改变训练结果。
 
     Returns:
-        None: 当 swanlab 不可用或被禁用时直接返回。
+        None: 当 swanlab 不可用、被禁用或收尾失败时直接返回。
+
+    Notes:
+        swanlab 的 ``finish`` 会访问远程 API。网络、证书或服务端故障属于
+        非关键的观测链路异常，因此这里只记录警告，避免覆盖训练阶段的结果
+        或原始异常。
     """
 
     if wandb is None or _SWANLAB_DISABLE_LOGIN:
         return
-    wandb.finish()
+    try:
+        wandb.finish()
+    except Exception:
+        logzero.logger.warning(
+            "Failed to finish swanlab logging; preserving the training result.",
+            exc_info=True,
+        )
 
 
 def get_args_DARLR() -> argparse.Namespace:
@@ -184,6 +244,17 @@ def get_args_DARLR() -> argparse.Namespace:
         choices=["embedding_topk", "random"],
         default="embedding_topk",
     )
+    parser.add_argument(
+        "--selector_policy_mode",
+        "--selector-policy-mode",
+        type=str,
+        choices=["learned", "random", "fixed"],
+        default="learned",
+        help=(
+            "learned trains the selector; random samples uniformly without "
+            "training; fixed samples from a frozen initialized selector."
+        ),
+    )
     parser.add_argument("--selector_lambda_s", type=float, default=1.0)
     parser.add_argument("--selector_lambda_d", type=float, default=0.05)
     parser.add_argument("--lambda_uncertainty", type=float, default=0.05)
@@ -210,8 +281,117 @@ def get_args_DARLR() -> argparse.Namespace:
         choices=["dynamic", "static", "off"],
         default="dynamic",
     )
+    # 新增: paper_core / stabilized 口径切换 (对应文档 §4.4)
+    parser.add_argument(
+        "--selector_gain_mode",
+        type=str,
+        choices=["paper_core", "stabilized"],
+        default="paper_core",
+    )
+    # 新增: selector loss 权重、独立学习率
+    parser.add_argument("--selector_loss_coef", type=float, default=1.0)
+    parser.add_argument("--selector_lr", type=float, default=None,
+                        help="If set, use a separate learning rate for selector optimizer.")
+    parser.add_argument(
+        "--selector_ent_coef",
+        "--selector-ent-coef",
+        type=_nonnegative_float,
+        default=0.0,
+        help="Entropy coefficient used only by the selector actor.",
+    )
+    parser.add_argument(
+        "--selector_reward_normalization",
+        "--selector-reward-normalization",
+        dest="selector_reward_normalization",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no_selector_reward_normalization",
+        "--no-selector-reward-normalization",
+        dest="selector_reward_normalization",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--selector_advantage_normalization",
+        "--selector-advantage-normalization",
+        dest="selector_advantage_normalization",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--no_selector_advantage_normalization",
+        "--no-selector-advantage-normalization",
+        dest="selector_advantage_normalization",
+        action="store_false",
+    )
+    parser.set_defaults(
+        selector_reward_normalization=False,
+        selector_advantage_normalization=False,
+    )
+    parser.add_argument(
+        "--selector_normalization_eps",
+        "--selector-normalization-eps",
+        type=_positive_float,
+        default=1.0e-8,
+    )
+    # 新增: DORL 静态方差惩罚 (供 static 消融与静态基线使用)
+    parser.add_argument("--lambda_variance", type=float, default=0.0)
 
     return parser.parse_known_args()[0]
+
+
+def validate_darlr_args(args: argparse.Namespace) -> None:
+    """在加载数据前校验 DARLR 训练参数的数值与结构约束。
+
+    Args:
+        args (argparse.Namespace): 合并通用、环境和 DARLR 参数后的命名空间。
+
+    Returns:
+        None: 参数合法时不修改输入。
+
+    Raises:
+        ValueError: 当学习率、梯度阈值、selector 结构或损失权重非法时抛出。
+    """
+
+    if args.lr <= 0:
+        raise ValueError("--lr must be positive.")
+    if args.selector_lr is not None and args.selector_lr <= 0:
+        raise ValueError("--selector_lr must be positive when provided.")
+    if args.max_grad_norm is not None and args.max_grad_norm <= 0:
+        raise ValueError("--max-grad-norm must be positive when provided.")
+    if args.selector_k <= 0:
+        raise ValueError("--selector_k must be positive.")
+    if args.selector_candidate_size < args.selector_k:
+        raise ValueError(
+            "--selector_candidate_size must be greater than or equal to "
+            "--selector_k."
+        )
+    if args.selector_pref_dim <= 0:
+        raise ValueError("--selector_pref_dim must be positive.")
+    if args.selector_num_heads <= 0:
+        raise ValueError("--selector_num_heads must be positive.")
+    if args.selector_pref_dim % args.selector_num_heads != 0:
+        raise ValueError(
+            "--selector_pref_dim must be divisible by --selector_num_heads."
+        )
+    if args.selector_num_layers <= 0:
+        raise ValueError("--selector_num_layers must be positive.")
+    if not 0 <= args.selector_dropout_rate < 1:
+        raise ValueError("--selector_dropout_rate must be in [0, 1).")
+    if args.selector_loss_coef < 0:
+        raise ValueError("--selector_loss_coef must be non-negative.")
+    if args.selector_ent_coef < 0:
+        raise ValueError("--selector_ent_coef must be non-negative.")
+    if args.selector_normalization_eps <= 0:
+        raise ValueError("--selector_normalization_eps must be positive.")
+    for argument_name in (
+        "selector_lambda_s",
+        "selector_lambda_d",
+        "lambda_uncertainty",
+        "lambda_entropy",
+        "lambda_variance",
+    ):
+        if getattr(args, argument_name) < 0:
+            raise ValueError(f"--{argument_name} must be non-negative.")
 
 
 def get_entropy(mylist, need_count=True):
@@ -337,6 +517,21 @@ def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
     with open(ensemble_models.PREDICTION_MAT_PATH, "rb") as file:
         predicted_mat = pickle.load(file)
 
+    # DARLR 需要静态 V0 用于静态 uncertainty 消融, 也用于 static_dorl 模式回退。
+    maxvar_mat = None
+    try:
+        with open(ensemble_models.VAR_MAT_PATH, "rb") as file:
+            maxvar_mat = pickle.load(file)
+        assert maxvar_mat.shape == predicted_mat.shape, (
+            "VAR_MAT_PATH shape must match PREDICTION_MAT_PATH shape, "
+            f"got {maxvar_mat.shape} vs {predicted_mat.shape}."
+        )
+    except FileNotFoundError:
+        logzero.logger.warning(
+            "VAR_MAT_PATH not found; static uncertainty ablation & static_dorl "
+            "mode will be unavailable for DARLR."
+        )
+
     env_kwargs = {
         "ensemble_models": ensemble_models,
         "env_task_class": type(env),
@@ -362,6 +557,9 @@ def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
         "darlr_eps": args.darlr_eps,
         "dynamic_reward_mode": args.dynamic_reward_mode,
         "dynamic_uncertainty_mode": args.dynamic_uncertainty_mode,
+        # DORL 静态 variance 惩罚 (static_dorl 模式与静态基线消融需要)
+        "maxvar_mat": maxvar_mat,
+        "lambda_variance": float(getattr(args, "lambda_variance", 0.0)),
     }
 
     train_envs = DummyVectorEnv(
@@ -371,10 +569,10 @@ def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     train_envs.seed(args.seed)
-    return train_envs, predicted_mat
+    return train_envs, predicted_mat, maxvar_mat
 
 
-def setup_policy_model(args, state_tracker, train_envs, test_envs_dict, predicted_mat):
+def setup_policy_model(args, state_tracker, train_envs, test_envs_dict, predicted_mat, maxvar_mat=None):
     """初始化 DARLR policy、collector 和优化器。
 
     Args:
@@ -419,17 +617,28 @@ def setup_policy_model(args, state_tracker, train_envs, test_envs_dict, predicte
         hidden_sizes=args.hidden_sizes,
     ).to(args.device)
 
-    optim_rl = torch.optim.Adam(
-        list(actor.parameters())
-        + list(critic.parameters())
-        + list(preference_encoder.parameters())
+    # P0#7: 拆分成两个独立 optimizer。recommender 只优化 actor/critic;
+    # selector 单独优化 preference_encoder / selector_state_encoder /
+    # selector_actor / selector_critic; state_tracker 依旧独立。
+    optim_rec = torch.optim.Adam(
+        list(actor.parameters()) + list(critic.parameters()),
+        lr=args.lr,
+    )
+    selector_lr = args.selector_lr if args.selector_lr is not None else args.lr
+    optim_selector = torch.optim.Adam(
+        list(preference_encoder.parameters())
         + list(selector_state_encoder.parameters())
         + list(selector_actor.parameters())
         + list(selector_critic.parameters()),
-        lr=args.lr,
+        lr=selector_lr,
     )
     optim_state = torch.optim.Adam(state_tracker.parameters(), lr=args.lr)
-    optim = [optim_rl, optim_state]
+    # save_model_fn 只识别 optim[0]/optim[-1], 对接旧接口: [optim_rec, optim_state].
+    # optim_selector 由 DARLRPolicy.darlr_extra_state() 单独保存。
+    optim = [optim_rec, optim_state]
+
+    # P0#4: 共享 previous-reward store, 全 run 唯一。
+    dynamic_reward_store = DynamicRewardStore(predicted_mat)
 
     policy = DARLRPolicy(
         actor=actor,
@@ -450,6 +659,18 @@ def setup_policy_model(args, state_tracker, train_envs, test_envs_dict, predicte
         selector_reward_mode=args.selector_reward_mode,
         darlr_eps=args.darlr_eps,
         selector_discount_factor=args.gamma,
+        selector_gain_mode=args.selector_gain_mode,
+        selector_loss_coef=args.selector_loss_coef,
+        selector_policy_mode=args.selector_policy_mode,
+        selector_ent_coef=args.selector_ent_coef,
+        selector_reward_normalization=args.selector_reward_normalization,
+        selector_advantage_normalization=(
+            args.selector_advantage_normalization
+        ),
+        selector_normalization_eps=args.selector_normalization_eps,
+        dynamic_reward_store=dynamic_reward_store,
+        maxvar_mat=maxvar_mat,
+        optim_selector=optim_selector,
         discount_factor=args.gamma,
         gae_lambda=args.gae_lambda,
         vf_coef=args.vf_coef,
@@ -461,6 +682,9 @@ def setup_policy_model(args, state_tracker, train_envs, test_envs_dict, predicte
         action_scaling=False,
     )
     rec_policy = RecPolicy(args, policy, state_tracker)
+    # 通过通用 trainer 的 epoch callback 链路，将 selector 训练诊断量与
+    # NX_0 等评估指标使用同一个 epoch 横坐标上传 SwanLab。
+    rec_policy.training_callbacks = [SelectorTrainingMetricsCallback(policy)]
 
     train_collector = Collector(
         rec_policy,
@@ -490,10 +714,11 @@ def main(args: argparse.Namespace) -> None:
         None: 训练结果由 trainer 打印并写入日志。
     """
 
+    validate_darlr_args(args)
     model_save_path, logger_path = prepare_dir_log(args)
     ensemble_models = prepare_user_model(args)
     env, dataset, kwargs_um = get_true_env(args)
-    train_envs, predicted_mat = prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um)
+    train_envs, predicted_mat, maxvar_mat = prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um)
     test_envs_dict = prepare_test_envs(args, env, kwargs_um)
     state_tracker = setup_state_tracker(args, ensemble_models, env, train_envs, test_envs_dict)
     policy, train_collector, test_collector_set, optim = setup_policy_model(
@@ -502,6 +727,7 @@ def main(args: argparse.Namespace) -> None:
         train_envs,
         test_envs_dict,
         predicted_mat,
+        maxvar_mat=maxvar_mat,
     )
     set_wandb(args)
     try:
@@ -535,3 +761,4 @@ if __name__ == "__main__":
         error = traceback.format_exc()
         print(error)
         logzero.logger.error(error)
+        raise
