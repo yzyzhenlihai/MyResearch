@@ -1,4 +1,4 @@
-"""绘制原 chunk 失效与延迟重规划代价的最简双子图。"""
+"""绘制完整未来轨迹上的 chunk 失效与延迟重规划代价双子图。"""
 
 from __future__ import annotations
 
@@ -55,16 +55,24 @@ def load_records(records_path: Path) -> list[dict[str, float | int]]:
         "chunk_position",
         "remaining_steps",
         "delay_steps",
-        "immediate_executed_steps",
-        "delayed_executed_steps",
+        "immediate_local_executed_steps",
+        "delayed_local_executed_steps",
+        "immediate_future_executed_steps",
+        "delayed_future_executed_steps",
+        "immediate_local_terminated",
+        "delayed_local_terminated",
         "immediate_terminated",
         "delayed_terminated",
     }
     float_fields = {
-        "immediate_reward",
-        "delayed_reward",
-        "replanning_gain",
-        "delay_loss",
+        "immediate_local_reward",
+        "delayed_local_reward",
+        "immediate_future_return",
+        "delayed_future_return",
+        "long_term_replanning_advantage",
+        "long_term_delay_cost",
+        "short_term_replanning_gain",
+        "short_term_delay_loss",
     }
     records: list[dict[str, float | int]] = []
     with records_path.open("r", encoding="utf-8", newline="") as file_obj:
@@ -179,7 +187,7 @@ def build_plot_summaries(
     """构造两个子图需要的均值、置信区间和样本量。
 
     左图只保留 `delay_steps == remaining_steps` 的完整 Continue 分支，
-    避免同一状态的 RG 因多个 delay 行被重复计数。右图固定
+    避免同一状态的长期优势因多个 delay 行被重复计数。右图固定
     `chunk_position == 1`，保证同一 K 下不同 delay 使用同一批状态。
 
     Args:
@@ -188,8 +196,8 @@ def build_plot_summaries(
         seed (int): 汇总随机种子。
 
     Returns:
-        dict[str, list[dict[str, float | int]]]: `replanning_gain` 和
-        `delay_loss` 两组绘图摘要。
+        dict[str, list[dict[str, float | int]]]: 长期重规划优势和长期
+        延迟代价两组绘图摘要。
     """
 
     rng = np.random.default_rng(seed)
@@ -200,7 +208,7 @@ def build_plot_summaries(
     ]
     gain_episode_values = _aggregate_episode_values(
         records=continue_records,
-        value_field="replanning_gain",
+        value_field="long_term_replanning_advantage",
         group_fields=("chunk_size", "chunk_position"),
     )
     gain_summaries: list[dict[str, float | int]] = []
@@ -231,7 +239,10 @@ def build_plot_summaries(
                 "win_rate": float(
                     np.mean(
                         [
-                            float(record["replanning_gain"]) > 0.0
+                            float(
+                                record["long_term_replanning_advantage"]
+                            )
+                            > 0.0
                             for record in state_records
                         ]
                     )
@@ -244,7 +255,7 @@ def build_plot_summaries(
     ]
     delay_episode_values = _aggregate_episode_values(
         records=first_position_records,
-        value_field="delay_loss",
+        value_field="long_term_delay_cost",
         group_fields=("chunk_size", "delay_steps"),
     )
     delay_summaries: list[dict[str, float | int]] = []
@@ -275,8 +286,8 @@ def build_plot_summaries(
             }
         )
     return {
-        "replanning_gain": gain_summaries,
-        "delay_loss": delay_summaries,
+        "long_term_replanning_advantage": gain_summaries,
+        "long_term_delay_cost": delay_summaries,
     }
 
 
@@ -297,7 +308,7 @@ def _plot_summary_curves(
     chunk_sizes = sorted(
         {
             int(record["chunk_size"])
-            for record in summaries["replanning_gain"]
+            for record in summaries["long_term_replanning_advantage"]
         }
     )
     figure, axes = plt.subplots(
@@ -312,7 +323,7 @@ def _plot_summary_curves(
         color = K_COLORS[color_index % len(K_COLORS)]
         gain_rows = [
             row
-            for row in summaries["replanning_gain"]
+            for row in summaries["long_term_replanning_advantage"]
             if int(row["chunk_size"]) == chunk_size
         ]
         positions = np.asarray(
@@ -361,7 +372,7 @@ def _plot_summary_curves(
 
         delay_rows = [
             row
-            for row in summaries["delay_loss"]
+            for row in summaries["long_term_delay_cost"]
             if int(row["chunk_size"]) == chunk_size
         ]
         delays = np.asarray(
@@ -397,16 +408,20 @@ def _plot_summary_curves(
         )
 
     gain_axis.axhline(0.0, color="#555555", linestyle="--", linewidth=1.0)
-    gain_axis.set_title("(a) Does the cached chunk become stale?")
+    gain_axis.set_title(
+        "(a) Does continuing the cached chunk reduce long-term return?"
+    )
     gain_axis.set_xlabel("Executed position within chunk")
-    gain_axis.set_ylabel("Replanning gain (per step)")
+    gain_axis.set_ylabel("Long-term replanning advantage")
     gain_axis.grid(alpha=0.22)
     gain_axis.legend(frameon=False)
 
     delay_axis.axhline(0.0, color="#555555", linestyle="--", linewidth=1.0)
-    delay_axis.set_title("(b) Is delayed replanning costly?")
+    delay_axis.set_title(
+        "(b) Is delayed replanning costly for long-term return?"
+    )
     delay_axis.set_xlabel("Extra cached actions before replanning")
-    delay_axis.set_ylabel("Delay loss (per step)")
+    delay_axis.set_ylabel("Long-term delay cost")
     delay_axis.grid(alpha=0.22)
     delay_axis.legend(frameon=False)
 

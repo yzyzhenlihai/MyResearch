@@ -1,10 +1,10 @@
-"""原 chunk 失效与延迟重规划代价的配对反事实评估。"""
+"""缓存 action chunk 长期失效与延迟重规划代价的配对反事实评估。"""
 
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -32,80 +32,111 @@ class EnvironmentSnapshot:
 
 @dataclass(frozen=True)
 class DelayEvaluation:
-    """一个重规划延迟分支的固定窗口结果。
+    """一个重规划延迟分支的局部干预与完整未来轨迹结果。
 
     Attributes:
         delay_steps (int): 重新规划前额外执行的缓存动作数。
-        reward_sum (float): 固定计划窗口内获得的奖励总和。
-        executed_steps (int): 因自然退出可能小于计划窗口的实际步数。
-        terminated (bool): 分支是否在窗口结束前自然退出。
+        local_reward_sum (float): 长度为原缓存后缀长度的局部窗口回报。
+        future_reward_sum (float): 从分支状态到 episode 结束的完整未来回报。
+        local_executed_steps (int): 局部窗口内实际执行步数。
+        future_executed_steps (int): 从分支状态到 episode 结束的实际步数。
+        local_terminated (bool): episode 是否在局部窗口内结束。
+        terminated (bool): 完整未来 rollout 是否到达自然退出或最大步数。
     """
 
     delay_steps: int
-    reward_sum: float
-    executed_steps: int
+    local_reward_sum: float
+    future_reward_sum: float
+    local_executed_steps: int
+    future_executed_steps: int
+    local_terminated: bool
     terminated: bool
 
 
 @dataclass(frozen=True)
 class BranchPointResult:
-    """同一中间状态上全部重规划延迟分支的配对结果。
+    """同一中间状态上多个重规划延迟分支的配对结果。
 
     Attributes:
-        planned_steps (int): 原 chunk 剩余动作数，也是所有分支的计划窗口。
+        planned_steps (int): 原 chunk 剩余动作数，也是局部干预窗口长度。
         evaluations (tuple[DelayEvaluation, ...]): 按延迟从小到大排列的结果。
     """
 
     planned_steps: int
     evaluations: tuple[DelayEvaluation, ...]
 
-    @property
-    def immediate_reward(self) -> float:
-        """返回立即重规划分支的奖励。
+    def _get_evaluation(self, delay_steps: int) -> DelayEvaluation:
+        """取得指定延迟分支。
+
+        Args:
+            delay_steps (int): 目标分支的重规划延迟。
 
         Returns:
-            float: `delay_steps=0` 分支的奖励总和。
+            DelayEvaluation: 与延迟匹配的评估结果。
 
         Raises:
-            RuntimeError: 当结果中缺少立即重规划分支时抛出。
+            RuntimeError: 当结果中缺少目标分支时抛出。
         """
 
         for evaluation in self.evaluations:
-            if evaluation.delay_steps == 0:
-                return evaluation.reward_sum
-        raise RuntimeError("BranchPointResult is missing delay_steps=0.")
+            if evaluation.delay_steps == delay_steps:
+                return evaluation
+        raise RuntimeError(
+            f"BranchPointResult is missing delay_steps={delay_steps}."
+        )
 
     @property
-    def continue_reward(self) -> float:
-        """返回完整执行原 chunk 剩余动作的奖励。
+    def immediate_evaluation(self) -> DelayEvaluation:
+        """返回立即重规划分支。
 
         Returns:
-            float: `delay_steps=planned_steps` 分支的奖励总和。
-
-        Raises:
-            RuntimeError: 当结果中缺少完整继续分支时抛出。
+            DelayEvaluation: `delay_steps=0` 分支。
         """
 
-        for evaluation in self.evaluations:
-            if evaluation.delay_steps == self.planned_steps:
-                return evaluation.reward_sum
-        raise RuntimeError("BranchPointResult is missing the full-continue branch.")
+        return self._get_evaluation(0)
 
     @property
-    def replanning_gain(self) -> float:
-        """计算每个计划步的立即重规划收益。
-
-        未执行步仍保留在分母中，避免自然退出分支通过缩短实际轨迹获得
-        人为偏高的单步奖励。
+    def continue_evaluation(self) -> DelayEvaluation:
+        """返回完整执行缓存后缀的 Continue 分支。
 
         Returns:
-            float: `(立即重规划奖励 - 完整继续奖励) / 计划窗口长度`。
+            DelayEvaluation: `delay_steps=planned_steps` 分支。
         """
 
-        return (self.immediate_reward - self.continue_reward) / self.planned_steps
+        return self._get_evaluation(self.planned_steps)
+
+    @property
+    def long_term_replanning_advantage(self) -> float:
+        """计算立即重规划相对完整 Continue 的长期回报优势。
+
+        Returns:
+            float: 两分支从当前状态到 episode 结束的未来回报之差。
+        """
+
+        return (
+            self.immediate_evaluation.future_reward_sum
+            - self.continue_evaluation.future_reward_sum
+        )
+
+    @property
+    def short_term_replanning_gain(self) -> float:
+        """计算局部窗口内每个计划步的重规划收益，仅用于机制诊断。
+
+        Returns:
+            float: 局部回报差除以固定局部窗口长度。
+        """
+
+        return (
+            self.immediate_evaluation.local_reward_sum
+            - self.continue_evaluation.local_reward_sum
+        ) / self.planned_steps
 
 
 Planner = Callable[[Sequence[int], Sequence[float]], Sequence[int]]
+DownstreamPlanner = Callable[
+    [Sequence[int], Sequence[float], int],
+    Sequence[int],
+]
 
 
 def capture_environment(env: Any) -> EnvironmentSnapshot:
@@ -129,6 +160,7 @@ def capture_environment(env: Any) -> EnvironmentSnapshot:
         "history_action",
         "sequence_action",
         "max_history",
+        "max_turn",
     )
     missing_fields = [name for name in required_fields if not hasattr(env, name)]
     if missing_fields:
@@ -182,14 +214,78 @@ def _step_branch(
         history_rewards (list[float]): 会被原地追加的奖励历史。
 
     Returns:
-        tuple[float, bool]: 当前步奖励与自然终止标记。
+        tuple[float, bool]: 当前步奖励与 episode 结束标记。
     """
 
     _, reward, terminated, truncated, _ = env.step(int(action))
     reward_float = float(reward)
     history_items.append(int(action))
     history_rewards.append(reward_float)
-    return reward_float, bool(terminated or truncated)
+    reached_max_turn = int(env.total_turn) >= int(env.max_turn)
+    return reward_float, bool(terminated or truncated or reached_max_turn)
+
+
+def _roll_out_downstream(
+    env: Any,
+    history_items: list[int],
+    history_rewards: list[float],
+    downstream_planner: DownstreamPlanner,
+    initial_terminated: bool,
+) -> tuple[float, int, bool]:
+    """用相同下游策略从局部干预窗口末端滚动到 episode 结束。
+
+    Args:
+        env (Any): 已处于局部干预窗口末端的环境分支。
+        history_items (list[int]): 当前分支的完整物品历史。
+        history_rewards (list[float]): 当前分支的完整奖励历史。
+        downstream_planner (DownstreamPlanner): 每次生成一个完整后续 chunk
+            的固定策略回调；第三个参数是该分支内从零开始的规划编号。
+        initial_terminated (bool): 局部窗口是否已经终止 episode。
+
+    Returns:
+        tuple[float, int, bool]: 下游回报、下游执行步数与最终结束标记。
+
+    Raises:
+        ValueError: 当下游 planner 返回空动作序列时抛出。
+        RuntimeError: 当环境超过自身最大步数仍未结束时抛出。
+    """
+
+    downstream_reward = 0.0
+    downstream_steps = 0
+    terminated = bool(initial_terminated)
+    planning_index = 0
+    maximum_followup_steps = max(int(env.max_turn) - int(env.total_turn), 0)
+
+    while not terminated and downstream_steps < maximum_followup_steps:
+        actions = list(
+            downstream_planner(
+                history_items,
+                history_rewards,
+                planning_index,
+            )
+        )
+        if not actions:
+            raise ValueError("downstream_planner must return at least one action.")
+        planning_index += 1
+        for action in actions:
+            reward, terminated = _step_branch(
+                env,
+                int(action),
+                history_items,
+                history_rewards,
+            )
+            downstream_reward += reward
+            downstream_steps += 1
+            if terminated or downstream_steps >= maximum_followup_steps:
+                break
+
+    if not terminated and int(env.total_turn) >= int(env.max_turn):
+        terminated = True
+    if not terminated and downstream_steps >= maximum_followup_steps:
+        raise RuntimeError(
+            "Downstream rollout exhausted env.max_turn without termination."
+        )
+    return downstream_reward, downstream_steps, terminated
 
 
 def _evaluate_delay(
@@ -200,8 +296,13 @@ def _evaluate_delay(
     cached_suffix: Sequence[int],
     delay_steps: int,
     planner: Planner,
+    downstream_planner: DownstreamPlanner,
 ) -> DelayEvaluation:
-    """评估“延迟若干缓存动作后再重规划”的单个分支。
+    """评估一个延迟分支的局部干预和完整未来轨迹。
+
+    局部窗口长度固定为缓存后缀长度：先执行 `delay_steps` 个旧动作，
+    再用最新状态重规划并补足窗口。窗口结束后，无论局部分支采用何种
+    干预，都切换到同一个下游策略，直到自然退出或达到 `max_turn`。
 
     Args:
         env (Any): 可恢复状态的推荐环境。
@@ -209,16 +310,15 @@ def _evaluate_delay(
         history_items (Sequence[int]): 起点时策略看到的完整物品历史。
         history_rewards (Sequence[float]): 起点时策略看到的完整奖励历史。
         cached_suffix (Sequence[int]): 原 chunk 尚未执行的缓存动作。
-        delay_steps (int): 重规划前继续执行的缓存动作数，范围
-            `[0, len(cached_suffix)]`。
-        planner (Planner): 根据最新历史生成新 chunk 的回调。
+        delay_steps (int): 重规划前继续执行的缓存动作数。
+        planner (Planner): 在局部窗口内根据最新历史生成新 chunk 的回调。
+        downstream_planner (DownstreamPlanner): 局部窗口后统一使用的策略。
 
     Returns:
-        DelayEvaluation: 固定计划窗口内的分支结果。
+        DelayEvaluation: 局部回报与完整未来轨迹回报。
 
     Raises:
-        ValueError: 当历史长度不一致、缓存后缀为空、延迟越界或 planner
-            返回的新动作不足时抛出。
+        ValueError: 当历史、缓存后缀、延迟或 planner 输出非法时抛出。
     """
 
     if len(history_items) != len(history_rewards):
@@ -234,8 +334,8 @@ def _evaluate_delay(
     restore_environment(env, snapshot)
     branch_items = list(history_items)
     branch_rewards = list(history_rewards)
-    reward_sum = 0.0
-    executed_steps = 0
+    local_reward_sum = 0.0
+    local_executed_steps = 0
     terminated = False
 
     # 先执行指定数量的旧缓存动作；一旦自然退出，该分支不再重规划。
@@ -246,17 +346,17 @@ def _evaluate_delay(
             branch_items,
             branch_rewards,
         )
-        reward_sum += reward
-        executed_steps += 1
+        local_reward_sum += reward
+        local_executed_steps += 1
         if terminated:
             break
 
-    remaining_steps = planned_steps - executed_steps
+    remaining_steps = planned_steps - local_executed_steps
     if not terminated and remaining_steps > 0:
         replanned_actions = list(planner(branch_items, branch_rewards))
         if len(replanned_actions) < remaining_steps:
             raise ValueError(
-                "planner returned fewer actions than the remaining evaluation window: "
+                "planner returned fewer actions than the remaining local window: "
                 f"needed={remaining_steps}, got={len(replanned_actions)}."
             )
         for action in replanned_actions[:remaining_steps]:
@@ -266,15 +366,26 @@ def _evaluate_delay(
                 branch_items,
                 branch_rewards,
             )
-            reward_sum += reward
-            executed_steps += 1
+            local_reward_sum += reward
+            local_executed_steps += 1
             if terminated:
                 break
 
+    local_terminated = terminated
+    downstream_reward, downstream_steps, terminated = _roll_out_downstream(
+        env=env,
+        history_items=branch_items,
+        history_rewards=branch_rewards,
+        downstream_planner=downstream_planner,
+        initial_terminated=local_terminated,
+    )
     return DelayEvaluation(
         delay_steps=delay_steps,
-        reward_sum=reward_sum,
-        executed_steps=executed_steps,
+        local_reward_sum=local_reward_sum,
+        future_reward_sum=local_reward_sum + downstream_reward,
+        local_executed_steps=local_executed_steps,
+        future_executed_steps=local_executed_steps + downstream_steps,
+        local_terminated=local_terminated,
         terminated=terminated,
     )
 
@@ -285,37 +396,54 @@ def evaluate_branch_point(
     history_rewards: Sequence[float],
     cached_suffix: Sequence[int],
     planner: Planner,
+    downstream_planner: DownstreamPlanner,
+    delay_values: Optional[Sequence[int]] = None,
 ) -> BranchPointResult:
-    """在同一中间状态上评估从立即重规划到完整继续的全部延迟。
+    """在同一状态上比较不同延迟分支的完整未来轨迹回报。
 
-    每个 delay 分支都从相同环境快照开始，且总计划窗口始终等于原
-    chunk 的剩余长度。函数结束后会恢复调用前的主轨迹环境状态。
+    每个分支都从同一环境快照开始。局部干预窗口结束后，各分支使用
+    相同的下游规划策略滚动到 episode 结束。函数结束后恢复主轨迹环境。
 
     Args:
         env (Any): 当前主轨迹环境。
         history_items (Sequence[int]): 当前策略物品历史，包含 reset dummy。
         history_rewards (Sequence[float]): 当前策略奖励历史。
         cached_suffix (Sequence[int]): 原 chunk 未执行的动作。
-        planner (Planner): 根据分支最新历史生成动作序列的回调。
+        planner (Planner): 局部窗口内根据分支最新历史生成动作的回调。
+        downstream_planner (DownstreamPlanner): 局部窗口后统一执行的策略。
+        delay_values (Optional[Sequence[int]]): 要评估的延迟集合。为空时
+            评估 `0..L`；若指定，仍必须包含立即重规划 `0` 和完整继续 `L`。
 
     Returns:
-        BranchPointResult: 全部延迟分支的配对结果。
+        BranchPointResult: 指定延迟分支的长期配对结果。
 
     Raises:
-        ValueError: 当缓存后缀为空或底层分支输入不合法时抛出。
-
-    Example:
-        >>> class ToyEnv:
-        ...     pass
-        >>> # 实际使用时传入 KuaiEnv 和 DORL-MAC planner。
+        ValueError: 当缓存后缀为空、延迟集合非法或底层输入非法时抛出。
     """
 
     if not cached_suffix:
         raise ValueError("cached_suffix must contain at least one action.")
+    planned_steps = len(cached_suffix)
+    selected_delays = (
+        list(range(planned_steps + 1))
+        if delay_values is None
+        else sorted(set(int(value) for value in delay_values))
+    )
+    if not selected_delays:
+        raise ValueError("delay_values must not be empty.")
+    if any(value < 0 or value > planned_steps for value in selected_delays):
+        raise ValueError(
+            f"delay_values must be within [0, {planned_steps}]."
+        )
+    if 0 not in selected_delays or planned_steps not in selected_delays:
+        raise ValueError(
+            "delay_values must include both 0 and the full-continue delay."
+        )
+
     snapshot = capture_environment(env)
     evaluations: list[DelayEvaluation] = []
     try:
-        for delay_steps in range(len(cached_suffix) + 1):
+        for delay_steps in selected_delays:
             evaluations.append(
                 _evaluate_delay(
                     env=env,
@@ -325,11 +453,12 @@ def evaluate_branch_point(
                     cached_suffix=cached_suffix,
                     delay_steps=delay_steps,
                     planner=planner,
+                    downstream_planner=downstream_planner,
                 )
             )
     finally:
         restore_environment(env, snapshot)
     return BranchPointResult(
-        planned_steps=len(cached_suffix),
+        planned_steps=planned_steps,
         evaluations=tuple(evaluations),
     )

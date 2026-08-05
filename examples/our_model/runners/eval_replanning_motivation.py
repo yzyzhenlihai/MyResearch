@@ -1,9 +1,10 @@
-"""验证原 chunk 失效与及时重规划必要性的动机实验入口。"""
+"""用完整未来轨迹回报验证 chunk 失效与及时重规划必要性。"""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import sys
@@ -50,6 +51,15 @@ DEFAULT_NUM_SAMPLES = 32
 DEFAULT_BOOTSTRAP_SAMPLES = 2000
 """可视化置信区间的默认 episode-level bootstrap 次数。"""
 
+FULL_DELAY_DIAGNOSTIC_POSITION = 1
+"""只在 chunk 第一个分支位置枚举全部延迟，控制长期 rollout 计算量。"""
+
+RECORDS_SCHEMA_VERSION = 2
+"""完整未来轨迹回报评估所使用的 CSV schema 版本。"""
+
+MAX_TORCH_SEED = 2**63 - 1
+"""PyTorch Generator 接受的稳定非负种子上界。"""
+
 INITIAL_DUMMY_ITEM = -1
 """StateTrackerAvg 在 episode reset 时使用的虚拟物品编号。"""
 
@@ -89,16 +99,24 @@ RECORD_FIELDNAMES = (
     "chunk_position",
     "remaining_steps",
     "delay_steps",
-    "immediate_reward",
-    "delayed_reward",
-    "immediate_executed_steps",
-    "delayed_executed_steps",
+    "immediate_local_reward",
+    "delayed_local_reward",
+    "immediate_future_return",
+    "delayed_future_return",
+    "immediate_local_executed_steps",
+    "delayed_local_executed_steps",
+    "immediate_future_executed_steps",
+    "delayed_future_executed_steps",
+    "immediate_local_terminated",
+    "delayed_local_terminated",
     "immediate_terminated",
     "delayed_terminated",
-    "replanning_gain",
-    "delay_loss",
+    "long_term_replanning_advantage",
+    "long_term_delay_cost",
+    "short_term_replanning_gain",
+    "short_term_delay_loss",
 )
-"""原始配对反事实记录的稳定 CSV 字段顺序。"""
+"""完整未来轨迹配对反事实记录的稳定 CSV 字段顺序。"""
 
 
 @dataclass(frozen=True)
@@ -475,6 +493,73 @@ def restore_torch_rng(
         torch.cuda.set_rng_state(rng_snapshot.cuda_state, device)
 
 
+def build_seeded_torch_rng(
+    seed: int,
+    device: torch.device,
+) -> TorchRNGSnapshot:
+    """从显式种子构造独立 RNG 快照，不改动进程全局随机状态。
+
+    Args:
+        seed (int): 位于 `[0, MAX_TORCH_SEED]` 的随机种子。
+        device (torch.device): MAC agent 所在设备。
+
+    Returns:
+        TorchRNGSnapshot: CPU 与可选 CUDA 规划随机数状态。
+
+    Raises:
+        ValueError: 当种子越界时抛出。
+    """
+
+    if not 0 <= seed <= MAX_TORCH_SEED:
+        raise ValueError(
+            f"seed must be in [0, {MAX_TORCH_SEED}], got {seed}."
+        )
+    cpu_generator = torch.Generator(device="cpu")
+    cpu_generator.manual_seed(seed)
+    cuda_state = None
+    if device.type == "cuda":
+        cuda_generator = torch.Generator(device=device)
+        cuda_generator.manual_seed(seed)
+        cuda_state = cuda_generator.get_state().clone()
+    return TorchRNGSnapshot(
+        cpu_state=cpu_generator.get_state().clone(),
+        cuda_state=cuda_state,
+    )
+
+
+def derive_downstream_seed(
+    base_seed: int,
+    chunk_size: int,
+    episode_id: int,
+    chunk_index: int,
+    chunk_position: int,
+    planning_index: int,
+) -> int:
+    """为同一分支点的第 n 次下游规划派生稳定公共随机数种子。
+
+    延迟编号不参与种子计算，因此所有 Continue/Replan 分支在相同的
+    下游规划编号上使用同一候选采样随机流；状态不同仍可产生不同动作。
+
+    Args:
+        base_seed (int): 实验全局随机种子。
+        chunk_size (int): 当前 checkpoint 的规划长度。
+        episode_id (int): 当前主轨迹编号。
+        chunk_index (int): 当前 chunk 编号。
+        chunk_position (int): 当前 chunk 内一基分支位置。
+        planning_index (int): 局部干预结束后的零基规划编号。
+
+    Returns:
+        int: 可传给 `build_seeded_torch_rng` 的稳定种子。
+    """
+
+    identity = (
+        f"{base_seed}|{chunk_size}|{episode_id}|{chunk_index}|"
+        f"{chunk_position}|{planning_index}"
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big") % MAX_TORCH_SEED
+
+
 def select_chunk(
     agent: torch.nn.Module,
     state_tracker: torch.nn.Module,
@@ -565,12 +650,9 @@ def _append_branch_records(
         None.
     """
 
-    immediate_evaluation = next(
-        evaluation
-        for evaluation in result.evaluations
-        if evaluation.delay_steps == 0
-    )
-    replanning_gain = float(result.replanning_gain)
+    immediate_evaluation = result.immediate_evaluation
+    long_term_advantage = float(result.long_term_replanning_advantage)
+    short_term_gain = float(result.short_term_replanning_gain)
     for evaluation in result.evaluations:
         records.append(
             {
@@ -581,15 +663,41 @@ def _append_branch_records(
                 "chunk_position": chunk_position,
                 "remaining_steps": result.planned_steps,
                 "delay_steps": evaluation.delay_steps,
-                "immediate_reward": immediate_evaluation.reward_sum,
-                "delayed_reward": evaluation.reward_sum,
-                "immediate_executed_steps": immediate_evaluation.executed_steps,
-                "delayed_executed_steps": evaluation.executed_steps,
+                "immediate_local_reward": (
+                    immediate_evaluation.local_reward_sum
+                ),
+                "delayed_local_reward": evaluation.local_reward_sum,
+                "immediate_future_return": (
+                    immediate_evaluation.future_reward_sum
+                ),
+                "delayed_future_return": evaluation.future_reward_sum,
+                "immediate_local_executed_steps": (
+                    immediate_evaluation.local_executed_steps
+                ),
+                "delayed_local_executed_steps": (
+                    evaluation.local_executed_steps
+                ),
+                "immediate_future_executed_steps": (
+                    immediate_evaluation.future_executed_steps
+                ),
+                "delayed_future_executed_steps": (
+                    evaluation.future_executed_steps
+                ),
+                "immediate_local_terminated": int(
+                    immediate_evaluation.local_terminated
+                ),
+                "delayed_local_terminated": int(evaluation.local_terminated),
                 "immediate_terminated": int(immediate_evaluation.terminated),
                 "delayed_terminated": int(evaluation.terminated),
-                "replanning_gain": replanning_gain,
-                "delay_loss": (
-                    immediate_evaluation.reward_sum - evaluation.reward_sum
+                "long_term_replanning_advantage": long_term_advantage,
+                "long_term_delay_cost": (
+                    immediate_evaluation.future_reward_sum
+                    - evaluation.future_reward_sum
+                ),
+                "short_term_replanning_gain": short_term_gain,
+                "short_term_delay_loss": (
+                    immediate_evaluation.local_reward_sum
+                    - evaluation.local_reward_sum
                 )
                 / result.planned_steps,
             }
@@ -684,23 +792,68 @@ def evaluate_checkpoint(
                 cached_suffix = base_chunk[chunk_position:]
 
                 if not terminated and cached_suffix:
-                    planner = lambda items, rewards: select_chunk(
-                        agent=agent,
-                        state_tracker=state_tracker,
-                        history_items=items,
-                        history_rewards=rewards,
-                        num_samples_test=args.num_samples_test,
-                        remove_recommended=args.remove_recommended,
-                        device=device,
-                        preserve_rng=True,
-                        planning_rng=base_planning_rng,
-                    )
+                    def local_planner(
+                        items: Sequence[int],
+                        rewards: Sequence[float],
+                    ) -> list[int]:
+                        """用原 chunk 的候选随机流执行局部重规划。"""
+
+                        return select_chunk(
+                            agent=agent,
+                            state_tracker=state_tracker,
+                            history_items=items,
+                            history_rewards=rewards,
+                            num_samples_test=args.num_samples_test,
+                            remove_recommended=args.remove_recommended,
+                            device=device,
+                            preserve_rng=True,
+                            planning_rng=base_planning_rng,
+                        )
+
+                    def downstream_planner(
+                        items: Sequence[int],
+                        rewards: Sequence[float],
+                        planning_index: int,
+                    ) -> list[int]:
+                        """用分支间对齐的随机流生成一个下游完整 chunk。"""
+
+                        downstream_seed = derive_downstream_seed(
+                            base_seed=args.seed,
+                            chunk_size=chunk_size,
+                            episode_id=episode_id,
+                            chunk_index=chunk_index,
+                            chunk_position=chunk_position,
+                            planning_index=planning_index,
+                        )
+                        downstream_rng = build_seeded_torch_rng(
+                            seed=downstream_seed,
+                            device=device,
+                        )
+                        return select_chunk(
+                            agent=agent,
+                            state_tracker=state_tracker,
+                            history_items=items,
+                            history_rewards=rewards,
+                            num_samples_test=args.num_samples_test,
+                            remove_recommended=args.remove_recommended,
+                            device=device,
+                            preserve_rng=True,
+                            planning_rng=downstream_rng,
+                        )
+
+                    if chunk_position == FULL_DELAY_DIAGNOSTIC_POSITION:
+                        delay_values = list(range(len(cached_suffix) + 1))
+                    else:
+                        # 左图只需要立即重规划与完整 Continue 两个端点。
+                        delay_values = [0, len(cached_suffix)]
                     result = evaluate_branch_point(
                         env=env,
                         history_items=history_items,
                         history_rewards=history_rewards,
                         cached_suffix=cached_suffix,
-                        planner=planner,
+                        planner=local_planner,
+                        downstream_planner=downstream_planner,
+                        delay_values=delay_values,
                     )
                     _append_branch_records(
                         records=records,
@@ -842,6 +995,12 @@ def main(argv: Optional[list[str]] = None) -> Path:
     )
     manifest = {
         "status": "completed",
+        "records_schema_version": RECORDS_SCHEMA_VERSION,
+        "primary_metric_definition": (
+            "undiscounted_complete_future_trajectory_return_from_branch_state"
+        ),
+        "downstream_execution_horizon": "checkpoint_chunk_size",
+        "full_delay_diagnostic_position": FULL_DELAY_DIAGNOSTIC_POSITION,
         "records": str(records_path),
         "summary": str(summary_path),
         "figures": [str(path) for path in figure_paths],
