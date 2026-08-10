@@ -572,7 +572,15 @@ def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
     return train_envs, predicted_mat, maxvar_mat
 
 
-def setup_policy_model(args, state_tracker, train_envs, test_envs_dict, predicted_mat, maxvar_mat=None):
+def setup_policy_model(
+    args,
+    state_tracker,
+    train_envs,
+    test_envs_dict,
+    predicted_mat,
+    maxvar_mat=None,
+    build_train_collector=True,
+):
     """初始化 DARLR policy、collector 和优化器。
 
     Args:
@@ -581,9 +589,16 @@ def setup_policy_model(args, state_tracker, train_envs, test_envs_dict, predicte
         train_envs: 训练向量环境。
         test_envs_dict (dict): 测试环境集合。
         predicted_mat (np.ndarray): world model 预测矩阵。
+        maxvar_mat (np.ndarray | None): world model 静态方差矩阵。
+        build_train_collector (bool): 是否构造训练 collector。纯 checkpoint
+            评测时可关闭，以避免创建不会使用的训练环境。
 
     Returns:
-        tuple: `(rec_policy, train_collector, test_collector_set, optim)`。
+        tuple: `(rec_policy, train_collector, test_collector_set, optim)`；关闭训练
+        collector 时第二项为 ``None``。
+
+    Raises:
+        ValueError: 当要求构造训练 collector 但 ``train_envs`` 为空时抛出。
     """
 
     if args.cpu:
@@ -686,13 +701,19 @@ def setup_policy_model(args, state_tracker, train_envs, test_envs_dict, predicte
     # NX_0 等评估指标使用同一个 epoch 横坐标上传 SwanLab。
     rec_policy.training_callbacks = [SelectorTrainingMetricsCallback(policy)]
 
-    train_collector = Collector(
-        rec_policy,
-        train_envs,
-        VectorReplayBuffer(args.buffer_size, len(train_envs)),
-        exploration_noise=args.exploration_noise,
-        remove_recommended_ids=args.remove_recommended_ids,
-    )
+    train_collector = None
+    if build_train_collector:
+        if train_envs is None:
+            raise ValueError(
+                "train_envs is required when build_train_collector=True."
+            )
+        train_collector = Collector(
+            rec_policy,
+            train_envs,
+            VectorReplayBuffer(args.buffer_size, len(train_envs)),
+            exploration_noise=args.exploration_noise,
+            remove_recommended_ids=args.remove_recommended_ids,
+        )
     test_collector_set = CollectorSet(
         rec_policy,
         test_envs_dict,

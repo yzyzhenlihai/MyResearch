@@ -36,8 +36,46 @@ class RecPolicy(ABC, nn.Module):
         # self.slate_size = args.slate_size
         self.slate_size = 1
         self.remove_recommended_ids = args.remove_recommended_ids
+        self.allowed_item_mask = None
         if self.action_type == "continuous":
             self.remap_eps = args.remap_eps
+
+    def set_allowed_item_indexes(self, allowed_item_indexes=None):
+        """设置评测时允许推荐的静态 item 候选集合。
+
+        Args:
+            allowed_item_indexes: 一维整数序列；传入 ``None`` 时恢复完整
+                item 候选空间。
+
+        Returns:
+            None: 候选掩码保存在当前策略包装器中。
+
+        Raises:
+            ValueError: 当候选为空、重复、不是整数或超出 item 范围时抛出。
+        """
+
+        if allowed_item_indexes is None:
+            self.allowed_item_mask = None
+            return
+        item_indexes = np.asarray(allowed_item_indexes)
+        if item_indexes.ndim != 1 or item_indexes.size == 0:
+            raise ValueError("allowed_item_indexes must be a non-empty 1D sequence.")
+        if not np.issubdtype(item_indexes.dtype, np.integer):
+            raise ValueError("allowed_item_indexes must contain integers.")
+        item_indexes = item_indexes.astype(np.int64, copy=False)
+        if len(np.unique(item_indexes)) != len(item_indexes):
+            raise ValueError("allowed_item_indexes must not contain duplicates.")
+        if item_indexes.min() < 0 or item_indexes.max() >= self.n_items:
+            raise ValueError(
+                f"allowed_item_indexes must be in [0, {self.n_items - 1}]."
+            )
+        allowed_mask = torch.zeros(
+            self.n_items,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        allowed_mask[item_indexes.tolist()] = True
+        self.allowed_item_mask = allowed_mask
 
 
     def get_score(self, action_emb, do_softmax = False):
@@ -179,7 +217,14 @@ class RecPolicy(ABC, nn.Module):
         if obs_next_rec_ids is not None:
             obs_next_rec_ids_torch = torch.LongTensor(obs_next_rec_ids).to(device=self.device)
             obs_next_mask = obs_next_mask.scatter(1, obs_next_rec_ids_torch, 0)
-        return obs_mask[:, :self.n_items].detach(), obs_next_mask[:, :self.n_items].detach()
+        obs_mask = obs_mask[:, :self.n_items]
+        obs_next_mask = obs_next_mask[:, :self.n_items]
+        if self.allowed_item_mask is not None:
+            obs_mask = obs_mask & self.allowed_item_mask.unsqueeze(0)
+            obs_next_mask = obs_next_mask & self.allowed_item_mask.unsqueeze(0)
+        if not torch.all(obs_mask.any(dim=1)):
+            raise RuntimeError("No allowed item remains for at least one observation.")
+        return obs_mask.detach(), obs_next_mask.detach()
 
 def get_rec_ids(buffer, indices, stage="Planning"):
     if len(buffer) == 0:

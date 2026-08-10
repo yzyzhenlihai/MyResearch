@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 export DATASET="KuaiEnv-v0"
 
 export SEED="${SEED:-2023}"
-export CUDA="${CUDA:-1}"
+export CUDA="${CUDA:-7}"
 export EPOCH="${EPOCH:-100}"
 export STEP_PER_EPOCH="${STEP_PER_EPOCH:-100000}"
 export TRAINING_NUM="${TRAINING_NUM:-100}"
@@ -20,9 +20,9 @@ export WINDOW_SIZE="${WINDOW_SIZE:-3}"
 export NUM_HEADS="${NUM_HEADS:-1}"
 
 # 论文 KuaiRec 协议 N=4, M=0：当前实现对应“前 3 个 + 当前动作”。
-export MAX_TURN="${MAX_TURN:-30}"
+export MAX_TURN="${MAX_TURN:-100}"
 export FORCE_LENGTH="${FORCE_LENGTH:-10}"
-export NUM_LEAVE_COMPUTE="${NUM_LEAVE_COMPUTE:-3}"
+export NUM_LEAVE_COMPUTE="${NUM_LEAVE_COMPUTE:-1}"
 export LEAVE_THRESHOLD="${LEAVE_THRESHOLD:-0}"
 
 export SELECTOR_K="${SELECTOR_K:-10}"
