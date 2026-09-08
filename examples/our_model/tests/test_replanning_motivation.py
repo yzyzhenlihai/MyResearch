@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -17,6 +18,7 @@ from examples.our_model.evaluation.replanning_motivation import (
 )
 from examples.our_model.runners.eval_replanning_motivation import (
     build_recommended_mask,
+    build_state_from_history,
     parse_checkpoint_specs,
 )
 
@@ -150,6 +152,53 @@ class MotivationInputTest(unittest.TestCase):
 
         self.assertEqual(mask.shape, (1, 5))
         self.assertEqual(mask[0].tolist(), [False, True, False, True, False])
+
+    def test_explicit_history_uses_chunk_dynamics_from_initial_state(self) -> None:
+        """动机实验应从离线初始状态按历史动作递推 dynamics。"""
+
+        class SumDynamics:
+            """把有效动作 embedding 之和加到状态各维。"""
+
+            def __call__(
+                self,
+                states: torch.Tensor,
+                actions: torch.Tensor,
+                valid: torch.Tensor,
+            ) -> torch.Tensor:
+                """返回动作前缀递推后的测试状态。
+
+                Args:
+                    states (torch.Tensor): 当前状态。
+                    actions (torch.Tensor): 动作 embedding。
+                    valid (torch.Tensor): 有效前缀标记。
+
+                Returns:
+                    torch.Tensor: 加上有效动作 embedding 总和后的状态。
+                """
+
+                return states + (actions * valid.unsqueeze(-1)).sum((1, 2), keepdim=False).unsqueeze(1)
+
+        agent = SimpleNamespace(
+            chunk_size=2,
+            action_dim=1,
+            action_mapper=SimpleNamespace(
+                item_embeddings=torch.tensor([[10.0], [20.0], [30.0]]),
+            ),
+            dynamics=SumDynamics(),
+        )
+        state = build_state_from_history(
+            agent=agent,
+            initial_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            user_id=1,
+            history_items=[-1, 0, 2],
+            history_rewards=[0.0, 0.5, 1.5],
+            device=torch.device("cpu"),
+        )
+
+        torch.testing.assert_close(
+            state,
+            torch.tensor([[43.0, 44.0]]),
+        )
 
 
 class MotivationSummaryTest(unittest.TestCase):

@@ -39,7 +39,7 @@ case "${ENV_NAME}" in
 esac
 
 DATASET_PATH="${DATASET_PATH:-${DEFAULT_DATASET_PATH}}"
-WHICH_TRACKER="${WHICH_TRACKER:-avg}"
+WHICH_TRACKER="${WHICH_TRACKER:-none}"
 REWARD_HANDLE="${REWARD_HANDLE:-cat}"
 WINDOW_SIZE="${WINDOW_SIZE:-3}"
 CHUNK_SIZE="${CHUNK_SIZE:-7}"
@@ -49,9 +49,10 @@ COMPLETION_WINDOW="${COMPLETION_WINDOW:-${CHUNK_SIZE}}"
 ENABLE_OPEN_LOOP_DIAGNOSTICS="${ENABLE_OPEN_LOOP_DIAGNOSTICS:-0}"
 GAMMA="${GAMMA:-0.9}"
 SEED="${SEED:-2023}"
-DEVICE="${DEVICE:-cuda:7}"
-CUDA="${CUDA:-7}"
+DEVICE="${DEVICE:-cuda:2}"
+CUDA="${CUDA:-2}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
 MAX_TURN="${MAX_TURN:-${DEFAULT_MAX_TURN}}"
 FORCE_LENGTH="${FORCE_LENGTH:-${MAX_TURN}}"
 NUM_LEAVE_COMPUTE="${NUM_LEAVE_COMPUTE:-${DEFAULT_NUM_LEAVE_COMPUTE}}"
@@ -62,7 +63,6 @@ MAX_TRAJECTORIES="${MAX_TRAJECTORIES:-}"
 MAX_CHUNKS="${MAX_CHUNKS:-}"
 USER_MODEL_ROOT="saved_models/${ENV_NAME}/${USER_MODEL_NAME}"
 ITEM_EMBEDDING_PATH="${ITEM_EMBEDDING_PATH:-${USER_MODEL_ROOT}/embeddings/[${READ_MESSAGE}]_emb_item_val_M0.pt}"
-USER_EMBEDDING_PATH="${USER_EMBEDDING_PATH:-${USER_MODEL_ROOT}/embeddings/[${READ_MESSAGE}]_emb_user_val_M0.pt}"
 PREDICTED_MAT_PATH="${PREDICTED_MAT_PATH:-${USER_MODEL_ROOT}/matsPre/[${READ_MESSAGE}]_matPre.pickle}"
 MAXVAR_MAT_PATH="${MAXVAR_MAT_PATH:-${USER_MODEL_ROOT}/matsVar/[${READ_MESSAGE}]_matVar.pickle}"
 
@@ -80,6 +80,8 @@ PREDICTED_MAT_NORMALIZE="${PREDICTED_MAT_NORMALIZE:-per_user_max}"
 ENTROPY_WINDOW="${ENTROPY_WINDOW:-1 2}"
 FEATURE_LEVEL="${FEATURE_LEVEL:-1}"
 IS_SORTED="${IS_SORTED:-1}"
+DYNAMICS_PRETRAIN_STEPS="${DYNAMICS_PRETRAIN_STEPS:-10000}"
+DYNAMICS_LR="${DYNAMICS_LR:-0.0003}"
 DYNAMICS_LOSS_WEIGHT="${DYNAMICS_LOSS_WEIGHT:-1.0}"
 # 阶段 ①：Categorical BC 预训练
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-100000}"
@@ -108,7 +110,6 @@ EVAL_EPISODES="${EVAL_EPISODES:-0}"
 EVAL_EVERY_N_EPOCHS="${EVAL_EVERY_N_EPOCHS:-1}"
 BUFFER_SIZE="${BUFFER_SIZE:-0}"
 QV_LOG_INTERVAL="${QV_LOG_INTERVAL:-100}"
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 ENABLE_STEP_PROFILER="${ENABLE_STEP_PROFILER:-0}"
 
 # SwanLab 项目命名（离散 Categorical MAC 版）
@@ -125,7 +126,7 @@ RUN_NAME_WITH_K="${RUN_NAME}-K${CHUNK_SIZE}"
 BC_RUN_NAME="${BC_RUN_NAME:-${RUN_NAME_WITH_K}-bc}"
 QV_RUN_NAME="${QV_RUN_NAME:-${RUN_NAME_WITH_K}-qv}"
 EVAL_RUN_NAME="${EVAL_RUN_NAME:-${RUN_NAME_WITH_K}-H${EXECUTION_HORIZON}-eval}"
-RUN_DIR="${RUN_DIR:-saved_models/${ENV_NAME}/DORL_MAC/${RUN_NAME_WITH_K}}"
+RUN_DIR="${RUN_DIR:-saved_models/${ENV_NAME}/MAC_origin/${RUN_NAME_WITH_K}}"
 BC_SAVE_DIR="${BC_SAVE_DIR:-${RUN_DIR}/categorical_bc}"
 MAC_SAVE_DIR="${MAC_SAVE_DIR:-${RUN_DIR}/mac_agent}"
 EVAL_SAVE_DIR="${EVAL_SAVE_DIR:-${RUN_DIR}/eval_H${EXECUTION_HORIZON}}"
@@ -159,6 +160,8 @@ COMMON_ARGS=(
   --lambda_variance "${LAMBDA_VARIANCE}"
   --entropy_window "${ENTROPY_WINDOW_ARGS[@]}"
   --dynamics_loss_weight "${DYNAMICS_LOSS_WEIGHT}"
+  --dynamics_pretrain_steps "${DYNAMICS_PRETRAIN_STEPS}"
+  --dynamics_lr "${DYNAMICS_LR}"
 )
 
 if [[ -n "${MAX_TRAJECTORIES}" ]]; then
@@ -168,7 +171,6 @@ if [[ -n "${MAX_CHUNKS}" ]]; then
   COMMON_ARGS+=(--max_chunks "${MAX_CHUNKS}")
 fi
 COMMON_ARGS+=(--item_embedding_path "${ITEM_EMBEDDING_PATH}")
-COMMON_ARGS+=(--user_embedding_path "${USER_EMBEDDING_PATH}")
 COMMON_ARGS+=(--predicted_mat_path "${PREDICTED_MAT_PATH}")
 COMMON_ARGS+=(--maxvar_mat_path "${MAXVAR_MAT_PATH}")
 if [[ "${USE_ENTROPY_REWARD}" == "1" || "${USE_ENTROPY_REWARD}" == "true" || "${USE_ENTROPY_REWARD}" == "True" ]]; then
@@ -231,6 +233,7 @@ reset_metrics_log() {
 find_existing_bc_ckpt() {
   local checkpoint_dir="$1"
   local checkpoints=()
+  local checkpoint_path=""
 
   if [[ ! -d "${checkpoint_dir}" ]]; then
     return 1
@@ -238,26 +241,29 @@ find_existing_bc_ckpt() {
 
   # 优先复用 runner 默认保存的 latest.pt，避免目录中有多个历史 checkpoint 时选错。
   if [[ -f "${checkpoint_dir}/latest.pt" ]]; then
-    printf '%s\n' "${checkpoint_dir}/latest.pt"
-    return 0
+    checkpoints+=("${checkpoint_dir}/latest.pt")
   fi
 
   shopt -s nullglob
-  checkpoints=("${checkpoint_dir}"/*.pt)
+  checkpoints+=("${checkpoint_dir}"/*.pt)
   shopt -u nullglob
-  if (( ${#checkpoints[@]} == 0 )); then
-    return 1
-  fi
-  printf '%s\n' "${checkpoints[0]}"
-  return 0
+  for checkpoint_path in "${checkpoints[@]}"; do
+    if "${PYTHON_BIN}" -c \
+      'import sys, torch; payload=torch.load(sys.argv[1], map_location="cpu"); raise SystemExit(0 if payload.get("format") == "mac_origin_precomputed_state_v2" else 1)' \
+      "${checkpoint_path}"; then
+      printf '%s\n' "${checkpoint_path}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 printf '[run_dorl_mac_kuai_train] run_dir=%s (chunk_size=K=%s, execution_horizon=H=%s)\n' \
   "${RUN_DIR}" "${CHUNK_SIZE}" "${EXECUTION_HORIZON}"
 printf '[run_dorl_mac_kuai_train] dataset: env=%s, trajectories=%s\n' \
   "${ENV_NAME}" "${DATASET_PATH}"
-printf '[run_dorl_mac_kuai_train] user model assets: item=%s, user=%s, prediction=%s, variance=%s\n' \
-  "${ITEM_EMBEDDING_PATH}" "${USER_EMBEDDING_PATH}" "${PREDICTED_MAT_PATH}" "${MAXVAR_MAT_PATH}"
+printf '[run_dorl_mac_kuai_train] user model assets: item=%s, prediction=%s, variance=%s\n' \
+  "${ITEM_EMBEDDING_PATH}" "${PREDICTED_MAT_PATH}" "${MAXVAR_MAT_PATH}"
 printf '[run_dorl_mac_kuai_train] open-loop diagnostics: CCR_window=%s, ADR=%s\n' \
   "${COMPLETION_WINDOW}" "${ENABLE_OPEN_LOOP_DIAGNOSTICS}"
 printf '[run_dorl_mac_kuai_train] pretrain (categorical BC): steps=%s, actor_lr=%s\n' \
@@ -319,12 +325,12 @@ run_command \
   --leave_policy "${LEAVE_POLICY}" \
   --test-num "${TEST_NUM}" \
   --eval_episodes "${EVAL_EPISODES}" \
+  --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
   --eval_every_n_epochs "${EVAL_EVERY_N_EPOCHS}" \
   --buffer-size "${BUFFER_SIZE}" \
   --save_dir "${MAC_SAVE_DIR}" \
   --eval_save_dir "${MAC_SAVE_DIR}/eval_during_train_H${EXECUTION_HORIZON}" \
   --log_interval "${QV_LOG_INTERVAL}" \
-  --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
   $( [ "${ENABLE_STEP_PROFILER}" = "1" ] && echo "--enable_step_profiler" )
 
 # 阶段 ③：最终评估

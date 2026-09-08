@@ -32,7 +32,7 @@ class DORLMACPolicyAdapter:
     def __init__(
         self,
         agent: mac_agent_module.MACAgent,
-        state_tracker: torch.nn.Module,
+        initial_states: torch.Tensor,
         action_mapper: ActionMapper,
         num_samples_test: int,
         device: torch.device,
@@ -44,7 +44,8 @@ class DORLMACPolicyAdapter:
 
         Args:
             agent (MACAgent): 已训练或已加载 checkpoint 的 DORL-MAC agent。
-            state_tracker (torch.nn.Module): 与离线数据一致的 StateTrackerAvg。
+            initial_states (torch.Tensor): 每个环境内部用户的离线轨迹初始
+                observation，形状为 `(num_users, state_dim)`。
             action_mapper (ActionMapper): 只提供 `num_items` 与 item embedding 表；
                 本适配器不使用它做相似度映射。
             num_samples_test (int): 评估时 rejection sampling 候选数。
@@ -59,13 +60,23 @@ class DORLMACPolicyAdapter:
                 shadow replan 动作至少共享一个类别即视为一致。
 
         Raises:
-            ValueError: 当候选数、execution horizon 或类别映射非法时抛出。
+            ValueError: 当初始状态、候选数、execution horizon 或类别映射非法时抛出。
         """
 
         if num_samples_test <= 0:
             raise ValueError("num_samples_test must be positive.")
+        initial_states = torch.as_tensor(
+            initial_states, dtype=torch.float32, device=device,
+        )
+        if initial_states.ndim != 2 or initial_states.shape[1] != agent.state_dim:
+            raise ValueError(
+                "initial_states must have shape (num_users, agent.state_dim), "
+                f"got {tuple(initial_states.shape)} and state_dim={agent.state_dim}."
+            )
+        if initial_states.shape[0] <= 0 or not torch.isfinite(initial_states).all():
+            raise ValueError("initial_states must be non-empty and finite.")
         self.agent = agent
-        self.state_tracker = state_tracker
+        self.initial_states = initial_states
         self.action_mapper = action_mapper
         self.num_samples_test = int(num_samples_test)
         self.device = device
@@ -94,6 +105,10 @@ class DORLMACPolicyAdapter:
         # chunk 内每步的 item id 缓存，`(B, K)`；`positions` 指向下一步应该出的 chunk step。
         self._cached_item_ids: Optional[torch.Tensor] = None
         self._cached_positions: Optional[torch.Tensor] = None
+        self._model_states: Optional[torch.Tensor] = None
+        self._pending_actions: Optional[torch.Tensor] = None
+        self._pending_lengths: Optional[torch.Tensor] = None
+        self._last_item_ids: Optional[torch.Tensor] = None
         self.reset_open_loop_diagnostics()
 
     def __call__(
@@ -125,15 +140,10 @@ class DORLMACPolicyAdapter:
             Batch: `act` 字段为整数 item id，形状 `(B,)`；`policy` 记录当前 chunk 内位置。
         """
 
-        del state, kwargs
-        states = self.state_tracker(
-            buffer=buffer,
-            indices=indices,
-            is_obs=is_obs,
-            batch=batch,
-            is_train=is_train,
-            use_batch_in_statetracker=use_batch_in_statetracker,
-        ).to(self.device)
+        del state, kwargs, is_obs, is_train, use_batch_in_statetracker
+        batch_size = self._infer_batch_size(batch)
+        reset_mask = self._get_reset_mask(batch=batch, batch_size=batch_size)
+        states = self._advance_model_states(batch=batch, reset_mask=reset_mask)
         recommended_mask = self._get_recommend_mask(
             remove_recommended_ids=remove_recommended_ids,
             batch_size=states.shape[0],
@@ -142,9 +152,10 @@ class DORLMACPolicyAdapter:
         )
         item_ids = self._next_chunk_item_ids(
             states=states.float(),
-            reset_mask=self._get_reset_mask(batch=batch, batch_size=states.shape[0]),
+            reset_mask=reset_mask,
             recommended_mask=recommended_mask if remove_recommended_ids else None,
         )
+        self._last_item_ids = item_ids.detach().clone()
         return Batch(
             act=item_ids.detach().cpu().numpy().astype(np.int64),
             policy=Batch(
@@ -215,7 +226,6 @@ class DORLMACPolicyAdapter:
         """
 
         self.agent.train(mode)
-        self.state_tracker.train(mode)
         self.reset_chunk_cache()
         self.reset_open_loop_diagnostics()
 
@@ -231,7 +241,6 @@ class DORLMACPolicyAdapter:
 
         del mode
         self.agent.eval()
-        self.state_tracker.eval()
         self.reset_chunk_cache()
         self.reset_open_loop_diagnostics()
 
@@ -244,6 +253,147 @@ class DORLMACPolicyAdapter:
 
         self._cached_item_ids = None
         self._cached_positions = None
+        self._model_states = None
+        self._pending_actions = None
+        self._pending_lengths = None
+        self._last_item_ids = None
+
+    @staticmethod
+    def _infer_batch_size(batch: Batch) -> int:
+        """从 Collector batch 推断并校验并行环境数量。
+
+        Args:
+            batch (Batch): 当前 Collector batch，必须包含二维 `obs`。
+
+        Returns:
+            int: batch 行数。
+
+        Raises:
+            ValueError: 当 `obs` 缺失或不是二维数组时抛出。
+        """
+
+        observations = np.asarray(batch.obs)
+        if observations.ndim != 2 or observations.shape[0] <= 0:
+            raise ValueError(
+                "Collector batch.obs must be a non-empty 2D user-item array."
+            )
+        return int(observations.shape[0])
+
+    def _user_ids_from_batch(self, batch: Batch, batch_size: int) -> torch.Tensor:
+        """读取环境 observation 第一列中的内部用户 ID。
+
+        Args:
+            batch (Batch): 当前 Collector batch。
+            batch_size (int): 已校验的 batch 行数。
+
+        Returns:
+            torch.Tensor: 形状为 `(B,)` 的内部用户 ID。
+
+        Raises:
+            ValueError: 当用户 ID 数量或取值越界时抛出。
+        """
+
+        user_ids = torch.as_tensor(
+            np.asarray(batch.obs)[:, 0], dtype=torch.long, device=self.device,
+        ).reshape(-1)
+        if user_ids.shape[0] != batch_size:
+            raise ValueError("Collector user id count does not match batch size.")
+        if torch.any(user_ids < 0) or torch.any(user_ids >= self.initial_states.shape[0]):
+            raise ValueError("Collector user id is outside the initial state table.")
+        return user_ids
+
+    def _predict_pending_states(self) -> torch.Tensor:
+        """用 dynamics 预测当前未提交动作前缀后的状态。
+
+        Returns:
+            torch.Tensor: 每个并行环境在当前决策时刻的模型状态。
+
+        Raises:
+            RuntimeError: 当内部状态缓存尚未初始化时抛出。
+        """
+
+        if (
+            self._model_states is None
+            or self._pending_actions is None
+            or self._pending_lengths is None
+        ):
+            raise RuntimeError("Policy model-state cache is not initialized.")
+        valid = torch.arange(
+            self.chunk_size, device=self.device,
+        ).unsqueeze(0) < self._pending_lengths.unsqueeze(1)
+        predicted = self.agent.dynamics(
+            self._model_states,
+            self._pending_actions,
+            valid,
+        )
+        has_pending = self._pending_lengths > 0
+        return torch.where(has_pending.unsqueeze(1), predicted, self._model_states)
+
+    def _advance_model_states(
+        self, batch: Batch, reset_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """在每次环境交互后按已执行动作递推策略状态。
+
+        新 episode 直接读取该用户在离线 pkl 中的初始 observation。连续
+        episode 将上一步实际执行的 item embedding 写入待提交前缀；前缀达到
+        execution horizon 时通过 chunk dynamics 提交一次边界状态。未达到
+        边界时也用相同 dynamics 生成只供当前 shadow replan 使用的状态预览。
+
+        Args:
+            batch (Batch): 当前 Collector batch，第一列为内部用户 ID。
+            reset_mask (torch.Tensor): 新 episode 行标记，形状为 `(B,)`。
+
+        Returns:
+            torch.Tensor: 当前决策时刻状态，形状为 `(B, state_dim)`。
+        """
+
+        batch_size = self._infer_batch_size(batch)
+        user_ids = self._user_ids_from_batch(batch, batch_size)
+        cache_missing = (
+            self._model_states is None
+            or self._model_states.shape[0] != batch_size
+        )
+        if cache_missing:
+            self._model_states = self.initial_states[user_ids].clone()
+            self._pending_actions = torch.zeros(
+                (batch_size, self.chunk_size, self.action_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self._pending_lengths = torch.zeros(
+                batch_size, dtype=torch.long, device=self.device,
+            )
+            self._last_item_ids = None
+            reset_mask = torch.ones(batch_size, dtype=torch.bool, device=self.device)
+
+        assert self._model_states is not None
+        assert self._pending_actions is not None
+        assert self._pending_lengths is not None
+        reset_mask = reset_mask.to(device=self.device, dtype=torch.bool)
+        continuation_mask = ~reset_mask
+        if self._last_item_ids is not None and continuation_mask.any():
+            rows = torch.nonzero(continuation_mask, as_tuple=False).squeeze(1)
+            positions = self._pending_lengths[rows]
+            if torch.any(positions >= self.chunk_size):
+                raise RuntimeError("Pending dynamics prefix exceeded chunk_size.")
+            action_embeddings = self.action_mapper.item_embeddings[
+                self._last_item_ids[rows]
+            ].to(device=self.device, dtype=torch.float32)
+            self._pending_actions[rows, positions] = action_embeddings
+            self._pending_lengths[rows] = positions + 1
+
+            commit_mask = self._pending_lengths >= self.execution_horizon
+            if commit_mask.any():
+                committed_predictions = self._predict_pending_states()
+                self._model_states[commit_mask] = committed_predictions[commit_mask]
+                self._pending_actions[commit_mask] = 0.0
+                self._pending_lengths[commit_mask] = 0
+
+        if reset_mask.any():
+            self._model_states[reset_mask] = self.initial_states[user_ids[reset_mask]]
+            self._pending_actions[reset_mask] = 0.0
+            self._pending_lengths[reset_mask] = 0
+        return self._predict_pending_states()
 
     def reset_open_loop_diagnostics(self) -> None:
         """清空当前评估分支的 ADR 累计量。

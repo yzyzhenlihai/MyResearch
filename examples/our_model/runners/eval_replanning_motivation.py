@@ -21,14 +21,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from analysis.plot_replanning_motivation import plot_motivation_figure
 from examples.our_model.evaluation import evaluate_branch_point
-from examples.our_model.policy import ActionMapper
 from examples.our_model.runners.common import (
     add_common_args,
     build_agent,
+    build_dataset_and_mapper,
     build_env_assets,
     configure_logging,
     ensure_dir,
-    load_item_embeddings,
     namespace_to_dict,
     resolve_common_paths,
     resolve_device,
@@ -37,7 +36,7 @@ from examples.our_model.runners.common import (
     set_seed,
 )
 from examples.our_model.runners.evaluation_utils import (
-    build_dorl_mac_state_tracker,
+    build_initial_state_table,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -61,7 +60,7 @@ MAX_TORCH_SEED = 2**63 - 1
 """PyTorch Generator 接受的稳定非负种子上界。"""
 
 INITIAL_DUMMY_ITEM = -1
-"""StateTrackerAvg 在 episode reset 时使用的虚拟物品编号。"""
+"""在 episode reset 时表示空历史的虚拟物品编号。"""
 
 SHARED_CHECKPOINT_FIELDS = (
     "env",
@@ -71,13 +70,13 @@ SHARED_CHECKPOINT_FIELDS = (
     "which_tracker",
     "reward_handle",
     "window_size",
+    "state_representation",
     "gamma",
     "num_leave_compute",
     "leave_threshold",
     "max_turn",
     "force_length",
     "item_embedding_path",
-    "user_embedding_path",
 )
 """不同 K checkpoint 必须一致、且可从 checkpoint 恢复的公共配置。"""
 
@@ -88,6 +87,7 @@ AGENT_CHECKPOINT_FIELDS = (
     "target_tau",
     "invalid_action_penalty",
     "dynamics_loss_weight",
+    "dynamics_hidden_dims",
 )
 """构造每个 K agent 时从 checkpoint 恢复的结构与数值配置。"""
 
@@ -306,7 +306,7 @@ def apply_shared_checkpoint_config(
         None.
 
     Raises:
-        ValueError: 当不同 K 的关键环境或 StateTracker 配置不一致时抛出。
+        ValueError: 当不同 K 的关键环境或观测配置不一致时抛出。
     """
 
     configs = {
@@ -334,16 +334,19 @@ def apply_shared_checkpoint_config(
 
 
 def build_state_from_history(
-    state_tracker: torch.nn.Module,
+    agent: torch.nn.Module,
+    initial_states: torch.Tensor,
+    user_id: int,
     history_items: Sequence[int],
     history_rewards: Sequence[float],
     device: torch.device,
 ) -> torch.Tensor:
-    """按 StateTrackerAvg 的真实语义从显式历史重建当前状态。
+    """从离线初始 observation 与已执行动作递推当前模型状态。
 
     Args:
-        state_tracker (torch.nn.Module): 已加载验证 embedding 的
-            `StateTrackerAvg`。
+        agent (torch.nn.Module): 含 chunk dynamics 与 action mapper 的 MAC agent。
+        initial_states (torch.Tensor): 与环境内部用户 ID 对齐的初始状态表。
+        user_id (int): 环境内部用户编号，与 user embedding 行号一致。
         history_items (Sequence[int]): 含 reset dummy 的物品历史。
         history_rewards (Sequence[float]): 与物品历史逐位置对齐的奖励历史。
         device (torch.device): 返回状态所在设备。
@@ -352,67 +355,35 @@ def build_state_from_history(
         torch.Tensor: 形状为 `(1, state_dim)` 的当前状态。
 
     Raises:
-        ValueError: 当历史为空、长度不一致、tracker 启用了用户 embedding，
-            或 reward handle 不受支持时抛出。
-
-    Example:
-        该函数由 runner 使用真实 StateTrackerAvg 调用；测试可传入实现
-        `get_embedding` 与 `get_normed_reward` 的轻量替身。
+        ValueError: 当历史为空或物品、奖励长度不一致时抛出。
     """
 
     if not history_items or len(history_items) != len(history_rewards):
         raise ValueError(
             "State history must be non-empty and item/reward lengths must match."
         )
-    if bool(getattr(state_tracker, "use_userEmbedding", False)):
-        raise ValueError(
-            "Replanning motivation runner currently requires use_userEmbedding=False."
-        )
-    window_size = int(getattr(state_tracker, "window_size"))
-    selected_items = np.asarray(
-        history_items[-window_size:],
-        dtype=np.int64,
-    ).reshape(-1, 1)
-    selected_rewards = np.asarray(
-        history_rewards[-window_size:],
-        dtype=np.float32,
-    ).reshape(-1, 1)
-
+    if not 0 <= user_id < initial_states.shape[0]:
+        raise ValueError(f"user_id is outside initial state table: {user_id}.")
+    state = initial_states[user_id:user_id + 1].to(
+        device=device, dtype=torch.float32,
+    )
+    executed_items = [int(item_id) for item_id in history_items if int(item_id) >= 0]
     with torch.no_grad():
-        item_embeddings = state_tracker.get_embedding(
-            selected_items.copy(),
-            "action",
-        )
-        reward_embeddings = state_tracker.get_embedding(
-            selected_rewards.copy(),
-            "feedback",
-        )
-        reward_handle = str(getattr(state_tracker, "reward_handle", ""))
-        if reward_handle == "cat":
-            normalized_rewards = state_tracker.get_normed_reward(
-                reward_embeddings,
-                is_train=False,
+        for start in range(0, len(executed_items), int(agent.chunk_size)):
+            prefix = executed_items[start:start + int(agent.chunk_size)]
+            prefix_ids = torch.as_tensor(prefix, dtype=torch.long, device=device)
+            actions = torch.zeros(
+                (1, int(agent.chunk_size), int(agent.action_dim)),
+                dtype=torch.float32,
+                device=device,
             )
-            state_rows = torch.cat(
-                [item_embeddings, normalized_rewards],
-                dim=1,
+            actions[0, :len(prefix)] = agent.action_mapper.item_embeddings[prefix_ids]
+            valid = torch.zeros(
+                (1, int(agent.chunk_size)), dtype=torch.bool, device=device,
             )
-        elif reward_handle == "cat2":
-            state_rows = torch.cat([item_embeddings, reward_embeddings], dim=1)
-        elif reward_handle == "mul":
-            normalized_rewards = state_tracker.get_normed_reward(
-                reward_embeddings,
-                is_train=False,
-            )
-            state_rows = item_embeddings * normalized_rewards
-        elif reward_handle in {"", "none", "None"}:
-            state_rows = item_embeddings
-        else:
-            raise ValueError(
-                f"Unsupported StateTracker reward_handle: {reward_handle!r}."
-            )
-        state = state_rows.mean(dim=0, keepdim=True)
-    return state.to(device=device, dtype=torch.float32)
+            valid[0, :len(prefix)] = True
+            state = agent.dynamics(state, actions, valid)
+    return state
 
 
 def build_recommended_mask(
@@ -562,7 +533,8 @@ def derive_downstream_seed(
 
 def select_chunk(
     agent: torch.nn.Module,
-    state_tracker: torch.nn.Module,
+    initial_states: torch.Tensor,
+    user_id: int,
     history_items: Sequence[int],
     history_rewards: Sequence[float],
     num_samples_test: int,
@@ -575,7 +547,8 @@ def select_chunk(
 
     Args:
         agent (torch.nn.Module): 已加载 checkpoint 的 `MACAgent`。
-        state_tracker (torch.nn.Module): 与训练配置一致的 StateTrackerAvg。
+        initial_states (torch.Tensor): 与环境内部用户 ID 对齐的初始状态表。
+        user_id (int): 环境内部用户编号。
         history_items (Sequence[int]): 当前物品历史。
         history_rewards (Sequence[float]): 当前奖励历史。
         num_samples_test (int): rejection sampling 候选数。
@@ -597,7 +570,9 @@ def select_chunk(
     if num_samples_test <= 0:
         raise ValueError("num_samples_test must be positive.")
     state = build_state_from_history(
-        state_tracker=state_tracker,
+        agent=agent,
+        initial_states=initial_states,
+        user_id=user_id,
         history_items=history_items,
         history_rewards=history_rewards,
         device=device,
@@ -707,7 +682,7 @@ def _append_branch_records(
 def evaluate_checkpoint(
     args: argparse.Namespace,
     env: Any,
-    state_tracker: torch.nn.Module,
+    initial_states: torch.Tensor,
     agent: torch.nn.Module,
     chunk_size: int,
     device: torch.device,
@@ -717,7 +692,7 @@ def evaluate_checkpoint(
     Args:
         args (argparse.Namespace): 动机实验配置。
         env (Any): KuaiEnv 主轨迹环境。
-        state_tracker (torch.nn.Module): 共享 StateTrackerAvg。
+        initial_states (torch.Tensor): 共享的离线用户初始状态表。
         agent (torch.nn.Module): 当前 K 的 MAC agent。
         chunk_size (int): 当前规划长度 K。
         device (torch.device): 模型设备。
@@ -736,7 +711,6 @@ def evaluate_checkpoint(
 
     set_seed(args.seed)
     agent.eval()
-    state_tracker.eval()
     records: list[dict[str, Any]] = []
     for episode_id in range(args.eval_episodes):
         observation, _ = env.reset()
@@ -758,7 +732,8 @@ def evaluate_checkpoint(
             base_planning_rng = capture_torch_rng(device)
             base_chunk = select_chunk(
                 agent=agent,
-                state_tracker=state_tracker,
+                initial_states=initial_states,
+                user_id=user_id,
                 history_items=history_items,
                 history_rewards=history_rewards,
                 num_samples_test=args.num_samples_test,
@@ -768,7 +743,8 @@ def evaluate_checkpoint(
             )
             replayed_base_chunk = select_chunk(
                 agent=agent,
-                state_tracker=state_tracker,
+                initial_states=initial_states,
+                user_id=user_id,
                 history_items=history_items,
                 history_rewards=history_rewards,
                 num_samples_test=args.num_samples_test,
@@ -800,7 +776,8 @@ def evaluate_checkpoint(
 
                         return select_chunk(
                             agent=agent,
-                            state_tracker=state_tracker,
+                            initial_states=initial_states,
+                            user_id=user_id,
                             history_items=items,
                             history_rewards=rewards,
                             num_samples_test=args.num_samples_test,
@@ -831,7 +808,8 @@ def evaluate_checkpoint(
                         )
                         return select_chunk(
                             agent=agent,
-                            state_tracker=state_tracker,
+                            initial_states=initial_states,
+                            user_id=user_id,
                             history_items=items,
                             history_rewards=rewards,
                             num_samples_test=args.num_samples_test,
@@ -943,13 +921,8 @@ def main(argv: Optional[list[str]] = None) -> Path:
         output_dir,
     )
     env, _, _ = build_env_assets(args)
-    item_embeddings = load_item_embeddings(args.item_embedding_path)
-    action_mapper = ActionMapper(item_embeddings=item_embeddings, device=device)
-    state_tracker = build_dorl_mac_state_tracker(
-        args=args,
-        env=env,
-        device=device,
-    )
+    offline_dataset, action_mapper, _ = build_dataset_and_mapper(args, device=device)
+    initial_states = build_initial_state_table(offline_dataset, env, device)
 
     all_records: list[dict[str, Any]] = []
     for chunk_size, checkpoint_path in checkpoint_paths.items():
@@ -964,6 +937,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
             agent_args,
             device=device,
             action_mapper=action_mapper,
+            state_dim=offline_dataset.state_dim,
         )
         agent.load_checkpoint_state(checkpoint, strict=True)
         agent.eval()
@@ -976,7 +950,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
             evaluate_checkpoint(
                 args=args,
                 env=env,
-                state_tracker=state_tracker,
+                initial_states=initial_states,
                 agent=agent,
                 chunk_size=chunk_size,
                 device=device,

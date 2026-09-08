@@ -20,12 +20,11 @@ from examples.our_model.runners.common import (
     build_reward_and_leave,
     resolve_common_paths,
 )
-from examples.our_model.runners.evaluation_utils import load_avg_embedding_provider
 from src.core.envs.KuaiRand_Pure.KuaiRandData import KuaiRandData
 
 
 class DORLMACKuaiRandCompatTest(unittest.TestCase):
-    """验证环境级路径分发、原始 ID 映射和 avg tracker embedding 加载。"""
+    """验证环境级路径分发以及原始 ID 映射。"""
 
     def test_resolve_common_paths_selects_dataset_from_env(self) -> None:
         """未显式传路径时，应根据环境选择对应的轨迹和模型资产。"""
@@ -38,14 +37,12 @@ class DORLMACKuaiRandCompatTest(unittest.TestCase):
                     read_message="pointneg",
                     dataset_path="",
                     item_embedding_path="",
-                    user_embedding_path="",
                     predicted_mat_path="",
                     maxvar_mat_path="",
                 )
                 resolve_common_paths(args)
                 self.assertEqual(args.dataset_path, dataset_path)
                 self.assertIn(f"saved_models/{env_name}/DeepFM", args.item_embedding_path)
-                self.assertTrue(args.user_embedding_path.endswith("_emb_user_val_M0.pt"))
                 self.assertTrue(args.predicted_mat_path.endswith("_matPre.pickle"))
                 self.assertTrue(args.maxvar_mat_path.endswith("_matVar.pickle"))
 
@@ -93,29 +90,6 @@ class DORLMACKuaiRandCompatTest(unittest.TestCase):
         self.assertEqual(reward_kwargs["raw_user_to_index"], {0: 0, 1: 1})
         self.assertEqual(reward_kwargs["internal_to_raw_item_ids"], [0, 1, 2])
         self.assertEqual(leave_model.list_feat_small, env.list_feat)
-
-    def test_avg_embedding_provider_validates_kuairand_shape(self) -> None:
-        """StateTrackerAvg 应只依赖与环境尺寸一致的 user/item embedding。"""
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            user_path = root / "users.pt"
-            item_path = root / "items.pt"
-            torch.save(torch.ones(2, 4), user_path)
-            torch.save(torch.ones(3, 5), item_path)
-            args = SimpleNamespace(
-                user_embedding_path=str(user_path),
-                item_embedding_path=str(item_path),
-            )
-            env = SimpleNamespace(mat=np.zeros((2, 3), dtype=np.float32))
-
-            provider = load_avg_embedding_provider(args=args, env=env)
-            embeddings = provider.load_val_user_item_embedding()
-
-        self.assertEqual(tuple(embeddings["feat_user"].weight.shape), (2, 4))
-        self.assertEqual(tuple(embeddings["feat_item"].weight.shape), (3, 5))
-        self.assertFalse(embeddings["feat_user"].weight.requires_grad)
-        self.assertFalse(embeddings["feat_item"].weight.requires_grad)
 
     def test_negative_missing_category_does_not_collide(self) -> None:
         """KuaiRand 的 -1 缺失标签不能与最大正类别共享向量列。"""

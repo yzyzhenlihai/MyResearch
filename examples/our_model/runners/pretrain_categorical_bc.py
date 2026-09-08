@@ -87,6 +87,8 @@ def main(argv: Optional[list[str]] = None) -> Path:
     args = parser.parse_args(argv)
     if args.pretrain_steps <= 0:
         raise ValueError("pretrain_steps must be positive.")
+    if args.dynamics_pretrain_steps <= 0:
+        raise ValueError("dynamics_pretrain_steps must be positive for MAC_origin.")
     if args.batch_size <= 0:
         raise ValueError("batch_size must be positive.")
     resolve_common_paths(args)
@@ -96,7 +98,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
 
     save_dir = ensure_dir(
         args.save_dir
-        or Path(args.save_root) / args.env / "DORL_MAC" / DEFAULT_BC_SUBDIR
+        or Path(args.save_root) / args.env / "MAC_origin" / DEFAULT_BC_SUBDIR
     )
     config = namespace_to_dict(args)
     save_resolved_config(save_dir, config)
@@ -108,7 +110,12 @@ def main(argv: Optional[list[str]] = None) -> Path:
         num_workers=0,
         drop_last=False,
     )
-    agent = build_agent(args, device=device, action_mapper=action_mapper)
+    agent = build_agent(
+        args,
+        device=device,
+        action_mapper=action_mapper,
+        state_dim=dataset.state_dim,
+    )
     optimizer = torch.optim.Adam(agent.actor_parameters(), lr=args.actor_lr)
     logger = SwanLabLogger(
         project=args.swanlab_project,
@@ -116,6 +123,15 @@ def main(argv: Optional[list[str]] = None) -> Path:
         config=config,
         log_path=str(save_dir / "metrics.jsonl"),
     )
+
+    dynamics_optimizer = torch.optim.Adam(agent.dynamics.parameters(), lr=args.dynamics_lr)
+    batch_iterator = cycle_dataloader(dataloader)
+    LOGGER.info("开始直接 chunk dynamics 预训练：steps=%s", args.dynamics_pretrain_steps)
+    for dynamics_step in range(1, args.dynamics_pretrain_steps + 1):
+        metrics = agent.dynamics_update(next(batch_iterator), dynamics_optimizer)
+        if dynamics_step == 1 or dynamics_step % args.log_interval == 0 or dynamics_step == args.dynamics_pretrain_steps:
+            logger.log(metrics, step=dynamics_step)
+            LOGGER.info("dynamics step=%s metrics=%s", dynamics_step, metrics)
 
     LOGGER.info("开始 DORL-MAC categorical BC 预训练：steps=%s", args.pretrain_steps)
     batch_iterator = cycle_dataloader(dataloader)
@@ -127,7 +143,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
             optimizer=optimizer,
         )
         if step == 1 or step % args.log_interval == 0 or step == args.pretrain_steps:
-            logger.log(last_metrics, step=step)
+            logger.log(last_metrics, step=args.dynamics_pretrain_steps + step)
             LOGGER.info("pretrain step=%s metrics=%s", step, last_metrics)
 
     checkpoint_path = save_dir / "latest.pt"
@@ -141,7 +157,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
         }
     )
     torch.save(agent.checkpoint_state(checkpoint_config), checkpoint_path)
-    logger.log({"artifact/latest_checkpoint": str(checkpoint_path)}, step=args.pretrain_steps)
+    logger.log({"artifact/latest_checkpoint": str(checkpoint_path)}, step=args.dynamics_pretrain_steps + args.pretrain_steps)
     logger.finish()
     LOGGER.info("actor 预训练完成，checkpoint=%s", checkpoint_path)
     return checkpoint_path

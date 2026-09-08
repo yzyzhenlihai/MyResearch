@@ -157,9 +157,9 @@ class HorizonResolutionTest(unittest.TestCase):
                 ) as build_env_assets,
                 mock.patch.object(
                     eval_module,
-                    "load_item_embeddings",
-                    return_value=torch.zeros(4, 3),
-                ) as load_item_embeddings,
+                    "build_dataset_and_mapper",
+                    return_value=(argparse.Namespace(state_dim=2), object(), torch.zeros(4, 3)),
+                ) as build_dataset_and_mapper,
                 mock.patch.object(
                     eval_module,
                     "build_reward_and_leave",
@@ -173,13 +173,19 @@ class HorizonResolutionTest(unittest.TestCase):
                 mock.patch.object(
                     eval_module.torch,
                     "load",
-                    return_value={"checkpoint": True},
+                    return_value={"format": "mac_origin_precomputed_state_v2", "config": {
+                        "chunk_size": 3, "window_size": 3, "gamma": 0.9,
+                        "actor_hidden_dims": [8], "value_hidden_dims": [8],
+                        "dynamics_hidden_dims": [8],
+                        "state_representation": "precomputed_avg_observation_v1",
+                        "state_dim": 2,
+                    }},
                 ) as load_checkpoint,
                 mock.patch.object(
                     eval_module,
-                    "build_dorl_mac_state_tracker",
-                    return_value=torch.nn.Identity(),
-                ) as build_state_tracker,
+                    "build_initial_state_table",
+                    return_value=torch.zeros((2, 2)),
+                ) as build_initial_state_table,
                 mock.patch.object(
                     eval_module,
                     "evaluate_one_horizon",
@@ -209,11 +215,11 @@ class HorizonResolutionTest(unittest.TestCase):
 
             self.assertEqual(result_path, output_path)
             build_env_assets.assert_called_once()
-            load_item_embeddings.assert_called_once()
+            build_dataset_and_mapper.assert_called_once()
             build_reward_and_leave.assert_called_once()
             build_agent.assert_called_once()
             load_checkpoint.assert_called_once()
-            build_state_tracker.assert_called_once()
+            build_initial_state_table.assert_called_once()
             self.assertEqual(evaluate_one_horizon.call_count, 3)
             evaluated_horizons = [
                 call.kwargs["execution_horizon"]

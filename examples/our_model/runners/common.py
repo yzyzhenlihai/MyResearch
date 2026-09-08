@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -29,11 +30,13 @@ from src.core.util.entropy_penalty import (  # noqa: E402
     finalize_entropy_map,
 )
 
-from examples.our_model.data import ActionChunkDataset, TrajectoryLoader  # noqa: E402
+from examples.our_model.data import ObservedChunkDataset, TrajectoryLoader  # noqa: E402
 import examples.our_model.models.mac_agent as mac_agent_module  # noqa: E402
 from examples.our_model.models.dorl_reward import DORLRewardModel  # noqa: E402
 from examples.our_model.models.leave_model import RuleBasedLeaveModel  # noqa: E402
-from examples.our_model.models.state_tracker_dynamics import StateTrackerDynamics  # noqa: E402
+from examples.our_model.models.chunk_dynamics import (  # noqa: E402
+    ChunkDynamics, DEFAULT_DYNAMICS_HIDDEN_DIMS,
+)
 from examples.our_model.policy import ActionMapper  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -55,6 +58,9 @@ DEFAULT_ACTOR_HIDDEN_DIMS = (256, 256)
 
 DEFAULT_VALUE_HIDDEN_DIMS = (256, 256)
 """MVP critic/value 默认隐藏层维度。"""
+
+STATE_REPRESENTATION = "precomputed_avg_observation_v1"
+"""直接使用离线 pkl 既有 observation 的状态契约。"""
 
 
 def configure_logging() -> None:
@@ -169,28 +175,6 @@ def default_item_embedding_path(env: str, user_model_name: str, read_message: st
     )
 
 
-def default_user_embedding_path(env: str, user_model_name: str, read_message: str) -> str:
-    """构造默认 user embedding 路径。
-
-    Args:
-        env (str): 环境名。
-        user_model_name (str): user model 名称。
-        read_message (str): user model 训练标识。
-
-    Returns:
-        str: user embedding 路径。
-    """
-
-    return str(
-        PROJECT_ROOT
-        / "saved_models"
-        / env
-        / user_model_name
-        / "embeddings"
-        / f"[{read_message}]_emb_user_val_M0.pt"
-    )
-
-
 def default_dataset_path(env: str) -> str:
     """返回指定快手环境的默认离线轨迹路径。
 
@@ -300,7 +284,13 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default="",
         help="离线轨迹路径；为空时根据 --env 自动选择 KuaiRec 或 KuaiRand 数据。",
     )
-    parser.add_argument("--which_tracker", type=str, default="avg")
+    parser.add_argument("--which_tracker", type=str, default="none", choices=["none"],
+                        help="MAC_origin 不使用 DORL StateTracker。")
+    parser.add_argument("--dynamics_hidden_dims", type=int, nargs="+",
+                        default=list(DEFAULT_DYNAMICS_HIDDEN_DIMS))
+    parser.add_argument("--dynamics_pretrain_steps", type=int, default=10000)
+    parser.add_argument("--dynamics_lr", type=float, default=3e-4)
+    parser.set_defaults(state_representation=STATE_REPRESENTATION)
     parser.add_argument("--reward_handle", type=str, default="cat")
     parser.add_argument("--window_size", type=int, default=3)
     parser.add_argument("--chunk_size", type=int, default=3)
@@ -347,7 +337,6 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument("--random_init", action="store_true", default=False)
     parser.add_argument("--item_embedding_path", type=str, default="")
-    parser.add_argument("--user_embedding_path", type=str, default="")
     parser.add_argument("--predicted_mat_path", type=str, default="")
     parser.add_argument(
         "--predicted_mat_normalize",
@@ -430,12 +419,6 @@ def resolve_common_paths(args: argparse.Namespace) -> None:
             args.user_model_name,
             args.read_message,
         )
-    if not args.user_embedding_path:
-        args.user_embedding_path = default_user_embedding_path(
-            args.env,
-            args.user_model_name,
-            args.read_message,
-        )
     if not args.predicted_mat_path:
         args.predicted_mat_path = default_predicted_mat_path(
             args.env,
@@ -450,10 +433,35 @@ def resolve_common_paths(args: argparse.Namespace) -> None:
         )
 
 
+def apply_checkpoint_model_config(args: argparse.Namespace, checkpoint: Dict[str, Any]) -> None:
+    """从新格式 checkpoint 恢复模型结构，避免评估误用 CLI 默认维度。
+
+    Args:
+        args (argparse.Namespace): 将原地更新的 runner 配置。
+        checkpoint (Dict[str, Any]): MAC_origin checkpoint。
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: checkpoint 为旧 StateTracker 格式时抛出。
+    """
+    if checkpoint.get("format") != "mac_origin_precomputed_state_v2":
+        raise ValueError("Old StateTracker checkpoints are incompatible; retrain MAC_origin.")
+    config = checkpoint["config"]
+    for key in ("chunk_size", "window_size", "gamma", "actor_hidden_dims",
+                "value_hidden_dims", "dynamics_hidden_dims", "state_representation",
+                "state_dim"):
+        if key not in config:
+            raise ValueError(f"Checkpoint missing model configuration: {key}")
+        setattr(args, key, config[key])
+    LOGGER.info("已恢复 checkpoint 模型结构：K=%s, W=%s", args.chunk_size, args.window_size)
+
+
 def build_dataset_and_mapper(
     args: argparse.Namespace,
     device: torch.device,
-) -> Tuple[ActionChunkDataset, ActionMapper, torch.Tensor]:
+) -> Tuple[ObservedChunkDataset, ActionMapper, torch.Tensor]:
     """构造 action chunk 数据集和 action mapper。
 
     Args:
@@ -461,13 +469,15 @@ def build_dataset_and_mapper(
         device (torch.device): 计算设备。
 
     Returns:
-        Tuple[ActionChunkDataset, ActionMapper, torch.Tensor]: 数据集、映射器和 item embedding。
+        Tuple[ObservedChunkDataset, ActionMapper, torch.Tensor]: 数据集、映射器和 item embedding。
     """
 
     item_embeddings = load_item_embeddings(args.item_embedding_path)
-    bundle = TrajectoryLoader(args.dataset_path).load(max_trajectories=args.max_trajectories)
+    bundle = TrajectoryLoader(args.dataset_path).load(
+        max_trajectories=args.max_trajectories, require_observations=True,
+    )
     entropy_history_size = max([args.num_leave_compute, args.max_turn] + list(args.entropy_window or [0]))
-    dataset = ActionChunkDataset(
+    dataset = ObservedChunkDataset(
         bundle=bundle,
         item_embeddings=item_embeddings,
         chunk_size=args.chunk_size,
@@ -649,6 +659,7 @@ def build_agent(
     args: argparse.Namespace,
     device: torch.device,
     action_mapper: ActionMapper,
+    state_dim: int,
     reward_model: DORLRewardModel | None = None,
     leave_model: RuleBasedLeaveModel | None = None,
 ) -> mac_agent_module.MACAgent:
@@ -658,6 +669,7 @@ def build_agent(
         args (argparse.Namespace): 命令行参数。
         device (torch.device): 计算设备。
         action_mapper (ActionMapper): action mapper。
+        state_dim (int): pkl observation 的状态维度。
         reward_model (DORLRewardModel | None): reward 模型，可为空。
         leave_model (RuleBasedLeaveModel | None): leave 模型，可为空。
 
@@ -665,13 +677,15 @@ def build_agent(
         mac_agent_module.MACAgent: 初始化后的 agent。
     """
 
-    state_dim = action_mapper.action_dim + 1
-    dynamics = StateTrackerDynamics(
-        window_size=args.window_size,
-        action_dim=action_mapper.action_dim,
+    if state_dim <= 0:
+        raise ValueError("state_dim must be positive.")
+    dynamics = ChunkDynamics(
         state_dim=state_dim,
+        action_dim=action_mapper.action_dim,
+        chunk_size=args.chunk_size,
+        hidden_dims=parse_hidden_dims(args.dynamics_hidden_dims),
     )
-    return mac_agent_module.MACAgent(
+    agent = mac_agent_module.MACAgent(
         state_dim=state_dim,
         action_dim=action_mapper.action_dim,
         chunk_size=args.chunk_size,
@@ -687,6 +701,15 @@ def build_agent(
         invalid_action_penalty=getattr(args, "invalid_action_penalty", -1.0),
         dynamics_loss_weight=getattr(args, "dynamics_loss_weight", 1.0),
     )
+    # 固定观测契约写入 checkpoint，避免误加载上一版重构状态的参数。
+    agent.observation_spec = {
+        "representation": STATE_REPRESENTATION,
+        "state_dim": state_dim,
+        "action_item_sha256": hashlib.sha256(
+            action_mapper.item_embeddings.detach().cpu().numpy().tobytes(),
+        ).hexdigest(),
+    }
+    return agent
 
 
 def ensure_dir(path: str | Path) -> Path:

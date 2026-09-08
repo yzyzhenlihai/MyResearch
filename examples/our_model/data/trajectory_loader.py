@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +42,7 @@ class TrajectoryBundle:
     num_users: int
     num_transitions: int
     dataset_path: str
+    initial_observations_by_user: Dict[int, np.ndarray] = field(default_factory=dict)
 
 
 class TrajectoryLoader:
@@ -65,12 +66,17 @@ class TrajectoryLoader:
         if not self.dataset_path.exists():
             raise FileNotFoundError(f"Trajectory dataset does not exist: {self.dataset_path}")
 
-    def load(self, max_trajectories: Optional[int] = None) -> TrajectoryBundle:
+    def load(
+        self, max_trajectories: Optional[int] = None,
+        require_observations: bool = True,
+    ) -> TrajectoryBundle:
         """读取轨迹 pkl 并返回校验后的数据包。
 
         Args:
             max_trajectories (Optional[int]): 仅保留前若干条用户轨迹，主要用于
                 smoke test；为 `None` 时读取全部轨迹。
+            require_observations (bool): 是否要求并校验离线数据中的
+                `observations` 与 `next_observations`。MAC_origin 训练必须为 True。
 
         Returns:
             TrajectoryBundle: 包含轨迹列表和基础统计信息的数据包。
@@ -87,6 +93,16 @@ class TrajectoryLoader:
             raise ValueError(
                 f"Trajectory dataset must be list[dict], got {type(trajectories).__name__}."
             )
+        all_initial_observations = {
+            int(trajectory["user_id"]): np.asarray(
+                trajectory["observations"], dtype=np.float32,
+            )[0].copy()
+            for trajectory in trajectories
+            if "user_id" in trajectory
+            and "observations" in trajectory
+            and len(trajectory["observations"]) > 0
+        } if require_observations else {}
+
         if max_trajectories is not None:
             if max_trajectories <= 0:
                 raise ValueError("max_trajectories must be positive when provided.")
@@ -99,10 +115,15 @@ class TrajectoryLoader:
         num_transitions = 0
 
         for trajectory_index, trajectory in enumerate(trajectories):
-            self._validate_trajectory_keys(trajectory_index, trajectory)
-            observations = np.asarray(trajectory["observations"])
+            self._validate_trajectory_keys(trajectory_index, trajectory, require_observations)
             actions = np.asarray(trajectory["actions"])
-            next_observations = np.asarray(trajectory["next_observations"])
+            if require_observations:
+                observations = np.asarray(trajectory["observations"])
+                next_observations = np.asarray(trajectory["next_observations"])
+            else:
+                # 零列矩阵仅用于共享长度校验；不从旧 tracker 状态读取任何值。
+                observations = np.empty((len(actions), 0), dtype=np.float32)
+                next_observations = observations
             rewards = np.asarray(trajectory["rewards"])
             terminals = np.asarray(trajectory["terminals"])
 
@@ -142,15 +163,20 @@ class TrajectoryLoader:
             num_users=len(trajectories),
             num_transitions=num_transitions,
             dataset_path=str(self.dataset_path),
+            initial_observations_by_user=all_initial_observations,
         )
 
     @staticmethod
-    def _validate_trajectory_keys(trajectory_index: int, trajectory: Dict[str, Any]) -> None:
+    def _validate_trajectory_keys(
+        trajectory_index: int, trajectory: Dict[str, Any],
+        require_observations: bool = True,
+    ) -> None:
         """检查单条轨迹字段完整性。
 
         Args:
             trajectory_index (int): 当前轨迹在列表中的下标。
             trajectory (Dict[str, Any]): 单条用户轨迹。
+            require_observations (bool): 是否要求旧 observations 字段。
 
         Returns:
             None.
@@ -159,7 +185,10 @@ class TrajectoryLoader:
             KeyError: 当轨迹缺少必需字段时抛出。
         """
 
-        missing_keys = sorted(set(REQUIRED_TRAJECTORY_KEYS).difference(trajectory.keys()))
+        required = set(REQUIRED_TRAJECTORY_KEYS)
+        if not require_observations:
+            required -= {"observations", "next_observations"}
+        missing_keys = sorted(required.difference(trajectory.keys()))
         if missing_keys:
             raise KeyError(f"Trajectory #{trajectory_index} missing keys: {missing_keys}.")
 

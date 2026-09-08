@@ -13,7 +13,7 @@ PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/pytho
   --user_model_name DeepFM \
   --read_message pointneg \
   --dataset_path data/KuaiRec/data_processed/DM_KuaiEnv-v0_small_data.pkl \
-  --which_tracker avg \
+  --which_tracker none \
   --reward_handle cat \
   --window_size 3 \
   --chunk_size 3 \
@@ -24,7 +24,9 @@ PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/pytho
   --batch_size 4 \
   --max_trajectories 4 \
   --max_chunks 64 \
+  --dynamics_pretrain_steps 2 \
   --pretrain_steps 2 \
+  --rollout_depth 3 \
   --epoch 2 \
   --step-per-epoch 1 \
   --test-num 1 \
@@ -32,5 +34,7 @@ PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/pytho
   --num_samples_test 2 \
   --max_turn 5 \
   --force_length 5 \
+  --no_entropy_reward \
+  --no_uncertainty_penalty \
   --swanlab_project DORL-MAC \
   --run_name dorl-mac

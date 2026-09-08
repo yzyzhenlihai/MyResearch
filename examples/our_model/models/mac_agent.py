@@ -14,7 +14,7 @@ from examples.our_model.models.chunk_actor import CategoricalChunkActor
 from examples.our_model.models.chunk_value import ChunkCritic, ChunkValue
 from examples.our_model.models.dorl_reward import DORLRewardModel
 from examples.our_model.models.leave_model import RuleBasedLeaveModel
-from examples.our_model.models.state_tracker_dynamics import StateTrackerDynamics
+from examples.our_model.models.chunk_dynamics import ChunkDynamics
 from examples.our_model.policy.action_mapper import ActionMapper
 
 REPEAT_POLICY_TRUNCATE = "truncate"
@@ -71,24 +71,17 @@ class RolloutResult:
 
 @dataclass
 class RolloutHistoryState:
-    """多步 imagined rollout 在 chunk 之间传递的显式历史缓存。
-
-    该结构只携带"已观测/已执行的 item 序列与 reward"等历史信息，不携带
-    dynamics 自身预测的 state 向量。每执行一个 chunk 后，把映射出的真实 item
-    追加进历史窗口并重新交给 StateTrackerDynamics 重算状态，从而保持"重算范式"
-    而非"自回归预测范式"，避免 dynamics 误差沿 rollout 深度累积。
+    """在块边界传递预测状态，并独立维护奖励与退出规则的离散记录。
 
     Attributes:
-        history_vectors (torch.Tensor): StateTrackerAvg 历史向量，形状 `(B, W, state_dim)`。
-        history_valid (torch.Tensor): 历史有效标记，形状 `(B, W)`。
+        states (torch.Tensor): 当前边界状态，后续块直接使用 dynamics 输出。
         leave_history (torch.Tensor): KuaiEnv leave 判断的 item 历史，形状 `(B, H_leave)`。
         recommended_mask (torch.Tensor): 已推荐 item mask，形状 `(B, num_items)`。
         env_step (torch.Tensor): 当前 episode 内已实际执行的底层 action 数，形状 `(B,)`。
         terminated (torch.Tensor): 该 episode 是否已终止，形状 `(B,)`。
     """
 
-    history_vectors: torch.Tensor
-    history_valid: torch.Tensor
+    states: torch.Tensor
     leave_history: torch.Tensor
     recommended_mask: torch.Tensor
     env_step: torch.Tensor
@@ -136,8 +129,8 @@ class TrajectoryRollout:
 class MACAgent(nn.Module):
     """PyTorch 版 DORL-MAC 最小闭环 agent（离散 Categorical + rejection sampling）。
 
-    该 agent 管理 chunk actor（离散 Categorical BC）、critic/value、显式
-    StateTracker dynamics、DORL reward model、leave model。整个流水线中动作始终
+    该 agent 管理 chunk actor（离散 Categorical BC）、critic/value、直接
+    chunk dynamics、DORL reward model、leave model。整个流水线中动作始终
     以「离散 item id」为一等公民：actor 直接在 N 个 item 上输出 categorical
     分布，rejection sampling 阶段从每步分布采 N_samples 组 item id 序列，通过
     item embedding 表查表拼出 chunk 向量后交给 critic 打分，选出 Q 最高的一组
@@ -155,7 +148,7 @@ class MACAgent(nn.Module):
         gamma: float,
         device: torch.device,
         action_mapper: ActionMapper,
-        dynamics: Optional[StateTrackerDynamics] = None,
+        dynamics: Optional[ChunkDynamics] = None,
         reward_model: Optional[DORLRewardModel] = None,
         leave_model: Optional[RuleBasedLeaveModel] = None,
         target_tau: float = 0.005,
@@ -174,7 +167,7 @@ class MACAgent(nn.Module):
             device (torch.device): 计算设备。
             action_mapper (ActionMapper): 持有 item embedding 表，供离散 item id
                 查表拼 chunk 向量使用（不再执行"连续→离散"的相似度映射）。
-            dynamics (Optional[StateTrackerDynamics]): 显式 StateTracker dynamics。
+            dynamics (Optional[ChunkDynamics]): 直接多步状态预测网络。
             reward_model (Optional[DORLRewardModel]): DORL reward 模型。
             leave_model (Optional[RuleBasedLeaveModel]): 规则退出模型。
             target_tau (float): target value 软更新系数。
@@ -277,10 +270,11 @@ class MACAgent(nn.Module):
         logits = self.actor(states)  # (B, K, N)
         log_probs_all = torch.log_softmax(logits, dim=-1)
         gathered = log_probs_all.gather(-1, chunk_item_ids.unsqueeze(-1)).squeeze(-1)  # (B, K)
-        bc_loss = -gathered.mean()
+        valid = batch.get("chunk_valid", torch.ones_like(chunk_item_ids)).to(self.device).bool()
+        bc_loss = -gathered[valid].mean()
         # 诊断：每步分布熵，用来观察 BC 是否过早坍缩到少量 item。
         probs = torch.softmax(logits, dim=-1)
-        step_entropy = -(probs * log_probs_all).sum(dim=-1).mean()
+        step_entropy = -(probs * log_probs_all).sum(dim=-1)[valid].mean()
 
         bc_loss.backward()
         optimizer.step()
@@ -288,9 +282,9 @@ class MACAgent(nn.Module):
         return {
             "actor/loss": float(bc_loss.detach().cpu()),
             "actor/bc_loss": float(bc_loss.detach().cpu()),
-            "actor/log_prob": float(gathered.detach().mean().cpu()),
+            "actor/log_prob": float(gathered.detach()[valid].mean().cpu()),
             "actor/entropy": float(step_entropy.detach().cpu()),
-            "state_tracker/next_state_mse": dynamics_mse,
+            "dynamics/next_state_mse": dynamics_mse,
         }
 
     # ------------------------------------------------------------------
@@ -298,61 +292,78 @@ class MACAgent(nn.Module):
     # ------------------------------------------------------------------
     @torch.no_grad()
     def compute_dynamics_mse(self, batch: Dict[str, torch.Tensor]) -> float:
-        """用真实 chunk 校验显式 StateTracker dynamics。
+        """计算直接 chunk 状态预测误差。
 
         Args:
-            batch (Dict[str, torch.Tensor]): ActionChunkDataset 输出 batch。
+            batch (Dict[str, torch.Tensor]): 离线真实观测与动作块。
 
         Returns:
-            float: 重算 next state 与数据集中 target next state 的 MSE；
-            若未配置 dynamics，则返回 `0.0`。
+            float: 有效块末状态 MSE；无模型时为零。
         """
-
         if self.dynamics is None:
             return 0.0
-        target_next_states = self._batch_tensor(batch, "next_observations").float()
-        chunk_actions = self._batch_tensor(batch, "actions").float().view(
-            -1, self.chunk_size, self.action_dim
+        prediction = self.dynamics(
+            self._batch_tensor(batch, "observations").float(),
+            self._batch_tensor(batch, "actions").float().reshape(
+                -1, self.chunk_size, self.action_dim,
+            ),
+            self._batch_tensor(batch, "chunk_valid").bool(),
         )
-        chunk_rewards = self._batch_tensor(batch, "chunk_step_rewards").float()
-        chunk_valid = torch.ones_like(chunk_rewards, dtype=torch.bool)
-        next_states = self.dynamics.next_state(
-            self._batch_tensor(batch, "history_vectors").float(),
-            self._batch_tensor(batch, "history_valid").float(),
-            chunk_actions,
-            chunk_rewards,
-            chunk_valid,
-        )
-        return float(F.mse_loss(next_states, target_next_states).detach().cpu())
+        return float(F.mse_loss(
+            prediction, self._batch_tensor(batch, "next_observations").float(),
+        ).cpu())
 
     def supervised_dynamics_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """用离线真实 chunk 监督训练 StateTrackerDynamics。
+        """以真实前缀终点监督直接动力学，不把反馈传入预测网络。
 
         Args:
-            batch (Dict[str, torch.Tensor]): ActionChunkDataset 输出 batch。
+            batch (Dict[str, torch.Tensor]): 含各前缀终点及有效掩码的离线 batch。
 
         Returns:
-            torch.Tensor: next-state MSE loss；未配置 dynamics 时为 0。
+            torch.Tensor: 对有效前缀的平均 next-state MSE。
         """
-
-        if self.dynamics is None or self.dynamics_loss_weight <= 0:
+        if self.dynamics is None:
             return torch.zeros((), device=self.device)
-        target_next_states = self._batch_tensor(batch, "next_observations").float()
-        chunk_actions = self._batch_tensor(batch, "actions").float().view(
-            -1,
-            self.chunk_size,
-            self.action_dim,
+        states = self._batch_tensor(batch, "observations").float()
+        actions = self._batch_tensor(batch, "actions").float().reshape(
+            -1, self.chunk_size, self.action_dim,
         )
-        chunk_rewards = self._batch_tensor(batch, "chunk_step_rewards").float()
-        chunk_valid = torch.ones_like(chunk_rewards, dtype=torch.bool)
-        predicted_next_states = self.dynamics.next_state(
-            self._batch_tensor(batch, "history_vectors").float(),
-            self._batch_tensor(batch, "history_valid").float(),
-            chunk_actions,
-            chunk_rewards,
-            chunk_valid,
+        valid = self._batch_tensor(batch, "chunk_valid").bool()
+        targets = self._batch_tensor(batch, "prefix_next_observations").float()
+        # 一次向量化监督所有有效前缀，包含 K 步及退出时的短前缀。
+        positions = torch.arange(self.chunk_size, device=self.device)
+        prefix_mask = positions[None, :] <= positions[:, None]
+        masks = valid[:, None, :] & prefix_mask[None, :, :]
+        expanded_states = states[:, None, :].expand(-1, self.chunk_size, -1)
+        expanded_actions = actions[:, None, :, :].expand(-1, self.chunk_size, -1, -1)
+        prediction = self.dynamics(
+            expanded_states[valid], expanded_actions[valid], masks[valid],
         )
-        return F.mse_loss(predicted_next_states, target_next_states)
+        return F.mse_loss(prediction, targets[valid])
+
+    def dynamics_update(
+        self, batch: Dict[str, torch.Tensor], optimizer: torch.optim.Optimizer,
+    ) -> Dict[str, float]:
+        """在 imagined 学习前，仅用真实日志预训练 dynamics。
+
+        Args:
+            batch (Dict[str, torch.Tensor]): 离线监督 batch。
+            optimizer (torch.optim.Optimizer): 仅包含 dynamics 参数的优化器。
+
+        Returns:
+            Dict[str, float]: 实测训练损失。
+
+        Raises:
+            RuntimeError: 未配置直接动力学时抛出。
+        """
+        if self.dynamics is None:
+            raise RuntimeError("Dynamics pretraining requires ChunkDynamics.")
+        self.dynamics.train()
+        optimizer.zero_grad(set_to_none=True)
+        loss = self.supervised_dynamics_loss(batch)
+        loss.backward()
+        optimizer.step()
+        return {"dynamics/pretrain_loss": float(loss.detach().cpu())}
 
     # ------------------------------------------------------------------
     # Discrete rejection sampling helpers
@@ -628,7 +639,7 @@ class MACAgent(nn.Module):
         return {
             "critic/critic_loss": float(critic_loss.detach().cpu()),
             "value/value_loss": float(value_loss.detach().cpu()),
-            "state_tracker/dynamics_loss": float(dynamics_loss.detach().cpu()),
+            "dynamics/loss": float(dynamics_loss.detach().cpu()),
             "critic/q_mean": float(q_values.detach().mean().cpu()),
             "critic/target_q_mean": float(target_q.detach().mean().cpu()),
             "value/target_v_mean": float(target_v.detach().mean().cpu()),
@@ -695,12 +706,13 @@ class MACAgent(nn.Module):
         """
 
         return RolloutHistoryState(
-            history_vectors=self._batch_tensor(batch, "history_vectors").float().clone(),
-            history_valid=self._batch_tensor(batch, "history_valid").float().clone(),
+            states=self._batch_tensor(batch, "observations").float().clone(),
             leave_history=self._batch_tensor(batch, "leave_history_item_ids").long().clone(),
             recommended_mask=self._batch_tensor(batch, "recommended_mask").bool().clone(),
             env_step=self._batch_tensor(batch, "env_step").long().view(-1).clone(),
-            terminated=self._batch_tensor(batch, "terminals").float().view(-1) > 0,
+            terminated=batch.get(
+                "initial_terminals", torch.zeros(len(batch["observations"])),
+            ).to(device=self.device, dtype=torch.bool).reshape(-1),
         )
 
     def _prepare_rollout_sampling_mask(
@@ -941,12 +953,9 @@ class MACAgent(nn.Module):
         done_chunks = terminal_flags | leave_terminated | (
             rollout_start_steps + effective_steps >= self.leave_model.max_turn
         )
-        next_states = self.dynamics.next_state(
-            history_state.history_vectors,
-            history_state.history_valid,
-            executed_action_embeddings,
-            step_rewards,
-            chunk_valid,
+        # 直接预测块末状态；奖励只用于回报，不再参与状态重算。
+        next_states = self.dynamics(
+            history_state.states, executed_action_embeddings, chunk_valid,
         )
         repeat_ratio = leave_violation_events.float().mean()
         exact_repeat_ratio = exact_repeat_events.float().mean()
@@ -964,16 +973,8 @@ class MACAgent(nn.Module):
             repeat_ratio=repeat_ratio,
             exact_repeat_ratio=exact_repeat_ratio,
         )
-        next_history_vectors, next_history_valid = self._update_history_vectors(
-            history_state.history_vectors,
-            history_state.history_valid,
-            executed_action_embeddings,
-            step_rewards,
-            chunk_valid,
-        )
         next_history_state = RolloutHistoryState(
-            history_vectors=next_history_vectors,
-            history_valid=next_history_valid,
+            states=next_states,
             leave_history=leave_history,
             recommended_mask=recommended_mask,
             env_step=rollout_start_steps + effective_steps,
@@ -981,83 +982,6 @@ class MACAgent(nn.Module):
         )
         return result, next_history_state
 
-    def _update_history_vectors(
-        self,
-        history_vectors: torch.Tensor,
-        history_valid: torch.Tensor,
-        executed_action_embeddings: torch.Tensor,
-        step_rewards: torch.Tensor,
-        chunk_valid: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """把本 chunk 实际执行的 `(action_emb, reward)` 追加进 StateTracker 历史窗口。
-
-        该更新遵循"重算范式"：把真实映射出的 item 表征追加到历史序列尾部并保留最近
-        `window_size` 项，供下一个 chunk 的 `StateTrackerDynamics` 重新求平均，而不是
-        把 dynamics 自身预测的 state 向量喂回输入，因此多 chunk rollout 不累积 dynamics 误差。
-
-        Args:
-            history_vectors (torch.Tensor): 当前历史向量，形状 `(B, W, state_dim)`。
-            history_valid (torch.Tensor): 当前历史有效标记，形状 `(B, W)`。
-            executed_action_embeddings (torch.Tensor): 本 chunk 执行的 action embedding，
-                形状 `(B, K, action_dim)`；未执行位置为 0。
-            step_rewards (torch.Tensor): 本 chunk 每步 reward，形状 `(B, K)`。
-            chunk_valid (torch.Tensor): 每步是否实际执行，形状 `(B, K)`。
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: 更新后的 `(history_vectors, history_valid)`。
-        """
-
-        window_size = int(history_vectors.shape[1])
-        batch_size = int(history_vectors.shape[0])
-        chunk_vectors = torch.cat([executed_action_embeddings, step_rewards.unsqueeze(-1)], dim=-1)
-        history_valid_bool = history_valid.bool()
-        chunk_valid_bool = chunk_valid.bool()
-
-        combined_vectors = torch.cat([history_vectors, chunk_vectors], dim=1)  # (B, W+K, D)
-        combined_valid_bool = torch.cat([history_valid_bool, chunk_valid_bool], dim=1)  # (B, W+K)
-        combined_valid_f = combined_valid_bool.to(dtype=history_valid.dtype)
-        masked_vectors = combined_vectors * combined_valid_f.unsqueeze(-1)
-
-        # 用 reverse cumsum 标记"最近 window_size 个有效位置"。
-        valid_int = combined_valid_bool.to(torch.int64)
-        reverse_cum = torch.flip(torch.cumsum(torch.flip(valid_int, dims=[1]), dim=1), dims=[1])
-        recent_mask = (reverse_cum <= window_size) & combined_valid_bool  # (B, W+K)
-
-        # 每个 batch 的最近有效条数 <= window_size；把它们按顺序 pack 到长度 window_size
-        # 的输出末尾。做法：对 recent_mask 内每个 True 分配一个 rank（从左到右计数），
-        # 再算出每个 True 应该落到目标索引 window_size - total_count + rank。
-        total_count = recent_mask.sum(dim=1)  # (B,)
-        left_cum = torch.cumsum(recent_mask.to(torch.int64), dim=1)  # (B, W+K)
-        offsets = (window_size - total_count).unsqueeze(1)  # (B, 1)
-        target_pos = offsets + left_cum - 1  # (B, W+K)  仅 True 位置有意义
-        target_pos = torch.where(
-            recent_mask,
-            target_pos,
-            torch.full_like(target_pos, window_size),  # 无效位置指向哨兵槽
-        )
-
-        new_vectors_ext = torch.zeros(
-            batch_size,
-            window_size + 1,
-            combined_vectors.shape[-1],
-            dtype=combined_vectors.dtype,
-            device=combined_vectors.device,
-        )
-        new_valid_ext = torch.zeros(
-            batch_size,
-            window_size + 1,
-            dtype=history_valid.dtype,
-            device=history_valid.device,
-        )
-        idx_vec = target_pos.unsqueeze(-1).expand(-1, -1, combined_vectors.shape[-1])
-        new_vectors_ext.scatter_(1, idx_vec, masked_vectors)
-        new_valid_ext.scatter_(1, target_pos, recent_mask.to(dtype=history_valid.dtype))
-
-        updated_vectors = new_vectors_ext[:, :window_size, :].contiguous()
-        updated_valid = new_valid_ext[:, :window_size].contiguous()
-        return updated_vectors, updated_valid
-
-    @torch.no_grad()
     def rollout_trajectory(
         self,
         batch: Dict[str, torch.Tensor],
@@ -1069,8 +993,9 @@ class MACAgent(nn.Module):
         """在模型内想象出一条 H 个 chunk 的 rollout（MAC value expansion 用）。
 
         每个 chunk 边界都用 `select_chunks`（rejection sampling on discrete
-        item id）在行为分布内重新选择价值最高的 chunk，再用 `StateTrackerDynamics
-        + DORLRewardModel + RuleBasedLeaveModel` 执行该 chunk 并推进历史缓存。
+        item id）在行为分布内重新选择价值最高的 chunk，再用 `ChunkDynamics
+        + DORLRewardModel + RuleBasedLeaveModel` 执行该 chunk。预测状态递归传给下一块，
+        离散历史仅用于奖励与退出规则，不参与状态生成。
         全程不与真实环境交互，是 on-policy 的模型内 imagined rollout。
         `leave_policy=terminate` 时，某个 chunk 内触发退出会让该样本终止，
         后续 chunk 不再 roll（与 DORL 一致）。
@@ -1113,13 +1038,7 @@ class MACAgent(nn.Module):
                 active = ~history_state.terminated
                 candidate_mask = None
             # rollout_depth 通常很小（默认 1）；跳过 `.item()` 同步以让 GPU 流水连续。
-            states = self.dynamics.next_state(
-                history_state.history_vectors,
-                history_state.history_valid,
-                torch.zeros(batch_size, self.chunk_size, self.action_dim, device=self.device),
-                torch.zeros(batch_size, self.chunk_size, device=self.device),
-                torch.zeros(batch_size, self.chunk_size, dtype=torch.bool, device=self.device),
-            )
+            states = history_state.states
             selected_item_ids, selected_chunks = self.select_chunks(
                 states,
                 num_samples=num_samples,
@@ -1219,7 +1138,9 @@ class MACAgent(nn.Module):
         """
 
         return {
+            "format": "mac_origin_precomputed_state_v2",
             "config": dict(config),
+            "observation_spec": getattr(self, "observation_spec", None),
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "value": self.value.state_dict(),
@@ -1241,6 +1162,12 @@ class MACAgent(nn.Module):
             KeyError: 当 checkpoint 缺少必要字段时抛出。
         """
 
+        if checkpoint.get("format") != "mac_origin_precomputed_state_v2":
+            raise ValueError("Incompatible checkpoint: retrain MAC_origin observation and chunk dynamics models.")
+        if self.dynamics is not None and checkpoint.get("dynamics") is None:
+            raise ValueError("MAC_origin checkpoint is missing chunk dynamics weights.")
+        if getattr(self, "observation_spec", None) != checkpoint.get("observation_spec"):
+            raise ValueError("Observation format or embedding assets differ from checkpoint.")
         if "actor" not in checkpoint:
             raise KeyError("checkpoint missing key: actor")
         self.actor.load_state_dict(checkpoint["actor"], strict=strict)

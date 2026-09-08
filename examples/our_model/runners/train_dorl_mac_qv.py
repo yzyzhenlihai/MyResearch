@@ -21,6 +21,7 @@ from examples.our_model.models.mac_agent import REPEAT_POLICY_MASK, REPEAT_POLIC
 from examples.our_model.runners.common import (
     add_common_args,
     build_agent,
+    apply_checkpoint_model_config,
     build_dataset_and_mapper,
     build_env_assets,
     build_reward_and_leave,
@@ -33,7 +34,10 @@ from examples.our_model.runners.common import (
     save_resolved_config,
     set_seed,
 )
-from examples.our_model.runners.evaluation_utils import build_dorl_mac_evaluator
+from examples.our_model.runners.evaluation_utils import (
+    build_dorl_mac_evaluator,
+    build_initial_state_table,
+)
 from examples.our_model.runners.pretrain_categorical_bc import cycle_dataloader
 
 LOGGER = logging.getLogger(__name__)
@@ -279,7 +283,7 @@ class QVTrainingMetricCalibrator:
         for metric_key in (
             "critic/critic_loss",
             "value/value_loss",
-            "state_tracker/dynamics_loss",
+            "dynamics/loss",
             "rollout/entropy",
             "rollout/uncertainty",
             "rollout/done_ratio",
@@ -529,7 +533,7 @@ class QVTrainingMetricCalibrator:
         return {
             "critic/critic_loss": self.loss_target,
             "value/value_loss": self.loss_target,
-            "state_tracker/dynamics_loss": 0.0,
+            "dynamics/loss": 0.0,
             "critic/q_mean": self.target_nx0_rew * 0.98,
             "critic/target_q_mean": self.target_nx0_rew,
             "rollout/reward_chunk": target_reward_chunk,
@@ -589,8 +593,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=4,
-        help="DataLoader 并行 worker 数；0 表示主线程串行。默认 4。",
+        default=0,
+        help=(
+            "DataLoader 并行 worker 数；0 表示主线程串行。默认 0，"
+            "避免受限容器无法创建 PyTorch tensor 共享 socket。"
+        ),
     )
     parser.add_argument(
         "--enable_step_profiler",
@@ -691,13 +698,15 @@ def main(argv: Optional[list[str]] = None) -> Path:
     if effective_eval_episodes <= 0:
         raise ValueError("test_num must be positive when eval_episodes is 0.")
 
+    checkpoint = torch.load(bc_actor_ckpt, map_location="cpu")
+    apply_checkpoint_model_config(args, checkpoint)
     resolve_common_paths(args)
     set_seed(args.seed)
     device = resolve_device(args.device)
     args.device = str(device)
     save_dir = ensure_dir(
         args.save_dir
-        or Path(args.save_root) / args.env / "DORL_MAC" / "mac_agent"
+        or Path(args.save_root) / args.env / "MAC_origin" / "mac_agent"
     )
     metrics_log_path = build_timestamped_metrics_path(save_dir)
     args.metrics_log_path = str(metrics_log_path)
@@ -716,11 +725,12 @@ def main(argv: Optional[list[str]] = None) -> Path:
         args,
         device=device,
         action_mapper=action_mapper,
+        state_dim=dataset.state_dim,
         reward_model=reward_model,
         leave_model=leave_model,
     )
-    checkpoint = torch.load(bc_actor_ckpt, map_location=device)
-    agent.load_checkpoint_state(checkpoint, strict=False)
+    agent.load_checkpoint_state(checkpoint, strict=True)
+    initial_states = build_initial_state_table(dataset, env, device)
     eval_save_dir = ensure_dir(args.eval_save_dir or save_dir / "eval_during_train")
     periodic_evaluator = build_dorl_mac_evaluator(
         args=args,
@@ -729,6 +739,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
         kwargs_um=kwargs_um,
         agent=agent,
         action_mapper=action_mapper,
+        initial_states=initial_states,
         device=device,
         num_samples_test=args.num_samples_test,
         execution_horizon=args.execution_horizon,

@@ -20,12 +20,13 @@ from examples.our_model.policy import ActionMapper
 from examples.our_model.runners.common import (
     add_common_args,
     build_agent,
+    apply_checkpoint_model_config,
+    build_dataset_and_mapper,
     build_env_assets,
     build_reward_and_leave,
     configure_logging,
     default_run_name,
     ensure_dir,
-    load_item_embeddings,
     namespace_to_dict,
     resolve_common_paths,
     resolve_device,
@@ -35,7 +36,7 @@ from examples.our_model.runners.common import (
 )
 from examples.our_model.runners.evaluation_utils import (
     build_dorl_mac_evaluator,
-    build_dorl_mac_state_tracker,
+    build_initial_state_table,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "在同一 Python 进程中依次评估多个 H；数据集、user model、"
-            "StateTracker 和 checkpoint 只加载一次。设置后不能同时传入"
+            "离线初始状态和 checkpoint 只加载一次。设置后不能同时传入"
             "单值 --execution_horizon。"
         ),
     )
@@ -200,7 +201,7 @@ def evaluate_one_horizon(
     kwargs_um: dict[str, Any],
     agent: Any,
     action_mapper: ActionMapper,
-    state_tracker: torch.nn.Module,
+    initial_states: torch.Tensor,
     device: torch.device,
     eval_episodes: int,
 ) -> Path:
@@ -219,7 +220,7 @@ def evaluate_one_horizon(
         kwargs_um (dict[str, Any]): 测试环境构造参数。
         agent (Any): 已加载 checkpoint 的共享 MAC agent。
         action_mapper (ActionMapper): 共享动作映射器。
-        state_tracker (torch.nn.Module): 共享的评估 StateTracker。
+        initial_states (torch.Tensor): 共享的离线用户初始状态表。
         device (torch.device): 评估设备。
         eval_episodes (int): 当前 H 的评估 episode 数。
 
@@ -248,11 +249,11 @@ def evaluate_one_horizon(
         kwargs_um=kwargs_um,
         agent=agent,
         action_mapper=action_mapper,
+        initial_states=initial_states,
         num_samples_test=horizon_args.num_samples_test,
         execution_horizon=execution_horizon,
         completion_window=horizon_args.completion_window,
         enable_open_loop_diagnostics=horizon_args.enable_open_loop_diagnostics,
-        state_tracker=state_tracker,
         device=device,
         eval_episodes=eval_episodes,
         save_dir=save_dir,
@@ -321,11 +322,13 @@ def main(argv: Optional[list[str]] = None) -> Path:
     set_mpl_cache_to_tmp()
     parser = build_parser()
     args = parser.parse_args(argv)
-    execution_horizons = resolve_execution_horizons(args)
     is_multi_horizon = args.execution_horizons is not None
     mac_ckpt = Path(args.mac_ckpt)
     if not mac_ckpt.is_file():
         raise FileNotFoundError(f"mac_ckpt file does not exist: {mac_ckpt}")
+    checkpoint = torch.load(mac_ckpt, map_location="cpu")
+    apply_checkpoint_model_config(args, checkpoint)
+    execution_horizons = resolve_execution_horizons(args)
     effective_eval_episodes = resolve_eval_episodes(args)
 
     resolve_common_paths(args)
@@ -333,7 +336,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
     device = resolve_device(args.device)
     output_base = ensure_dir(
         args.eval_save_dir
-        or Path(args.save_root) / args.env / "DORL_MAC" / "eval"
+        or Path(args.save_root) / args.env / "MAC_origin" / "eval"
     )
 
     LOGGER.info(
@@ -344,8 +347,8 @@ def main(argv: Optional[list[str]] = None) -> Path:
         mac_ckpt,
     )
     env, env_dataset, kwargs_um = build_env_assets(args)
-    item_embeddings = load_item_embeddings(args.item_embedding_path)
-    action_mapper = ActionMapper(item_embeddings=item_embeddings, device=device)
+    offline_dataset, action_mapper, _ = build_dataset_and_mapper(args, device=device)
+    initial_states = build_initial_state_table(offline_dataset, env, device)
     reward_model, leave_model = build_reward_and_leave(
         args,
         env=env,
@@ -356,17 +359,12 @@ def main(argv: Optional[list[str]] = None) -> Path:
         args,
         device=device,
         action_mapper=action_mapper,
+        state_dim=offline_dataset.state_dim,
         reward_model=reward_model,
         leave_model=leave_model,
     )
-    checkpoint = torch.load(mac_ckpt, map_location=device)
-    agent.load_checkpoint_state(checkpoint, strict=False)
+    agent.load_checkpoint_state(checkpoint, strict=True)
     agent.eval()
-    state_tracker = build_dorl_mac_state_tracker(
-        args=args,
-        env=env,
-        device=device,
-    )
     LOGGER.info(
         "共享评估资产加载完成；后续 %d 个 H 不再重载数据集、模型或 checkpoint。",
         len(execution_horizons),
@@ -393,7 +391,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
                 kwargs_um=kwargs_um,
                 agent=agent,
                 action_mapper=action_mapper,
-                state_tracker=state_tracker,
+                initial_states=initial_states,
                 device=device,
                 eval_episodes=effective_eval_episodes,
             )

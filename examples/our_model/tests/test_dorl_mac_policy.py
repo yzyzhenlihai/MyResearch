@@ -6,6 +6,7 @@ import unittest
 from typing import Optional, Sequence
 
 import torch
+from src.tianshou.tianshou.data import Batch
 
 from examples.our_model.policy.dorl_mac_policy import (
     ADR_COMPARISON_CATEGORY_OVERLAP,
@@ -41,7 +42,10 @@ class FakeAgent:
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive.")
         self.chunk_size = int(chunk_size)
+        self.state_dim = 3
         self.select_call_count = 0
+        self.selected_states: list[torch.Tensor] = []
+        self.dynamics = PrefixLengthDynamics()
 
     def select_chunks(
         self,
@@ -61,6 +65,7 @@ class FakeAgent:
         """
 
         del num_samples, recommended_mask
+        self.selected_states.append(states.detach().clone())
         batch_size = int(states.shape[0])
         chunk_start = self.select_call_count * 10
         self.select_call_count += 1
@@ -91,6 +96,31 @@ class FakeActionMapper:
             raise ValueError("num_items must be positive.")
         self.num_items = int(num_items)
         self.action_dim = 1
+        self.item_embeddings = torch.arange(num_items, dtype=torch.float32).reshape(-1, 1)
+
+
+class PrefixLengthDynamics:
+    """按有效前缀长度递增状态的测试 dynamics。"""
+
+    def __call__(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """返回每行状态加有效动作数量的确定性结果。
+
+        Args:
+            states (torch.Tensor): 当前边界状态。
+            actions (torch.Tensor): 动作 embedding，测试中不读取数值。
+            valid (torch.Tensor): 有效动作前缀标记。
+
+        Returns:
+            torch.Tensor: 递推后的测试状态。
+        """
+
+        del actions
+        return states + valid.sum(dim=1, keepdim=True).to(states.dtype)
 
 
 def build_test_adapter(
@@ -122,7 +152,7 @@ def build_test_adapter(
         ]
     adapter = DORLMACPolicyAdapter(
         agent=agent,  # type: ignore[arg-type]
-        state_tracker=torch.nn.Identity(),
+        initial_states=torch.zeros((2, agent.state_dim)),
         action_mapper=FakeActionMapper(TEST_NUM_ITEMS),  # type: ignore[arg-type]
         num_samples_test=4,
         device=torch.device("cpu"),
@@ -191,6 +221,31 @@ class DORLMACPolicyExecutionHorizonTest(unittest.TestCase):
             build_test_adapter(execution_horizon=0)
         with self.assertRaisesRegex(ValueError, "1 <= H <= chunk_size"):
             build_test_adapter(execution_horizon=TEST_CHUNK_SIZE + 1)
+
+    def test_collector_state_advances_only_through_chunk_dynamics(self) -> None:
+        """验证真实 Collector 以离线初态开始并在 H 边界提交 dynamics。"""
+
+        adapter, agent = build_test_adapter(execution_horizon=2)
+        start_batch = Batch(
+            obs=torch.tensor([[0, -1]]).numpy(),
+            is_start=torch.tensor([True]).numpy(),
+        )
+        continuing_batch = Batch(
+            obs=torch.tensor([[0, 0]]).numpy(),
+            is_start=torch.tensor([False]).numpy(),
+        )
+
+        outputs = [int(adapter(start_batch, buffer=None).act[0])]
+        outputs.append(int(adapter(continuing_batch, buffer=None).act[0]))
+        outputs.append(int(adapter(continuing_batch, buffer=None).act[0]))
+
+        self.assertEqual(outputs, [0, 1, 10])
+        torch.testing.assert_close(
+            agent.selected_states[0], torch.zeros((1, agent.state_dim)),
+        )
+        torch.testing.assert_close(
+            agent.selected_states[1], torch.full((1, agent.state_dim), 2.0),
+        )
 
     def test_adr_counts_cached_tail_disagreements(self) -> None:
         """验证类别无交集时 ADR 统计分歧、暴露和位置指标。"""

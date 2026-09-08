@@ -128,34 +128,22 @@ class ZeroDynamics(nn.Module):
         super().__init__()
         self.state_dim = int(state_dim)
 
-    def next_state(
-        self,
-        history_vectors: torch.Tensor,
-        history_valid: torch.Tensor,
-        chunk_actions: torch.Tensor,
-        chunk_rewards: torch.Tensor,
+    def forward(
+        self, states: torch.Tensor, chunk_actions: torch.Tensor,
         chunk_valid: torch.Tensor,
     ) -> torch.Tensor:
-        """按 batch 大小返回零状态。
+        """按当前状态的 batch 大小返回零预测。
 
         Args:
-            history_vectors (torch.Tensor): 历史向量，形状为 `(B, W, state_dim)`。
-            history_valid (torch.Tensor): 历史有效标记，未在测试逻辑中使用。
-            chunk_actions (torch.Tensor): chunk action embedding，未在测试逻辑中使用。
-            chunk_rewards (torch.Tensor): chunk 每步 reward，未在测试逻辑中使用。
-            chunk_valid (torch.Tensor): chunk 有效标记，未在测试逻辑中使用。
+            states (torch.Tensor): 当前块边界状态。
+            chunk_actions (torch.Tensor): 动作块，测试桩不使用。
+            chunk_valid (torch.Tensor): 有效前缀，测试桩不使用。
 
         Returns:
-            torch.Tensor: 零 next state，形状为 `(B, state_dim)`。
+            torch.Tensor: 与状态同形状的零预测。
         """
-
-        del history_valid, chunk_actions, chunk_rewards, chunk_valid
-        return torch.zeros(
-            int(history_vectors.shape[0]),
-            self.state_dim,
-            dtype=history_vectors.dtype,
-            device=history_vectors.device,
-        )
+        del chunk_actions, chunk_valid
+        return torch.zeros_like(states)
 
 
 class ZeroRewardModel:
@@ -226,8 +214,7 @@ def build_rollout_history_state(
     """
 
     return RolloutHistoryState(
-        history_vectors=torch.zeros((1, 1, agent.state_dim), dtype=torch.float32),
-        history_valid=torch.zeros((1, 1), dtype=torch.float32),
+        states=torch.zeros((1, agent.state_dim), dtype=torch.float32),
         leave_history=torch.full((1, 1), -1, dtype=torch.long),
         recommended_mask=recommended_mask,
         env_step=torch.zeros(1, dtype=torch.long),
@@ -358,8 +345,7 @@ class MACAgentCrossChunkMaskSamplingTest(unittest.TestCase):
 
         agent = build_test_agent(chunk_size=1, num_items=NUM_ITEMS)
         history_state = RolloutHistoryState(
-            history_vectors=torch.zeros((2, 1, STATE_DIM)),
-            history_valid=torch.zeros((2, 1)),
+            states=torch.zeros((2, STATE_DIM)),
             leave_history=torch.full((2, 1), -1, dtype=torch.long),
             recommended_mask=torch.tensor(
                 [
@@ -384,8 +370,7 @@ class MACAgentCrossChunkMaskSamplingTest(unittest.TestCase):
 
         agent = build_test_agent(chunk_size=1, num_items=NUM_ITEMS)
         history_state = RolloutHistoryState(
-            history_vectors=torch.zeros((1, 1, STATE_DIM)),
-            history_valid=torch.zeros((1, 1)),
+            states=torch.zeros((1, STATE_DIM)),
             leave_history=torch.full((1, 1), -1, dtype=torch.long),
             recommended_mask=torch.ones((1, NUM_ITEMS), dtype=torch.bool),
             env_step=torch.zeros(1, dtype=torch.long),

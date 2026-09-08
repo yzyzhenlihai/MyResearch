@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description="Run DORL-MAC smoke pipeline.")
     add_common_args(parser)
+    parser.set_defaults(dynamics_pretrain_steps=DEFAULT_SMOKE_STEPS)
     parser.add_argument("--pretrain_steps", type=int, default=DEFAULT_SMOKE_STEPS)
     parser.add_argument("--train_steps", type=int, default=DEFAULT_SMOKE_STEPS)
     parser.add_argument("--epoch", type=int, default=0)
@@ -79,10 +80,22 @@ def build_common_argv(args: argparse.Namespace) -> List[str]:
         args.which_tracker,
         "--reward_handle",
         args.reward_handle,
+        "--dynamics_pretrain_steps",
+        str(args.dynamics_pretrain_steps),
+        "--dynamics_lr",
+        str(args.dynamics_lr),
         "--window_size",
         str(args.window_size),
         "--chunk_size",
         str(args.chunk_size),
+        "--rollout_depth",
+        str(args.rollout_depth),
+        "--lambda_chunk",
+        str(args.lambda_chunk),
+        "--leave_policy",
+        args.leave_policy,
+        "--predicted_mat_normalize",
+        args.predicted_mat_normalize,
         "--gamma",
         str(args.gamma),
         "--seed",
@@ -136,10 +149,9 @@ def build_common_argv(args: argparse.Namespace) -> List[str]:
             else "--disable_open_loop_diagnostics",
         ]
     )
+    common_args.extend(["--dynamics_hidden_dims", *map(str, args.dynamics_hidden_dims)])
     if args.item_embedding_path:
         common_args.extend(["--item_embedding_path", args.item_embedding_path])
-    if args.user_embedding_path:
-        common_args.extend(["--user_embedding_path", args.user_embedding_path])
     if args.predicted_mat_path:
         common_args.extend(["--predicted_mat_path", args.predicted_mat_path])
     if args.maxvar_mat_path:
@@ -174,7 +186,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     smoke_root = ensure_dir(
         args.smoke_dir
-        or Path(args.save_root) / args.env / "DORL_MAC" / "smoke"
+        or Path(args.save_root) / args.env / "MAC_origin" / "smoke"
     )
     common_argv = build_common_argv(args)
     LOGGER.info("开始 DORL-MAC smoke pipeline，输出目录：%s", smoke_root)
@@ -210,6 +222,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             str(args.num_samples_test),
             "--test-num",
             str(args.test_num),
+            "--dataloader_num_workers",
+            "0",
             "--save_dir",
             str(qv_dir),
             "--log_interval",

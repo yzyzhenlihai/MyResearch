@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
-from examples.policy.policy_utils import prepare_test_envs, prepare_user_model, setup_state_tracker
+from examples.policy.policy_utils import prepare_test_envs
 from src.core.collector.collector_set import CollectorSet
 from src.core.evaluation.evaluator import (
     Evaluator_Coverage_Count,
@@ -88,101 +88,6 @@ OPEN_LOOP_BRANCH_FB = "FB"
 
 OPEN_LOOP_BRANCH_NX0 = "NX_0"
 """屏蔽已推荐 item 但不强制轨迹长度的 NX_0 分支名。"""
-
-
-class _PreloadedEmbeddingProvider:
-    """为无参数 StateTrackerAvg 提供预加载的 user/item embedding。"""
-
-    def __init__(self, user_embeddings: torch.Tensor, item_embeddings: torch.Tensor) -> None:
-        """保存已校验的 embedding 张量。
-
-        Args:
-            user_embeddings (torch.Tensor): 用户 embedding 表。
-            item_embeddings (torch.Tensor): 物品 embedding 表。
-        """
-
-        self.user_embeddings = user_embeddings
-        self.item_embeddings = item_embeddings
-
-    def load_val_user_item_embedding(
-        self,
-        model_i: int = 0,
-        freeze_emb: bool = True,
-    ) -> torch.nn.ModuleDict:
-        """返回与 `EnsembleModel` 相同接口的验证集 embedding。
-
-        Args:
-            model_i (int): 兼容原接口的模型编号；预加载版本仅支持 M0。
-            freeze_emb (bool): 是否冻结 embedding 参数。
-
-        Returns:
-            torch.nn.ModuleDict: 包含 `feat_user` 和 `feat_item` 的 embedding 模块。
-
-        Raises:
-            ValueError: 当请求 M0 之外的模型编号时抛出。
-        """
-
-        if model_i != 0:
-            raise ValueError("Preloaded StateTrackerAvg embeddings only provide model M0.")
-        return torch.nn.ModuleDict(
-            {
-                "feat_user": torch.nn.Embedding.from_pretrained(
-                    self.user_embeddings,
-                    freeze=freeze_emb,
-                ),
-                "feat_item": torch.nn.Embedding.from_pretrained(
-                    self.item_embeddings,
-                    freeze=freeze_emb,
-                ),
-            }
-        )
-
-
-def load_avg_embedding_provider(args: Any, env: Any) -> _PreloadedEmbeddingProvider:
-    """直接加载 StateTrackerAvg 所需 embedding，避免重载可训练 user model。
-
-    Args:
-        args (Any): 含 `user_embedding_path` 和 `item_embedding_path` 的参数对象。
-        env (Any): 当前推荐环境，用于校验 user/item 数量。
-
-    Returns:
-        _PreloadedEmbeddingProvider: 与旧 `EnsembleModel` embedding 接口兼容的提供器。
-
-    Raises:
-        FileNotFoundError: 当 user 或 item embedding 文件不存在时抛出。
-        ValueError: 当 embedding 维度或行数与环境不一致时抛出。
-    """
-
-    user_path = Path(args.user_embedding_path)
-    item_path = Path(args.item_embedding_path)
-    for asset_name, asset_path in (
-        ("User embedding", user_path),
-        ("Item embedding", item_path),
-    ):
-        if not asset_path.is_file():
-            raise FileNotFoundError(f"{asset_name} file does not exist: {asset_path}")
-
-    user_embeddings = torch.load(user_path, map_location="cpu")
-    item_embeddings = torch.load(item_path, map_location="cpu")
-    if not isinstance(user_embeddings, torch.Tensor) or user_embeddings.ndim != 2:
-        raise ValueError(f"User embedding file must contain a 2D Tensor: {user_path}")
-    if not isinstance(item_embeddings, torch.Tensor) or item_embeddings.ndim != 2:
-        raise ValueError(f"Item embedding file must contain a 2D Tensor: {item_path}")
-    expected_users, expected_items = map(int, env.mat.shape)
-    if int(user_embeddings.shape[0]) != expected_users:
-        raise ValueError(
-            "User embedding rows must match environment users: "
-            f"rows={user_embeddings.shape[0]}, users={expected_users}."
-        )
-    if int(item_embeddings.shape[0]) != expected_items:
-        raise ValueError(
-            "Item embedding rows must match environment items: "
-            f"rows={item_embeddings.shape[0]}, items={expected_items}."
-        )
-    return _PreloadedEmbeddingProvider(
-        user_embeddings=user_embeddings.float(),
-        item_embeddings=item_embeddings.float(),
-    )
 
 
 @dataclass
@@ -933,72 +838,70 @@ def calibrate_nx0_feat_metric(
     return float(calibrated_value)
 
 
-def apply_state_tracker_defaults(args: Any, device: torch.device) -> None:
-    """补齐 `setup_state_tracker` 依赖的旧策略参数。
+def build_initial_state_table(
+    offline_dataset: Any, env: Any, device: torch.device,
+) -> torch.Tensor:
+    """将离线轨迹首个 observation 对齐到环境内部用户 ID。
 
     Args:
-        args (Any): 命令行参数对象，会被原地更新。
-        device (torch.device): 评估设备。
+        offline_dataset (Any): `ObservedChunkDataset`，其 bundle 保存完整 pkl
+            中每个原始用户的首个 observation。
+        env (Any): 真实推荐环境，用于获得用户 LabelEncoder 与用户数。
+        device (torch.device): 状态表所在设备。
 
     Returns:
-        None.
+        torch.Tensor: 形状为 `(env_num_users, state_dim)` 的初始状态表。
+
+    Raises:
+        ValueError: 当离线状态缺失、维度错误、非有限或不能覆盖环境用户时抛出。
+
+    Example:
+        若环境含两个内部用户且 pkl 的原始用户 ID 可由 `lbe_user` 映射为
+        0 和 1，则返回两行按内部 ID 排列的初始 observation。
     """
 
-    args.device = device
-    args.freeze_emb = False
-    args.use_pretrained_embedding = True
-    args.use_userEmbedding = False
-    args.need_state_norm = False
-    args.embedding_dim = 32
-    args.filter_sizes = [2, 3, 4]
-    args.num_filters = 16
-    args.dropout_rate = 0.1
-    args.num_heads = 1
-    args.dilations = "[1, 2, 1, 2, 1, 2]"
-    args.model_name = "DORL_MAC"
-    args.draw_bar = False
-    args.top_rate = 0.8
-
-
-def build_dorl_mac_state_tracker(
-    args: Any,
-    env: Any,
-    device: torch.device,
-) -> torch.nn.Module:
-    """加载一次 user model 并构造 DORL-MAC 评估 StateTracker。
-
-    单进程多 H 消融可以复用本函数返回的 StateTracker，避免每个
-    execution horizon 重复加载 user model。StateTracker 在评估路径
-    中只根据当前 Collector buffer 构造状态，不保存跨 episode 隐状态。
-
-    Args:
-        args (Any): 命令行参数对象，会补齐旧 StateTracker 所需字段。
-        env (Any): 当前真实推荐环境实例。
-        device (torch.device): StateTracker 所在设备。
-
-    Returns:
-        torch.nn.Module: 已切换到 eval 模式的 StateTracker。
-    """
-
-    apply_state_tracker_defaults(args, device=device)
-    if str(args.which_tracker).lower() == "avg":
-        ensemble_models = load_avg_embedding_provider(args=args, env=env)
-        LOGGER.info(
-            "StateTrackerAvg 直接加载 embedding，不加载 DeepFM 可训练参数：env=%s",
-            args.env,
+    initial_by_raw_user = offline_dataset.bundle.initial_observations_by_user
+    state_dim = int(offline_dataset.state_dim)
+    num_users = int(env.mat.shape[0])
+    table = torch.empty((num_users, state_dim), dtype=torch.float32, device=device)
+    seen = torch.zeros(num_users, dtype=torch.bool, device=device)
+    user_encoder = getattr(env, "lbe_user", None)
+    for raw_user_id, raw_state in initial_by_raw_user.items():
+        if user_encoder is None:
+            internal_user_id = int(raw_user_id)
+        else:
+            try:
+                internal_user_id = int(
+                    user_encoder.transform([int(raw_user_id)])[0]
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Offline trajectory contains unknown raw user id: {raw_user_id}."
+                ) from exc
+        if not 0 <= internal_user_id < num_users:
+            raise ValueError(
+                f"Internal user id {internal_user_id} is outside environment range."
+            )
+        state = torch.as_tensor(raw_state, dtype=torch.float32, device=device)
+        if state.shape != (state_dim,) or not torch.isfinite(state).all():
+            raise ValueError(
+                f"Invalid initial observation for user {raw_user_id}: "
+                f"shape={tuple(state.shape)}."
+            )
+        table[internal_user_id] = state
+        seen[internal_user_id] = True
+    if not seen.all():
+        missing = torch.nonzero(~seen, as_tuple=False).squeeze(1).cpu().tolist()
+        raise ValueError(
+            "Offline trajectories do not cover all environment users; "
+            f"missing internal ids (first 10): {missing[:10]}."
         )
-    else:
-        ensemble_models = prepare_user_model(args)
-    args.device = device
-    state_tracker = setup_state_tracker(
-        args,
-        ensemble_models,
-        env,
-        train_envs=None,
-        test_envs_dict=None,
+    LOGGER.info(
+        "已从离线 pkl 构造 dynamics 初始状态表：users=%s, state_dim=%s",
+        num_users,
+        state_dim,
     )
-    state_tracker.eval()
-    return state_tracker
+    return table
 
 
 def resolve_evaluation_collection_config(
@@ -1072,10 +975,15 @@ def build_dorl_policy_callbacks(
         ValueError: 当 item 相似度矩阵不足以支持 transform 评估时抛出。
     """
 
+    LOGGER.info("开始加载评估 callback 的验证集统计。")
     _, _, df_item_val, _ = dataset.get_val_data()
+    LOGGER.info("验证集表加载完成；开始加载特征支配统计。")
     item_feat_domination = dataset.get_domination()
+    LOGGER.info("特征支配统计加载完成；开始加载 item 相似度。")
     item_similarity = dataset.get_item_similarity()
+    LOGGER.info("item 相似度加载完成；开始加载流行度。")
     item_popularity = dataset.get_item_popularity()
+    LOGGER.info("评估 callback 统计加载完成。")
     need_transform = bool(getattr(args, "need_transform", False))
     if need_transform and len(item_similarity) <= max(env.lbe_item.classes_):
         raise ValueError("item_similarity is too small for transformed item ids.")
@@ -1087,8 +995,8 @@ def build_dorl_policy_callbacks(
             need_transform,
             item_feat_domination,
             lbe_item=env.lbe_item if need_transform else None,
-            top_rate=args.top_rate,
-            draw_bar=args.draw_bar,
+            top_rate=float(getattr(args, "top_rate", 0.8)),
+            draw_bar=bool(getattr(args, "draw_bar", False)),
         ),
         Evaluator_Coverage_Count(collector_set, df_item_val, need_transform),
         Evaluator_User_Experience(
@@ -1110,6 +1018,7 @@ def build_dorl_mac_evaluator(
     kwargs_um: Dict[str, Any],
     agent: mac_agent_module.MACAgent,
     action_mapper: ActionMapper,
+    initial_states: torch.Tensor,
     device: torch.device,
     num_samples_test: int,
     eval_episodes: int,
@@ -1118,7 +1027,6 @@ def build_dorl_mac_evaluator(
     execution_horizon: Optional[int] = None,
     completion_window: int = 5,
     enable_open_loop_diagnostics: bool = False,
-    state_tracker: Optional[torch.nn.Module] = None,
 ) -> DORLMACEvaluator:
     """构造可在训练中重复调用的 DORL-MAC 评估器。
 
@@ -1129,6 +1037,7 @@ def build_dorl_mac_evaluator(
         kwargs_um (Dict[str, Any]): 构造测试环境所需参数。
         agent (mac_agent_module.MACAgent): 当前训练中的 agent；评估器持有引用，因此会使用最新参数。
         action_mapper (ActionMapper): action embedding 到 item id 的映射器。
+        initial_states (torch.Tensor): 与环境内部用户 ID 对齐的离线初始状态表。
         device (torch.device): 评估设备。
         num_samples_test (int): 评估时 rejection sampling 候选数。
         eval_episodes (int): 每次评估 episode 数。
@@ -1138,9 +1047,6 @@ def build_dorl_mac_evaluator(
             前缀长度 `H`；为 `None` 时执行完整 chunk。
         completion_window (int): CCR@W 的固定环境步窗口 W。
         enable_open_loop_diagnostics (bool): 是否启用 ADR shadow replan。
-        state_tracker (Optional[torch.nn.Module]): 可选的预构造 StateTracker。
-            单进程多 H sweep 传入同一实例以避免重复加载 user model；
-            为 `None` 时保持原行为并在函数内构造。
 
     Returns:
         DORLMACEvaluator: 可复用评估器。
@@ -1160,18 +1066,10 @@ def build_dorl_mac_evaluator(
             "completion_window must not exceed max_turn, "
             f"got window={completion_window}, max_turn={args.max_turn}."
         )
-    if state_tracker is None:
-        state_tracker = build_dorl_mac_state_tracker(
-            args=args,
-            env=env,
-            device=device,
-        )
-    else:
-        args.device = device
-    state_tracker.eval()
+    args.device = device
     policy = DORLMACPolicyAdapter(
         agent=agent,
-        state_tracker=state_tracker,
+        initial_states=initial_states,
         action_mapper=action_mapper,
         num_samples_test=num_samples_test,
         device=device,
