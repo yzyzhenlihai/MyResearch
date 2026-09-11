@@ -10,9 +10,10 @@ export PYTHONPATH="${PWD}:${PWD}/src:${PWD}/src/DeepCTR-Torch:${PWD}/src/tiansho
 
 PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/python}"
 CHUNK_SIZE="${CHUNK_SIZE:-7}"
+SEED="${SEED:-2023}"
 H_VALUES="${H_VALUES:-1 2 3 4 5 6 7}"
 COMPLETION_WINDOW="${COMPLETION_WINDOW:-${CHUNK_SIZE}}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-saved_models/KuaiEnv-v0/MAC_origin/open_loop_K${CHUNK_SIZE}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-saved_models/KuaiEnv-v0/MAC_origin/open_loop_K${CHUNK_SIZE}_seed${SEED}}"
 SWANLAB_PROJECT="${SWANLAB_PROJECT:-DORL-MAC-OpenLoop}"
 EVAL_EPISODES="${EVAL_EPISODES:-10}"
 TEST_NUM="${TEST_NUM:-2}"
@@ -26,7 +27,6 @@ WHICH_TRACKER="${WHICH_TRACKER:-none}"
 REWARD_HANDLE="${REWARD_HANDLE:-cat}"
 WINDOW_SIZE="${WINDOW_SIZE:-3}"
 GAMMA="${GAMMA:-0.9}"
-SEED="${SEED:-2023}"
 DEVICE="${DEVICE:-cuda:0}"
 CUDA="${CUDA:-0}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
@@ -41,7 +41,7 @@ LAMBDA_VARIANCE="${LAMBDA_VARIANCE:-1}"
 ENTROPY_WINDOW="${ENTROPY_WINDOW:-1 2}"
 DYNAMICS_LOSS_WEIGHT="${DYNAMICS_LOSS_WEIGHT:-1.0}"
 # 若设置 MAC_CKPT，则自动作为 --mac_ckpt 传入（命令行显式 --mac_ckpt 仍优先）。
-MAC_CKPT="${MAC_CKPT:-saved_models/KuaiEnv-v0/MAC_origin/dorl-mac-kuai-catbc-qv-K${CHUNK_SIZE}/mac_agent/latest.pt}"
+MAC_CKPT="${MAC_CKPT:-saved_models/KuaiEnv-v0/MAC_origin/dorl-mac-kuai-catbc-qv-K${CHUNK_SIZE}-seed${SEED}/mac_agent/latest.pt}"
 
 read -r -a ENTROPY_WINDOW_ARGS <<< "${ENTROPY_WINDOW}"
 
@@ -103,7 +103,7 @@ fi
   --execution_horizons "${EXECUTION_HORIZONS[@]}" \
   --enable_open_loop_diagnostics \
   --swanlab_project "${SWANLAB_PROJECT}" \
-  --run_name "open-loop-K${CHUNK_SIZE}" \
+  --run_name "open-loop-K${CHUNK_SIZE}-seed${SEED}" \
   --eval_save_dir "${OUTPUT_ROOT}"
 
 printf '\n[run_dorl_mac_open_loop_eval] done. outputs are under %s\n' "${OUTPUT_ROOT}"

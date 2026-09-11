@@ -118,15 +118,15 @@ BC_SWANLAB_PROJECT="${BC_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-CategoricalBC}"
 QV_SWANLAB_PROJECT="${QV_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-QV}"
 EVAL_SWANLAB_PROJECT="${EVAL_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-Eval}"
 RUN_NAME="${RUN_NAME:-${DEFAULT_RUN_NAME}}"
-# 默认在 run_name / run_dir 里拼上 K=${CHUNK_SIZE}，让不同 K 的实验自动落到不同目录：
-#   - 相同 K 再次运行：BC 目录已有 latest.pt → 自动短路复用；
-#   - 不同 K 运行：BC / QV / eval 全部落到新目录，自动触发 BC 重训。
+# 默认在 run_name / run_dir 里同时拼上 K 和 seed，隔离不同结构与随机重复：
+#   - 相同 K、相同 seed 再次运行：BC 目录已有 latest.pt → 自动短路复用；
+#   - K 或 seed 任一变化：dynamics/BC、Q/V、eval 全部落到新目录并独立记录。
 # 用户仍可显式覆盖 RUN_DIR / BC_SAVE_DIR / *_RUN_NAME 以复用旧路径。
-RUN_NAME_WITH_K="${RUN_NAME}-K${CHUNK_SIZE}"
-BC_RUN_NAME="${BC_RUN_NAME:-${RUN_NAME_WITH_K}-bc}"
-QV_RUN_NAME="${QV_RUN_NAME:-${RUN_NAME_WITH_K}-qv}"
-EVAL_RUN_NAME="${EVAL_RUN_NAME:-${RUN_NAME_WITH_K}-H${EXECUTION_HORIZON}-eval}"
-RUN_DIR="${RUN_DIR:-saved_models/${ENV_NAME}/MAC_origin/${RUN_NAME_WITH_K}}"
+RUN_TAG="${RUN_NAME}-K${CHUNK_SIZE}-seed${SEED}"
+BC_RUN_NAME="${BC_RUN_NAME:-${RUN_TAG}-bc}"
+QV_RUN_NAME="${QV_RUN_NAME:-${RUN_TAG}-qv}"
+EVAL_RUN_NAME="${EVAL_RUN_NAME:-${RUN_TAG}-H${EXECUTION_HORIZON}-eval}"
+RUN_DIR="${RUN_DIR:-saved_models/${ENV_NAME}/MAC_origin/${RUN_TAG}}"
 BC_SAVE_DIR="${BC_SAVE_DIR:-${RUN_DIR}/categorical_bc}"
 MAC_SAVE_DIR="${MAC_SAVE_DIR:-${RUN_DIR}/mac_agent}"
 EVAL_SAVE_DIR="${EVAL_SAVE_DIR:-${RUN_DIR}/eval_H${EXECUTION_HORIZON}}"
@@ -258,8 +258,8 @@ find_existing_bc_ckpt() {
   return 1
 }
 
-printf '[run_dorl_mac_kuai_train] run_dir=%s (chunk_size=K=%s, execution_horizon=H=%s)\n' \
-  "${RUN_DIR}" "${CHUNK_SIZE}" "${EXECUTION_HORIZON}"
+printf '[run_dorl_mac_kuai_train] run_dir=%s (chunk_size=K=%s, seed=%s, execution_horizon=H=%s)\n' \
+  "${RUN_DIR}" "${CHUNK_SIZE}" "${SEED}" "${EXECUTION_HORIZON}"
 printf '[run_dorl_mac_kuai_train] dataset: env=%s, trajectories=%s\n' \
   "${ENV_NAME}" "${DATASET_PATH}"
 printf '[run_dorl_mac_kuai_train] user model assets: item=%s, prediction=%s, variance=%s\n' \
