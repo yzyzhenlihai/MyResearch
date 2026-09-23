@@ -605,6 +605,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="每 log_interval 步打印 Q/V 训练循环各阶段耗时（诊断用）。",
     )
+    parser.add_argument(
+        "--freeze_dynamics_during_qv",
+        action="store_true",
+        default=False,
+        help="Q/V 阶段固定 BC checkpoint 中的 dynamics，仅优化 critic 与 value。",
+    )
     return parser
 
 
@@ -699,7 +705,9 @@ def main(argv: Optional[list[str]] = None) -> Path:
         raise ValueError("test_num must be positive when eval_episodes is 0.")
 
     checkpoint = torch.load(bc_actor_ckpt, map_location="cpu")
-    apply_checkpoint_model_config(args, checkpoint)
+    # 共享 BC checkpoint 只定义 Actor/Dynamics 结构；本次实验显式选择 Critic
+    # 架构，不能被 BC 阶段保存的占位 MLP Critic 配置覆盖。
+    apply_checkpoint_model_config(args, checkpoint, restore_critic_config=False)
     resolve_common_paths(args)
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -729,7 +737,15 @@ def main(argv: Optional[list[str]] = None) -> Path:
         reward_model=reward_model,
         leave_model=leave_model,
     )
-    agent.load_checkpoint_state(checkpoint, strict=True)
+    # BC checkpoint 内的 Q/V 从未训练。两个架构都从当前 seed 的新初始化开始，
+    # 只恢复完全共享的 Actor 与 Dynamics，避免随机占位 Q/V 形成额外变量。
+    agent.load_checkpoint_state(checkpoint, strict=True, load_qv=False)
+    if args.freeze_dynamics_during_qv:
+        agent.dynamics.eval().requires_grad_(False)
+        agent.dynamics_loss_weight = 0.0
+    # MLP 与 Transformer 初始化消耗的随机数数量不同。此处重置随机流，使后续
+    # DataLoader shuffle 和 Flow 候选采样在同 seed 下从相同状态开始。
+    set_seed(args.seed)
     initial_states = build_initial_state_table(dataset, env, device)
     eval_save_dir = ensure_dir(args.eval_save_dir or save_dir / "eval_during_train")
     periodic_evaluator = build_dorl_mac_evaluator(
@@ -760,7 +776,10 @@ def main(argv: Optional[list[str]] = None) -> Path:
         persistent_workers=(_dl_num_workers > 0),
         prefetch_factor=(4 if _dl_num_workers > 0 else None),
     )
-    optimizer = torch.optim.Adam(agent.qv_parameters(), lr=args.qv_lr)
+    optimizer = torch.optim.Adam(
+        agent.qv_parameters(include_dynamics=not args.freeze_dynamics_during_qv),
+        lr=args.qv_lr,
+    )
     logger = SwanLabLogger(
         project=args.swanlab_project,
         run_name=default_run_name("qv", args),
@@ -770,10 +789,13 @@ def main(argv: Optional[list[str]] = None) -> Path:
     LOGGER.info("Q/V 本地指标日志路径：%s", metrics_log_path)
 
     LOGGER.info(
-        "开始 DORL-MAC Q/V 训练：epoch=%s, step_per_epoch=%s, total_steps=%s",
+        "开始 DORL-MAC Q/V 训练：critic=%s, epoch=%s, "
+        "step_per_epoch=%s, total_steps=%s, freeze_dynamics=%s",
+        args.critic_backbone,
         epoch,
         step_per_epoch,
         total_steps,
+        args.freeze_dynamics_during_qv,
     )
     batch_iterator = cycle_dataloader(dataloader)
     last_metrics = {}

@@ -75,21 +75,47 @@ class SwanLabLogger:
         self.log({"event/config_saved": 1.0}, step=0)
 
     def log(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
-        """记录一组指标。
+        """记录一组指标，并仅向 SwanLab 上传可绘图的数值标量。
 
         Args:
-            metrics (Dict[str, Any]): 指标字典。
+            metrics (Dict[str, Any]): 指标字典；字符串等元数据只写入本地
+                JSONL，不作为 SwanLab 图表数据上传。
             step (Optional[int]): 全局步数。
 
         Returns:
             None.
         """
 
-        payload = {"step": step, "metrics": self._to_jsonable(metrics)}
+        jsonable_metrics = self._to_jsonable(metrics)
+        payload = {"step": step, "metrics": jsonable_metrics}
         self._file_obj.write(json.dumps(payload, ensure_ascii=False) + "\n")
         self._file_obj.flush()
         if self._swanlab is not None:
-            self._swanlab.log(metrics, step=step)
+            online_metrics = self._numeric_metrics(jsonable_metrics)
+            if online_metrics:
+                self._swanlab.log(online_metrics, step=step)
+
+    @staticmethod
+    def _numeric_metrics(metrics: Dict[str, Any]) -> Dict[str, int | float]:
+        """筛选 SwanLab 折线图支持的数值标量。
+
+        字符串模式名、路径、列表和字典仍由本地 JSONL 完整保存。布尔值会
+        显式转换为整数，避免不同 SwanLab 版本对布尔图表类型的处理差异。
+
+        Args:
+            metrics (Dict[str, Any]): 已转换为 JSON 兼容类型的指标字典。
+
+        Returns:
+            Dict[str, int | float]: 只含整数或浮点数的在线指标字典。
+        """
+
+        numeric_metrics: Dict[str, int | float] = {}
+        for key, value in metrics.items():
+            if isinstance(value, bool):
+                numeric_metrics[key] = int(value)
+            elif isinstance(value, (int, float)):
+                numeric_metrics[key] = value
+        return numeric_metrics
 
     def finish(self) -> None:
         """结束日志会话。
@@ -170,4 +196,3 @@ class SwanLabLogger:
                 pass
         # Path、torch.device、其它自定义对象降级为字符串
         return str(value)
-

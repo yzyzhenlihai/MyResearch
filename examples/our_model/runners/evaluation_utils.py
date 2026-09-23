@@ -92,10 +92,10 @@ OPEN_LOOP_BRANCH_NX0 = "NX_0"
 
 @dataclass
 class DORLMACEvaluator:
-    """封装与 DORL trainer 对齐的 DORL-MAC 评估器。
+    """封装与 DORL trainer 对齐的共享策略评估器。
 
     Attributes:
-        policy (DORLMACPolicyAdapter): 当前被评估的策略适配器。
+        policy (Any): 当前被评估的 ordinary 或 Transformer Q 策略适配器。
         collector_set (CollectorSet): 复用现有 DORL 三模式评估的 collector 集合。
         callbacks (List[Any]): 与原 DORL `policy.callbacks` 同构的 evaluator 链。
         eval_episodes (int): 每次评估采样的 episode 数量。
@@ -105,7 +105,7 @@ class DORLMACEvaluator:
         max_turn (int): FB/NX_0 分支的最大轨迹长度，用于识别右删失窗口。
     """
 
-    policy: DORLMACPolicyAdapter
+    policy: Any
     collector_set: CollectorSet
     callbacks: List[Any]
     eval_episodes: int
@@ -126,13 +126,21 @@ class DORLMACEvaluator:
             的基础指标和覆盖率、特征、多样性、新颖度指标。
         """
 
+        execution_horizon = int(self.policy.execution_horizon)
+        execution_horizon_label: Any = execution_horizon
+        if execution_horizon <= 0:
+            execution_horizon_label = getattr(
+                self.policy,
+                "execution_horizon_mode",
+                "adaptive",
+            )
         LOGGER.info(
             "开始 DORL-MAC epoch 评估：epoch=%s, episodes=%s, K=%s, H=%s, "
             "candidates=%s, CCR_window=%s, ADR=%s",
             epoch,
             self.eval_episodes,
             self.policy.chunk_size,
-            self.policy.execution_horizon,
+            execution_horizon_label,
             self.policy.num_samples_test,
             self.completion_window,
             self.policy.enable_open_loop_diagnostics,
@@ -146,7 +154,7 @@ class DORLMACEvaluator:
         summary.setdefault("evaluation/chunk_size", int(self.policy.chunk_size))
         summary.setdefault(
             "evaluation/execution_horizon",
-            int(self.policy.execution_horizon),
+            execution_horizon,
         )
         summary.setdefault(
             "evaluation/num_samples_test",
@@ -170,12 +178,27 @@ class DORLMACEvaluator:
         )
         if global_step is not None:
             summary.setdefault("trainer/env_step", int(global_step))
+        metadata_hook = getattr(self.policy, "get_evaluation_metadata", None)
+        if callable(metadata_hook):
+            summary.update(metadata_hook())
         self.save_dir.mkdir(parents=True, exist_ok=True)
         summary_path = self.save_dir / f"summary_epoch_{epoch}.json"
         with summary_path.open("w", encoding="utf-8") as file_obj:
             json.dump(summary, file_obj, indent=2, ensure_ascii=False)
         LOGGER.info("DORL-MAC epoch 评估完成：epoch=%s, summary=%s", epoch, summary_path)
         return summary
+
+    def close(self) -> None:
+        """关闭三个 DORL 评估分支持有的向量环境。
+
+        Returns:
+            None.
+        """
+
+        for collector in self.collector_set.collector_dict.values():
+            close_method = getattr(getattr(collector, "env", None), "close", None)
+            if callable(close_method):
+                close_method()
 
     def _run_callbacks(self, epoch: int, results: Dict[str, Any]) -> Dict[str, Any]:
         """串行执行与 DORL trainer 相同的 evaluator callbacks。
@@ -1011,6 +1034,104 @@ def build_dorl_policy_callbacks(
     ]
 
 
+def build_dorl_policy_evaluator(
+    args: Any,
+    env: Any,
+    dataset: Any,
+    kwargs_um: Dict[str, Any],
+    policy: Any,
+    eval_episodes: int,
+    save_dir: Path,
+    buffer_size: int = 0,
+    completion_window: int = 5,
+) -> DORLMACEvaluator:
+    """用同一套 DORL 三分支协议构造任意 chunk Q 策略的评估器。
+
+    Args:
+        args (Any): 包含 `test_num`、`max_turn` 和 `force_length` 的运行配置。
+        env (Any): KuaiEnv/KuaiRandEnv 模板。
+        dataset (Any): 原 DORL 数据集对象，用于构造评估 callbacks。
+        kwargs_um (Dict[str, Any]): 构造真实测试环境的参数。
+        policy (Any): 已适配 Collector 接口的 ordinary 或 Transformer Q 策略。
+        eval_episodes (int): FB、NX_0、NX_force 每个分支采样的 episode 数。
+        save_dir (Path): 每轮评估 summary 保存目录。
+        buffer_size (int): replay buffer 容量；小于等于零时自动计算。
+        completion_window (int): CCR@W 使用的固定环境步窗口。
+
+    Returns:
+        DORLMACEvaluator: 可重复用于训练期评估的共享评估器。
+
+    Raises:
+        ValueError: 当评估数量、窗口或 policy 公共属性非法时抛出。
+    """
+
+    if eval_episodes <= 0:
+        raise ValueError("eval_episodes must be positive.")
+    if completion_window <= 0:
+        raise ValueError("completion_window must be positive.")
+    if completion_window > int(args.max_turn):
+        raise ValueError(
+            "completion_window must not exceed max_turn, "
+            f"got window={completion_window}, max_turn={args.max_turn}."
+        )
+    required_policy_attributes = (
+        "chunk_size",
+        "execution_horizon",
+        "num_samples_test",
+        "enable_open_loop_diagnostics",
+        "adr_comparison",
+        "adr_num_categories",
+    )
+    missing_attributes = [
+        name for name in required_policy_attributes if not hasattr(policy, name)
+    ]
+    if missing_attributes:
+        raise ValueError(
+            "DORL evaluation policy is missing required attributes: "
+            f"{missing_attributes}."
+        )
+    if int(policy.num_samples_test) <= 0:
+        raise ValueError("policy.num_samples_test must be positive.")
+
+    parallel_env_num, resolved_buffer_size = resolve_evaluation_collection_config(
+        eval_episodes=eval_episodes,
+        requested_env_num=int(args.test_num),
+        max_turn=int(args.max_turn),
+        force_length=int(args.force_length),
+        buffer_size=buffer_size,
+    )
+    original_test_num = int(args.test_num)
+    args.test_num = parallel_env_num
+    try:
+        test_envs_dict = prepare_test_envs(args, env, kwargs_um)
+    finally:
+        args.test_num = original_test_num
+    collector_set = CollectorSet(
+        policy,
+        test_envs_dict,
+        buffer_size=resolved_buffer_size,
+        env_num=parallel_env_num,
+        force_length=args.force_length,
+    )
+    callbacks = build_dorl_policy_callbacks(
+        args=args,
+        env=env,
+        dataset=dataset,
+        collector_set=collector_set,
+    )
+    policy.callbacks = callbacks
+    return DORLMACEvaluator(
+        policy=policy,
+        collector_set=collector_set,
+        callbacks=callbacks,
+        eval_episodes=eval_episodes,
+        save_dir=save_dir,
+        force_length=args.force_length,
+        completion_window=completion_window,
+        max_turn=args.max_turn,
+    )
+
+
 def build_dorl_mac_evaluator(
     args: Any,
     env: Any,
@@ -1055,17 +1176,8 @@ def build_dorl_mac_evaluator(
         ValueError: 当评估 episode、候选数或 CCR 窗口非法时抛出。
     """
 
-    if eval_episodes <= 0:
-        raise ValueError("eval_episodes must be positive.")
     if num_samples_test <= 0:
         raise ValueError("num_samples_test must be positive.")
-    if completion_window <= 0:
-        raise ValueError("completion_window must be positive.")
-    if completion_window > int(args.max_turn):
-        raise ValueError(
-            "completion_window must not exceed max_turn, "
-            f"got window={completion_window}, max_turn={args.max_turn}."
-        )
     args.device = device
     policy = DORLMACPolicyAdapter(
         agent=agent,
@@ -1082,40 +1194,14 @@ def build_dorl_mac_evaluator(
             else None
         ),
     )
-    parallel_env_num, resolved_buffer_size = resolve_evaluation_collection_config(
-        eval_episodes=eval_episodes,
-        requested_env_num=int(args.test_num),
-        max_turn=int(args.max_turn),
-        force_length=int(args.force_length),
-        buffer_size=buffer_size,
-    )
-    original_test_num = int(args.test_num)
-    args.test_num = parallel_env_num
-    try:
-        test_envs_dict = prepare_test_envs(args, env, kwargs_um)
-    finally:
-        args.test_num = original_test_num
-    collector_set = CollectorSet(
-        policy,
-        test_envs_dict,
-        buffer_size=resolved_buffer_size,
-        env_num=parallel_env_num,
-        force_length=args.force_length,
-    )
-    callbacks = build_dorl_policy_callbacks(
+    return build_dorl_policy_evaluator(
         args=args,
         env=env,
         dataset=dataset,
-        collector_set=collector_set,
-    )
-    policy.callbacks = callbacks
-    return DORLMACEvaluator(
+        kwargs_um=kwargs_um,
         policy=policy,
-        collector_set=collector_set,
-        callbacks=callbacks,
         eval_episodes=eval_episodes,
         save_dir=save_dir,
-        force_length=args.force_length,
+        buffer_size=buffer_size,
         completion_window=completion_window,
-        max_turn=args.max_turn,
     )

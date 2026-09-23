@@ -11,10 +11,72 @@ export PYTHONPATH="${PWD}:${PWD}/src:${PWD}/src/DeepCTR-Torch:${PWD}/src/tiansho
 PYTHON_BIN="${PYTHON_BIN:-/data/yuzhengyang/miniconda3/envs/easyrl4rec/bin/python}"
 DRY_RUN="${DRY_RUN:-0}"
 RESET_METRICS="${RESET_METRICS:-1}"
+TRAIN_STAGES="${TRAIN_STAGES:-all}"
+RUN_BC=0
+RUN_QV=0
+RUN_EVAL=0
+if [[ "${TRAIN_STAGES}" == "all" ]]; then
+  RUN_BC=1
+  RUN_QV=1
+  RUN_EVAL=1
+else
+  read -r -a STAGE_VALUES <<< "${TRAIN_STAGES//,/ }"
+  for stage_name in "${STAGE_VALUES[@]}"; do
+    case "${stage_name}" in
+      bc|pretrain) RUN_BC=1 ;;
+      qv) RUN_QV=1 ;;
+      eval) RUN_EVAL=1 ;;
+      *)
+        printf '[run_dorl_mac_kuai_train] ERROR: TRAIN_STAGES must contain bc,qv,eval or all; got %s.\n' \
+          "${TRAIN_STAGES}" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
+if (( RUN_BC + RUN_QV + RUN_EVAL == 0 )); then
+  printf '[run_dorl_mac_kuai_train] ERROR: TRAIN_STAGES is empty.\n' >&2
+  exit 2
+fi
 
 ENV_NAME="${ENV_NAME:-KuaiEnv-v0}" # KuaiRand-v0  KuaiEnv-v0
 USER_MODEL_NAME="${USER_MODEL_NAME:-DeepFM}"
 READ_MESSAGE="${READ_MESSAGE:-pointneg}"
+ACTOR_TYPE="${ACTOR_TYPE:-categorical_flow}"
+FLOW_STEPS="${FLOW_STEPS:-10}"
+FLOW_SAMPLE_BATCH_SIZE="${FLOW_SAMPLE_BATCH_SIZE:-4}"
+FLOW_TEMPERATURE="${FLOW_TEMPERATURE:-0.05}"
+FLOW_POSITIVE_WEIGHT="${FLOW_POSITIVE_WEIGHT:-0}"
+FLOW_DISTILL_WEIGHT="${FLOW_DISTILL_WEIGHT:-1.0}"
+FLOW_SAMPLING_MODE="${FLOW_SAMPLING_MODE:-onestep}"
+CRITIC_BACKBONE="${CRITIC_BACKBONE:-mlp}"
+CRITIC_TRANSFORMER_HIDDEN_DIM="${CRITIC_TRANSFORMER_HIDDEN_DIM:-72}"
+CRITIC_TRANSFORMER_LAYERS="${CRITIC_TRANSFORMER_LAYERS:-2}"
+CRITIC_TRANSFORMER_HEADS="${CRITIC_TRANSFORMER_HEADS:-4}"
+CRITIC_TRANSFORMER_DROPOUT="${CRITIC_TRANSFORMER_DROPOUT:-0.0}"
+
+case "${ACTOR_TYPE}" in
+  categorical_flow)
+    ACTOR_TAG="categorical-flow"
+    BC_SUBDIR="categorical_flow_bc"
+    ;;
+  categorical)
+    ACTOR_TAG="categorical-ce"
+    BC_SUBDIR="categorical_bc"
+    ;;
+  *)
+    printf '[run_dorl_mac_kuai_train] ERROR: ACTOR_TYPE must be categorical_flow or categorical.\n' >&2
+    exit 2
+    ;;
+esac
+
+case "${CRITIC_BACKBONE}" in
+  mlp|transformer) ;;
+  *)
+    printf '[run_dorl_mac_kuai_train] ERROR: CRITIC_BACKBONE must be mlp or transformer.\n' >&2
+    exit 2
+    ;;
+esac
 
 case "${ENV_NAME}" in
   KuaiEnv-v0)
@@ -22,14 +84,14 @@ case "${ENV_NAME}" in
     DEFAULT_MAX_TURN=100
     DEFAULT_NUM_LEAVE_COMPUTE=1
     DEFAULT_LEAVE_THRESHOLD=0
-    DEFAULT_RUN_NAME="dorl-mac-kuai-catbc-qv"
+    DEFAULT_RUN_BASE="dorl-mac-kuai"
     ;;
   KuaiRand-v0)
     DEFAULT_DATASET_PATH="data/KuaiRand_Pure/data_processed/DM_KuaiRand-v0_test_data.pkl"
     DEFAULT_MAX_TURN=100
     DEFAULT_NUM_LEAVE_COMPUTE=1
     DEFAULT_LEAVE_THRESHOLD=0
-    DEFAULT_RUN_NAME="dorl-mac-kuairand-catbc-qv"
+    DEFAULT_RUN_BASE="dorl-mac-kuairand"
     ;;
   *)
     printf '[run_dorl_mac_kuai_train] ERROR: unsupported ENV_NAME=%s; choose KuaiEnv-v0 or KuaiRand-v0.\n' \
@@ -37,6 +99,7 @@ case "${ENV_NAME}" in
     exit 2
     ;;
 esac
+DEFAULT_RUN_NAME="${DEFAULT_RUN_BASE}-${ACTOR_TAG}-qv"
 
 DATASET_PATH="${DATASET_PATH:-${DEFAULT_DATASET_PATH}}"
 WHICH_TRACKER="${WHICH_TRACKER:-none}"
@@ -48,9 +111,9 @@ EXECUTION_HORIZON="${EXECUTION_HORIZON:-${CHUNK_SIZE}}"
 COMPLETION_WINDOW="${COMPLETION_WINDOW:-${CHUNK_SIZE}}"
 ENABLE_OPEN_LOOP_DIAGNOSTICS="${ENABLE_OPEN_LOOP_DIAGNOSTICS:-0}"
 GAMMA="${GAMMA:-0.9}"
-SEED="${SEED:-2023}"
-DEVICE="${DEVICE:-cuda:2}"
-CUDA="${CUDA:-2}"
+SEED="${SEED:-2025}"
+DEVICE="${DEVICE:-cuda:6}"
+CUDA="${CUDA:-6}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
 MAX_TURN="${MAX_TURN:-${DEFAULT_MAX_TURN}}"
@@ -83,7 +146,7 @@ IS_SORTED="${IS_SORTED:-1}"
 DYNAMICS_PRETRAIN_STEPS="${DYNAMICS_PRETRAIN_STEPS:-10000}"
 DYNAMICS_LR="${DYNAMICS_LR:-0.0003}"
 DYNAMICS_LOSS_WEIGHT="${DYNAMICS_LOSS_WEIGHT:-1.0}"
-# 阶段 ①：Categorical BC 预训练
+# 阶段 ①：类别空间 Flow Matching BC（可用 ACTOR_TYPE=categorical 回退 CE）
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-100000}"
 ACTOR_LR="${ACTOR_LR:-0.0003}"
 PRETRAIN_LOG_INTERVAL="${PRETRAIN_LOG_INTERVAL:-100}"
@@ -111,10 +174,11 @@ EVAL_EVERY_N_EPOCHS="${EVAL_EVERY_N_EPOCHS:-1}"
 BUFFER_SIZE="${BUFFER_SIZE:-0}"
 QV_LOG_INTERVAL="${QV_LOG_INTERVAL:-100}"
 ENABLE_STEP_PROFILER="${ENABLE_STEP_PROFILER:-0}"
+FREEZE_DYNAMICS_DURING_QV="${FREEZE_DYNAMICS_DURING_QV:-0}"
 
-# SwanLab 项目命名（离散 Categorical MAC 版）
+# SwanLab 项目命名（类别 Flow 与 CE 使用不同项目/运行目录）
 SWANLAB_PROJECT="${SWANLAB_PROJECT:-DORL-MAC}"
-BC_SWANLAB_PROJECT="${BC_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-CategoricalBC}"
+BC_SWANLAB_PROJECT="${BC_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-${ACTOR_TAG}-BC}"
 QV_SWANLAB_PROJECT="${QV_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-QV}"
 EVAL_SWANLAB_PROJECT="${EVAL_SWANLAB_PROJECT:-${SWANLAB_PROJECT}-Eval}"
 RUN_NAME="${RUN_NAME:-${DEFAULT_RUN_NAME}}"
@@ -126,8 +190,25 @@ RUN_TAG="${RUN_NAME}-K${CHUNK_SIZE}-seed${SEED}"
 BC_RUN_NAME="${BC_RUN_NAME:-${RUN_TAG}-bc}"
 QV_RUN_NAME="${QV_RUN_NAME:-${RUN_TAG}-qv}"
 EVAL_RUN_NAME="${EVAL_RUN_NAME:-${RUN_TAG}-H${EXECUTION_HORIZON}-eval}"
-RUN_DIR="${RUN_DIR:-saved_models/${ENV_NAME}/MAC_origin/${RUN_TAG}}"
-BC_SAVE_DIR="${BC_SAVE_DIR:-${RUN_DIR}/categorical_bc}"
+# 新实验统一写入 QV_suite；显式 RUN_DIR 时保留旧的目录覆盖语义。
+OUTPUT_ROOT="${OUTPUT_ROOT:-saved_models/${ENV_NAME}/QV_suite/K${CHUNK_SIZE}}"
+RUN_DIR_WAS_SET=0
+if [[ -n "${RUN_DIR:-}" ]]; then
+  RUN_DIR_WAS_SET=1
+else
+  if [[ "${CRITIC_BACKBONE}" == "transformer" ]]; then
+    RUN_DIR="${OUTPUT_ROOT}/transformer/seed-${SEED}"
+  else
+    RUN_DIR="${OUTPUT_ROOT}/ordinary/seed-${SEED}"
+  fi
+fi
+if [[ -z "${BC_SAVE_DIR:-}" ]]; then
+  if (( RUN_DIR_WAS_SET == 1 )); then
+    BC_SAVE_DIR="${RUN_DIR}/${BC_SUBDIR}"
+  else
+    BC_SAVE_DIR="${OUTPUT_ROOT}/shared_pretrain/seed-${SEED}/${BC_SUBDIR}"
+  fi
+fi
 MAC_SAVE_DIR="${MAC_SAVE_DIR:-${RUN_DIR}/mac_agent}"
 EVAL_SAVE_DIR="${EVAL_SAVE_DIR:-${RUN_DIR}/eval_H${EXECUTION_HORIZON}}"
 BC_ACTOR_CKPT="${BC_ACTOR_CKPT:-}"
@@ -150,6 +231,18 @@ COMMON_ARGS=(
   --device "${DEVICE}"
   --cuda "${CUDA}"
   --batch_size "${BATCH_SIZE}"
+  --actor_type "${ACTOR_TYPE}"
+  --flow_steps "${FLOW_STEPS}"
+  --flow_sample_batch_size "${FLOW_SAMPLE_BATCH_SIZE}"
+  --flow_temperature "${FLOW_TEMPERATURE}"
+  --flow_positive_weight "${FLOW_POSITIVE_WEIGHT}"
+  --flow_distill_weight "${FLOW_DISTILL_WEIGHT}"
+  --flow_sampling_mode "${FLOW_SAMPLING_MODE}"
+  --critic_backbone "${CRITIC_BACKBONE}"
+  --critic_transformer_hidden_dim "${CRITIC_TRANSFORMER_HIDDEN_DIM}"
+  --critic_transformer_layers "${CRITIC_TRANSFORMER_LAYERS}"
+  --critic_transformer_heads "${CRITIC_TRANSFORMER_HEADS}"
+  --critic_transformer_dropout "${CRITIC_TRANSFORMER_DROPOUT}"
   --num_leave_compute "${NUM_LEAVE_COMPUTE}"
   --leave_threshold "${LEAVE_THRESHOLD}"
   --max_turn "${MAX_TURN}"
@@ -249,8 +342,8 @@ find_existing_bc_ckpt() {
   shopt -u nullglob
   for checkpoint_path in "${checkpoints[@]}"; do
     if "${PYTHON_BIN}" -c \
-      'import sys, torch; payload=torch.load(sys.argv[1], map_location="cpu"); raise SystemExit(0 if payload.get("format") == "mac_origin_precomputed_state_v2" else 1)' \
-      "${checkpoint_path}"; then
+      'import sys, torch; payload=torch.load(sys.argv[1], map_location="cpu", weights_only=False); config=payload.get("config", {}); actual=payload.get("actor_type", config.get("actor_type", "categorical")); expected_weight=float(sys.argv[3]); actual_weight=float(config.get("flow_distill_weight", 0.0)); actual_mode=config.get("flow_sampling_mode", "onestep" if payload.get("actor_onestep") is not None else "teacher"); distill_ok=actual != "categorical_flow" or (abs(actual_weight-expected_weight) < 1e-12 and actual_mode == sys.argv[4] and (expected_weight == 0 or payload.get("actor_onestep") is not None)); valid=payload.get("format") == "mac_origin_precomputed_state_v2" and actual == sys.argv[2] and distill_ok; raise SystemExit(0 if valid else 1)' \
+      "${checkpoint_path}" "${ACTOR_TYPE}" "${FLOW_DISTILL_WEIGHT}" "${FLOW_SAMPLING_MODE}"; then
       printf '%s\n' "${checkpoint_path}"
       return 0
     fi
@@ -258,19 +351,26 @@ find_existing_bc_ckpt() {
   return 1
 }
 
-printf '[run_dorl_mac_kuai_train] run_dir=%s (chunk_size=K=%s, seed=%s, execution_horizon=H=%s)\n' \
-  "${RUN_DIR}" "${CHUNK_SIZE}" "${SEED}" "${EXECUTION_HORIZON}"
+printf '[run_dorl_mac_kuai_train] output_root=%s (chunk_size=K=%s, seed=%s, execution_horizon=H=%s)\n' \
+  "${OUTPUT_ROOT}" "${CHUNK_SIZE}" "${SEED}" "${EXECUTION_HORIZON}"
+printf '[run_dorl_mac_kuai_train] paths: bc=%s, qv=%s, eval=%s\n' \
+  "${BC_SAVE_DIR}" "${MAC_SAVE_DIR}" "${EVAL_SAVE_DIR}"
 printf '[run_dorl_mac_kuai_train] dataset: env=%s, trajectories=%s\n' \
   "${ENV_NAME}" "${DATASET_PATH}"
 printf '[run_dorl_mac_kuai_train] user model assets: item=%s, prediction=%s, variance=%s\n' \
   "${ITEM_EMBEDDING_PATH}" "${PREDICTED_MAT_PATH}" "${MAXVAR_MAT_PATH}"
 printf '[run_dorl_mac_kuai_train] open-loop diagnostics: CCR_window=%s, ADR=%s\n' \
   "${COMPLETION_WINDOW}" "${ENABLE_OPEN_LOOP_DIAGNOSTICS}"
-printf '[run_dorl_mac_kuai_train] pretrain (categorical BC): steps=%s, actor_lr=%s\n' \
-  "${PRETRAIN_STEPS}" "${ACTOR_LR}"
+printf '[run_dorl_mac_kuai_train] pretrain: actor=%s, steps=%s, flow_steps=%s, distill_weight=%s, sampling=%s, temperature=%s, actor_lr=%s\n' \
+  "${ACTOR_TYPE}" "${PRETRAIN_STEPS}" "${FLOW_STEPS}" "${FLOW_DISTILL_WEIGHT}" \
+  "${FLOW_SAMPLING_MODE}" "${FLOW_TEMPERATURE}" "${ACTOR_LR}"
 printf '[run_dorl_mac_kuai_train] qv: epoch=%s, step_per_epoch=%s, test_num=%s, rollout_depth=%s, lambda_chunk=%s, leave_policy=%s, repeat_policy=%s\n' \
   "${EPOCH}" "${STEP_PER_EPOCH}" "${TEST_NUM}" \
   "${ROLLOUT_DEPTH}" "${LAMBDA_CHUNK}" "${LEAVE_POLICY}" "${REPEAT_POLICY}"
+printf '[run_dorl_mac_kuai_train] critic: backbone=%s, hidden_dim=%s, layers=%s, heads=%s, dropout=%s\n' \
+  "${CRITIC_BACKBONE}" "${CRITIC_TRANSFORMER_HIDDEN_DIM}" \
+  "${CRITIC_TRANSFORMER_LAYERS}" "${CRITIC_TRANSFORMER_HEADS}" \
+  "${CRITIC_TRANSFORMER_DROPOUT}"
 printf '[run_dorl_mac_kuai_train] reward: entropy=%s(lambda=%s, window=%s), uncertainty=%s(lambda=%s), invalid_penalty=%s, pred_mat_normalize=%s\n' \
   "${USE_ENTROPY_REWARD}" "${LAMBDA_ENTROPY}" "${ENTROPY_WINDOW}" \
   "${USE_UNCERTAINTY_PENALTY}" "${LAMBDA_VARIANCE}" "${INVALID_ACTION_PENALTY}" \
@@ -278,73 +378,100 @@ printf '[run_dorl_mac_kuai_train] reward: entropy=%s(lambda=%s, window=%s), unce
 printf '[run_dorl_mac_kuai_train] swanlab projects: bc=%s, qv=%s, eval=%s\n' \
   "${BC_SWANLAB_PROJECT}" "${QV_SWANLAB_PROJECT}" "${EVAL_SWANLAB_PROJECT}"
 
-# 阶段 ①：Categorical BC 预训练；若目录里已有 latest.pt/其他 *.pt，短路跳过。
-if [[ -z "${BC_ACTOR_CKPT}" ]]; then
-  if BC_ACTOR_CKPT="$(find_existing_bc_ckpt "${BC_SAVE_DIR}")"; then
-    printf '[run_dorl_mac_kuai_train] found existing BC checkpoint, skip BC training: %s\n' \
-      "${BC_ACTOR_CKPT}"
+# 阶段 ①：类别 Flow/CE BC；只复用 actor 类型与蒸馏配置一致的 checkpoint。
+if (( RUN_BC == 1 )); then
+  if [[ -z "${BC_ACTOR_CKPT}" ]]; then
+    if BC_ACTOR_CKPT="$(find_existing_bc_ckpt "${BC_SAVE_DIR}")"; then
+      printf '[run_dorl_mac_kuai_train] found existing BC checkpoint, skip BC training: %s\n' \
+        "${BC_ACTOR_CKPT}"
+    else
+      reset_metrics_log "${BC_SAVE_DIR}/metrics.jsonl" "bc"
+      run_command \
+        "${PYTHON_BIN}" examples/our_model/runners/pretrain_categorical_bc.py \
+        "${COMMON_ARGS[@]}" \
+        --swanlab_project "${BC_SWANLAB_PROJECT}" \
+        --run_name "${BC_RUN_NAME}" \
+        --pretrain_steps "${PRETRAIN_STEPS}" \
+        --actor_lr "${ACTOR_LR}" \
+        --save_dir "${BC_SAVE_DIR}" \
+        --log_interval "${PRETRAIN_LOG_INTERVAL}"
+      BC_ACTOR_CKPT="${BC_SAVE_DIR}/latest.pt"
+    fi
   else
-    reset_metrics_log "${BC_SAVE_DIR}/metrics.jsonl" "bc"
-    run_command \
-      "${PYTHON_BIN}" examples/our_model/runners/pretrain_categorical_bc.py \
-      "${COMMON_ARGS[@]}" \
-      --swanlab_project "${BC_SWANLAB_PROJECT}" \
-      --run_name "${BC_RUN_NAME}" \
-      --pretrain_steps "${PRETRAIN_STEPS}" \
-      --actor_lr "${ACTOR_LR}" \
-      --save_dir "${BC_SAVE_DIR}" \
-      --log_interval "${PRETRAIN_LOG_INTERVAL}"
-    BC_ACTOR_CKPT="${BC_SAVE_DIR}/latest.pt"
+    printf '[run_dorl_mac_kuai_train] use user provided BC checkpoint: %s\n' "${BC_ACTOR_CKPT}"
   fi
-else
-  printf '[run_dorl_mac_kuai_train] use user provided BC checkpoint: %s\n' "${BC_ACTOR_CKPT}"
+elif (( RUN_QV == 1 )) && [[ -z "${BC_ACTOR_CKPT}" ]]; then
+  if BC_ACTOR_CKPT="$(find_existing_bc_ckpt "${BC_SAVE_DIR}")"; then
+    printf '[run_dorl_mac_kuai_train] reuse BC checkpoint for Q/V: %s\n' "${BC_ACTOR_CKPT}"
+  else
+    printf '[run_dorl_mac_kuai_train] ERROR: qv stage requires BC_ACTOR_CKPT or an existing checkpoint under %s.\n' \
+      "${BC_SAVE_DIR}" >&2
+    exit 1
+  fi
 fi
 
-if [[ "${DRY_RUN}" != "1" && ! -f "${BC_ACTOR_CKPT}" ]]; then
+if (( RUN_QV == 1 )) && [[ "${DRY_RUN}" != "1" && ! -f "${BC_ACTOR_CKPT}" ]]; then
   printf '[run_dorl_mac_kuai_train] ERROR: BC checkpoint does not exist: %s\n' "${BC_ACTOR_CKPT}" >&2
   exit 1
 fi
 
-# 阶段 ②：Q/V 训练
-reset_metrics_log "${MAC_SAVE_DIR}/metrics.jsonl" "qv"
-run_command \
-  "${PYTHON_BIN}" examples/our_model/runners/train_dorl_mac_qv.py \
-  "${COMMON_ARGS[@]}" \
-  --swanlab_project "${QV_SWANLAB_PROJECT}" \
-  --run_name "${QV_RUN_NAME}" \
-  --bc_actor_ckpt "${BC_ACTOR_CKPT}" \
-  --epoch "${EPOCH}" \
-  --step-per-epoch "${STEP_PER_EPOCH}" \
-  --qv_lr "${QV_LR}" \
-  --target_tau "${TARGET_TAU}" \
-  --num_samples_train "${NUM_SAMPLES_TRAIN}" \
-  --num_samples_test "${NUM_SAMPLES_TEST}" \
-  --repeat_policy "${REPEAT_POLICY}" \
-  --rollout_depth "${ROLLOUT_DEPTH}" \
-  --lambda_chunk "${LAMBDA_CHUNK}" \
-  --leave_policy "${LEAVE_POLICY}" \
-  --test-num "${TEST_NUM}" \
-  --eval_episodes "${EVAL_EPISODES}" \
-  --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
-  --eval_every_n_epochs "${EVAL_EVERY_N_EPOCHS}" \
-  --buffer-size "${BUFFER_SIZE}" \
-  --save_dir "${MAC_SAVE_DIR}" \
-  --eval_save_dir "${MAC_SAVE_DIR}/eval_during_train_H${EXECUTION_HORIZON}" \
-  --log_interval "${QV_LOG_INTERVAL}" \
-  $( [ "${ENABLE_STEP_PROFILER}" = "1" ] && echo "--enable_step_profiler" )
+# 阶段 ②：严格统一的 chunk Q/V 训练，仅由 CRITIC_BACKBONE 切换 Q 网络。
+if (( RUN_QV == 1 )); then
+  reset_metrics_log "${MAC_SAVE_DIR}/metrics.jsonl" "qv"
+  QV_EXTRA_ARGS=()
+  if is_truthy "${ENABLE_STEP_PROFILER}"; then
+    QV_EXTRA_ARGS+=(--enable_step_profiler)
+  fi
+  if is_truthy "${FREEZE_DYNAMICS_DURING_QV}"; then
+    QV_EXTRA_ARGS+=(--freeze_dynamics_during_qv)
+  fi
+  run_command \
+    "${PYTHON_BIN}" examples/our_model/runners/train_dorl_mac_qv.py \
+    "${COMMON_ARGS[@]}" \
+    --swanlab_project "${QV_SWANLAB_PROJECT}" \
+    --run_name "${QV_RUN_NAME}" \
+    --bc_actor_ckpt "${BC_ACTOR_CKPT}" \
+    --epoch "${EPOCH}" \
+    --step-per-epoch "${STEP_PER_EPOCH}" \
+    --qv_lr "${QV_LR}" \
+    --target_tau "${TARGET_TAU}" \
+    --num_samples_train "${NUM_SAMPLES_TRAIN}" \
+    --num_samples_test "${NUM_SAMPLES_TEST}" \
+    --repeat_policy "${REPEAT_POLICY}" \
+    --rollout_depth "${ROLLOUT_DEPTH}" \
+    --lambda_chunk "${LAMBDA_CHUNK}" \
+    --leave_policy "${LEAVE_POLICY}" \
+    --test-num "${TEST_NUM}" \
+    --eval_episodes "${EVAL_EPISODES}" \
+    --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
+    --eval_every_n_epochs "${EVAL_EVERY_N_EPOCHS}" \
+    --buffer-size "${BUFFER_SIZE}" \
+    --save_dir "${MAC_SAVE_DIR}" \
+    --eval_save_dir "${MAC_SAVE_DIR}/eval_during_train_H${EXECUTION_HORIZON}" \
+    --log_interval "${QV_LOG_INTERVAL}" \
+    "${QV_EXTRA_ARGS[@]}"
+fi
 
-# 阶段 ③：最终评估
-reset_metrics_log "${EVAL_SAVE_DIR}/metrics.jsonl" "eval"
-run_command \
-  "${PYTHON_BIN}" examples/our_model/runners/eval_dorl_mac.py \
-  "${COMMON_ARGS[@]}" \
-  --swanlab_project "${EVAL_SWANLAB_PROJECT}" \
-  --run_name "${EVAL_RUN_NAME}" \
-  --mac_ckpt "${MAC_SAVE_DIR}/latest.pt" \
-  --num_samples_test "${NUM_SAMPLES_TEST}" \
-  --test-num "${TEST_NUM}" \
-  --eval_episodes "${EVAL_EPISODES}" \
-  --buffer-size "${BUFFER_SIZE}" \
-  --eval_save_dir "${EVAL_SAVE_DIR}"
+# 阶段 ③：使用同一 DORL evaluator 进行最终评估。
+if (( RUN_EVAL == 1 )); then
+  if [[ "${DRY_RUN}" != "1" && ! -f "${MAC_SAVE_DIR}/latest.pt" ]]; then
+    printf '[run_dorl_mac_kuai_train] ERROR: eval stage requires %s/latest.pt.\n' \
+      "${MAC_SAVE_DIR}" >&2
+    exit 1
+  fi
+  reset_metrics_log "${EVAL_SAVE_DIR}/metrics.jsonl" "eval"
+  run_command \
+    "${PYTHON_BIN}" examples/our_model/runners/eval_dorl_mac.py \
+    "${COMMON_ARGS[@]}" \
+    --swanlab_project "${EVAL_SWANLAB_PROJECT}" \
+    --run_name "${EVAL_RUN_NAME}" \
+    --mac_ckpt "${MAC_SAVE_DIR}/latest.pt" \
+    --num_samples_test "${NUM_SAMPLES_TEST}" \
+    --test-num "${TEST_NUM}" \
+    --eval_episodes "${EVAL_EPISODES}" \
+    --buffer-size "${BUFFER_SIZE}" \
+    --eval_save_dir "${EVAL_SAVE_DIR}"
+fi
 
-printf '\n[run_dorl_mac_kuai_train] done. outputs are under %s\n' "${RUN_DIR}"
+printf '\n[run_dorl_mac_kuai_train] done. bc=%s qv=%s eval=%s\n' \
+  "${BC_SAVE_DIR}" "${MAC_SAVE_DIR}" "${EVAL_SAVE_DIR}"

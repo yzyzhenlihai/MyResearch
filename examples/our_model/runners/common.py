@@ -37,6 +37,21 @@ from examples.our_model.models.leave_model import RuleBasedLeaveModel  # noqa: E
 from examples.our_model.models.chunk_dynamics import (  # noqa: E402
     ChunkDynamics, DEFAULT_DYNAMICS_HIDDEN_DIMS,
 )
+from examples.our_model.models.chunk_actor import (  # noqa: E402
+    DEFAULT_FLOW_DISTILL_WEIGHT,
+    DEFAULT_FLOW_POSITIVE_WEIGHT,
+    DEFAULT_FLOW_SAMPLE_BATCH_SIZE,
+    DEFAULT_FLOW_STEPS,
+    DEFAULT_FLOW_TEMPERATURE,
+)
+from examples.our_model.models.chunk_value import (  # noqa: E402
+    CRITIC_BACKBONE_MLP,
+    DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
+    DEFAULT_CRITIC_TRANSFORMER_HEADS,
+    DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM,
+    DEFAULT_CRITIC_TRANSFORMER_LAYERS,
+    SUPPORTED_CRITIC_BACKBONES,
+)
 from examples.our_model.policy import ActionMapper  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
@@ -356,6 +371,63 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max_chunks", type=int, default=None)
     parser.add_argument("--actor_hidden_dims", type=int, nargs="*", default=list(DEFAULT_ACTOR_HIDDEN_DIMS))
     parser.add_argument("--value_hidden_dims", type=int, nargs="*", default=list(DEFAULT_VALUE_HIDDEN_DIMS))
+    parser.add_argument(
+        "--critic_backbone",
+        choices=sorted(SUPPORTED_CRITIC_BACKBONES),
+        default=CRITIC_BACKBONE_MLP,
+        help="Critic 网络结构；严格架构对照仅切换 mlp/transformer。",
+    )
+    parser.add_argument(
+        "--critic_transformer_hidden_dim",
+        type=int,
+        default=DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM,
+    )
+    parser.add_argument(
+        "--critic_transformer_layers",
+        type=int,
+        default=DEFAULT_CRITIC_TRANSFORMER_LAYERS,
+    )
+    parser.add_argument(
+        "--critic_transformer_heads",
+        type=int,
+        default=DEFAULT_CRITIC_TRANSFORMER_HEADS,
+    )
+    parser.add_argument(
+        "--critic_transformer_dropout",
+        type=float,
+        default=DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
+    )
+    parser.add_argument(
+        "--actor_type", choices=["categorical", "categorical_flow"],
+        default="categorical_flow",
+        help="chunk BC 类型；默认在类别顶点空间使用 Flow Matching。",
+    )
+    parser.add_argument("--flow_steps", type=int, default=DEFAULT_FLOW_STEPS)
+    parser.add_argument(
+        "--flow_sample_batch_size", type=int,
+        default=DEFAULT_FLOW_SAMPLE_BATCH_SIZE,
+        help="Flow 推理单次并行积分的候选数；减小可降低显存峰值。",
+    )
+    parser.add_argument("--flow_temperature", type=float, default=DEFAULT_FLOW_TEMPERATURE)
+    parser.add_argument(
+        "--flow_positive_weight", type=float,
+        default=DEFAULT_FLOW_POSITIVE_WEIGHT,
+        help="Flow 真实类别坐标权重；0 表示自动使用 item 数。",
+    )
+    parser.add_argument(
+        "--flow_distill_weight", type=float,
+        default=DEFAULT_FLOW_DISTILL_WEIGHT,
+        help="一步 actor 蒸馏 MSE 权重；0 禁用蒸馏并要求 teacher 采样。",
+    )
+    parser.add_argument(
+        "--flow_sampling_mode",
+        choices=[
+            mac_agent_module.FLOW_SAMPLING_ONESTEP,
+            mac_agent_module.FLOW_SAMPLING_TEACHER,
+        ],
+        default=mac_agent_module.FLOW_SAMPLING_ONESTEP,
+        help="Flow 候选生成路径；默认使用蒸馏后的一步 actor。",
+    )
     parser.add_argument("--swanlab_project", type=str, default="DORL-MAC")
     parser.add_argument("--run_name", type=str, default="")
     parser.add_argument("--num_leave_compute", type=int, default=9)
@@ -433,12 +505,18 @@ def resolve_common_paths(args: argparse.Namespace) -> None:
         )
 
 
-def apply_checkpoint_model_config(args: argparse.Namespace, checkpoint: Dict[str, Any]) -> None:
+def apply_checkpoint_model_config(
+    args: argparse.Namespace,
+    checkpoint: Dict[str, Any],
+    restore_critic_config: bool = True,
+) -> None:
     """从新格式 checkpoint 恢复模型结构，避免评估误用 CLI 默认维度。
 
     Args:
         args (argparse.Namespace): 将原地更新的 runner 配置。
         checkpoint (Dict[str, Any]): MAC_origin checkpoint。
+        restore_critic_config (bool): 是否恢复 Critic 结构。评估完整 Q/V checkpoint
+            时保持 `True`；从共享 BC checkpoint 开始新 Q/V 训练时设为 `False`。
 
     Returns:
         None.
@@ -455,18 +533,52 @@ def apply_checkpoint_model_config(args: argparse.Namespace, checkpoint: Dict[str
         if key not in config:
             raise ValueError(f"Checkpoint missing model configuration: {key}")
         setattr(args, key, config[key])
-    LOGGER.info("已恢复 checkpoint 模型结构：K=%s, W=%s", args.chunk_size, args.window_size)
+    # 旧 v2 checkpoint 没有 actor_type 字段，明确按原 categorical CE 恢复。
+    args.actor_type = config.get("actor_type", "categorical")
+    if restore_critic_config:
+        args.critic_backbone = config.get("critic_backbone", CRITIC_BACKBONE_MLP)
+        for key, default_value in (
+            ("critic_transformer_hidden_dim", DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM),
+            ("critic_transformer_layers", DEFAULT_CRITIC_TRANSFORMER_LAYERS),
+            ("critic_transformer_heads", DEFAULT_CRITIC_TRANSFORMER_HEADS),
+            ("critic_transformer_dropout", DEFAULT_CRITIC_TRANSFORMER_DROPOUT),
+        ):
+            setattr(args, key, config.get(key, default_value))
+    for key in (
+        "flow_steps", "flow_sample_batch_size", "flow_temperature",
+        "flow_positive_weight",
+    ):
+        if key in config:
+            setattr(args, key, config[key])
+    if args.actor_type == mac_agent_module.ACTOR_TYPE_CATEGORICAL_FLOW:
+        # 早期 Flow checkpoint 只保存多步教师，恢复时继续使用教师采样。
+        has_onestep = checkpoint.get("actor_onestep") is not None
+        args.flow_distill_weight = config.get(
+            "flow_distill_weight", DEFAULT_FLOW_DISTILL_WEIGHT if has_onestep else 0.0,
+        )
+        args.flow_sampling_mode = config.get(
+            "flow_sampling_mode",
+            mac_agent_module.FLOW_SAMPLING_ONESTEP
+            if has_onestep
+            else mac_agent_module.FLOW_SAMPLING_TEACHER,
+        )
+    LOGGER.info(
+        "已恢复 checkpoint 模型结构：K=%s, W=%s, actor=%s, critic=%s",
+        args.chunk_size, args.window_size, args.actor_type, args.critic_backbone,
+    )
 
 
 def build_dataset_and_mapper(
     args: argparse.Namespace,
     device: torch.device,
+    pretraining_only: bool = False,
 ) -> Tuple[ObservedChunkDataset, ActionMapper, torch.Tensor]:
     """构造 action chunk 数据集和 action mapper。
 
     Args:
         args (argparse.Namespace): 命令行参数。
         device (torch.device): 计算设备。
+        pretraining_only (bool): 是否省略 Q/V rollout 专用的历史与 mask 字段。
 
     Returns:
         Tuple[ObservedChunkDataset, ActionMapper, torch.Tensor]: 数据集、映射器和 item embedding。
@@ -485,6 +597,7 @@ def build_dataset_and_mapper(
         window_size=args.window_size,
         leave_history_size=entropy_history_size,
         max_chunks=args.max_chunks,
+        pretraining_only=pretraining_only,
     )
     dataset.validate_action_lookup(max_trajectories=args.max_trajectories)
     action_mapper = ActionMapper(item_embeddings=item_embeddings, device=device)
@@ -700,6 +813,18 @@ def build_agent(
         target_tau=getattr(args, "target_tau", 0.005),
         invalid_action_penalty=getattr(args, "invalid_action_penalty", -1.0),
         dynamics_loss_weight=getattr(args, "dynamics_loss_weight", 1.0),
+        actor_type=args.actor_type,
+        flow_steps=args.flow_steps,
+        flow_sample_batch_size=args.flow_sample_batch_size,
+        flow_temperature=args.flow_temperature,
+        flow_positive_weight=args.flow_positive_weight,
+        flow_distill_weight=args.flow_distill_weight,
+        flow_sampling_mode=args.flow_sampling_mode,
+        critic_backbone=args.critic_backbone,
+        critic_transformer_hidden_dim=args.critic_transformer_hidden_dim,
+        critic_transformer_layers=args.critic_transformer_layers,
+        critic_transformer_heads=args.critic_transformer_heads,
+        critic_transformer_dropout=args.critic_transformer_dropout,
     )
     # 固定观测契约写入 checkpoint，避免误加载上一版重构状态的参数。
     agent.observation_spec = {

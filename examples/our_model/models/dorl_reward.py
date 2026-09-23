@@ -258,6 +258,26 @@ class DORLRewardModel:
 
         return self.reward_components(raw_user_ids, item_ids, history_item_ids)["reward"]
 
+    def raw_preference(self, raw_user_ids: torch.Tensor, item_ids: torch.Tensor) -> torch.Tensor:
+        """返回既定预测变换后的原始偏好，不做 entropy、uncertainty 或平移截断。
+
+        Args:
+            raw_user_ids (torch.Tensor): 原始用户 ID，形状 `(B,)`。
+            item_ids (torch.Tensor): 对齐预测矩阵的内部 item ID，形状 `(B,)`。
+
+        Returns:
+            torch.Tensor: 原始偏好，允许为负，形状 `(B,)`。
+
+        Raises:
+            ValueError: batch 长度不匹配或 item 越界。
+        """
+        items = item_ids.to(device=self.device, dtype=torch.long).reshape(-1)
+        if items.numel() != raw_user_ids.numel():
+            raise ValueError("User and item batches must have equal lengths")
+        if torch.any(items < 0) or torch.any(items >= self.num_items):
+            raise ValueError("Item IDs outside predicted matrix")
+        return self.predicted_mat[self.user_indices(raw_user_ids), items]
+
     def reward_components(
         self,
         raw_user_ids: torch.Tensor,

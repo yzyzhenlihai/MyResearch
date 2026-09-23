@@ -1,4 +1,4 @@
-"""DORL-MAC 离散 Categorical chunk actor 离线预训练入口。"""
+"""DORL-MAC categorical CE 或 categorical Flow chunk actor 预训练入口。"""
 
 from __future__ import annotations
 
@@ -35,8 +35,11 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_PRETRAIN_STEPS = 200_000
 """正式 actor 预训练默认步数。"""
 
-DEFAULT_BC_SUBDIR = "categorical_bc"
-"""actor checkpoint 默认保存子目录。"""
+BC_SUBDIR_BY_ACTOR_TYPE = {
+    "categorical": "categorical_bc",
+    "categorical_flow": "categorical_flow_bc",
+}
+"""不同 actor 类型的默认 checkpoint 子目录。"""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,7 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
         argparse.ArgumentParser: 参数解析器。
     """
 
-    parser = argparse.ArgumentParser(description="Pretrain DORL-MAC discrete categorical chunk actor.")
+    parser = argparse.ArgumentParser(
+        description="Pretrain DORL-MAC categorical CE/Flow chunk actor.",
+    )
     add_common_args(parser)
     parser.add_argument("--pretrain_steps", type=int, default=DEFAULT_PRETRAIN_STEPS)
     parser.add_argument("--actor_lr", type=float, default=3e-4)
@@ -98,11 +103,14 @@ def main(argv: Optional[list[str]] = None) -> Path:
 
     save_dir = ensure_dir(
         args.save_dir
-        or Path(args.save_root) / args.env / "MAC_origin" / DEFAULT_BC_SUBDIR
+        or Path(args.save_root) / args.env / "MAC_origin"
+        / BC_SUBDIR_BY_ACTOR_TYPE[args.actor_type]
     )
     config = namespace_to_dict(args)
     save_resolved_config(save_dir, config)
-    dataset, action_mapper, _ = build_dataset_and_mapper(args, device=device)
+    dataset, action_mapper, _ = build_dataset_and_mapper(
+        args, device=device, pretraining_only=True,
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=min(args.batch_size, len(dataset)),
@@ -119,7 +127,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
     optimizer = torch.optim.Adam(agent.actor_parameters(), lr=args.actor_lr)
     logger = SwanLabLogger(
         project=args.swanlab_project,
-        run_name=default_run_name("categorical-bc", args),
+        run_name=default_run_name(args.actor_type.replace("_", "-"), args),
         config=config,
         log_path=str(save_dir / "metrics.jsonl"),
     )
@@ -133,7 +141,12 @@ def main(argv: Optional[list[str]] = None) -> Path:
             logger.log(metrics, step=dynamics_step)
             LOGGER.info("dynamics step=%s metrics=%s", dynamics_step, metrics)
 
-    LOGGER.info("开始 DORL-MAC categorical BC 预训练：steps=%s", args.pretrain_steps)
+    LOGGER.info(
+        "开始 DORL-MAC chunk BC 预训练：actor=%s, steps=%s, "
+        "flow_steps=%s, distill_weight=%s, sampling=%s",
+        args.actor_type, args.pretrain_steps, args.flow_steps,
+        args.flow_distill_weight, args.flow_sampling_mode,
+    )
     batch_iterator = cycle_dataloader(dataloader)
     last_metrics = {}
     for step in range(1, args.pretrain_steps + 1):

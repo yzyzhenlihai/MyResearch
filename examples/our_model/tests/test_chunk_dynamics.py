@@ -22,6 +22,7 @@ from examples.our_model.data.observed_chunk_dataset import ObservedChunkDataset
 from examples.our_model.data.trajectory_loader import TrajectoryBundle
 from examples.our_model.models.chunk_dynamics import ChunkDynamics
 from examples.our_model.models.mac_agent import MACAgent
+from examples.our_model.models.chunk_value import CRITIC_BACKBONE_TRANSFORMER
 from examples.our_model.policy.action_mapper import ActionMapper
 from examples.our_model.tests.test_mac_agent_unique_sampling import attach_rollout_dependencies
 
@@ -62,12 +63,17 @@ def build_fixture() -> tuple[torch.Tensor, ObservedChunkDataset, dict[str, torch
     return items, dataset, batch
 
 
-def build_agent(items: torch.Tensor, state_dim: int = 2) -> MACAgent:
+def build_agent(
+    items: torch.Tensor,
+    state_dim: int = 2,
+    critic_backbone: str = "mlp",
+) -> MACAgent:
     """构造使用真实 ChunkDynamics 的小型测试 agent。
 
     Args:
         items (torch.Tensor): item embedding 表。
         state_dim (int): pkl observation 维度。
+        critic_backbone (str): Critic 网络结构。
 
     Returns:
         MACAgent: 具有规则奖励依赖的 CPU agent。
@@ -76,6 +82,11 @@ def build_agent(items: torch.Tensor, state_dim: int = 2) -> MACAgent:
     mapper = ActionMapper(items, torch.device("cpu"))
     agent = MACAgent(
         state_dim, 4, 3, (16,), (16,), 0.9, torch.device("cpu"), mapper,
+        critic_backbone=critic_backbone,
+        critic_transformer_hidden_dim=16,
+        critic_transformer_layers=1,
+        critic_transformer_heads=4,
+        critic_transformer_dropout=0.0,
     )
     attach_rollout_dependencies(agent, max_turn=9)
     agent.dynamics = ChunkDynamics(state_dim, 4, 3, (32,))
@@ -142,6 +153,29 @@ class ChunkDynamicsTest(unittest.TestCase):
         self.assertAlmostEqual(self.batch["rewards"][0].item(), 0.9, places=6)
         self.assertNotIn("history_vectors", self.batch)
 
+    def test_pretraining_dataset_skips_rollout_only_fields(self) -> None:
+        """BC/dynamics 数据不应构造历史、reward 与全目录推荐 mask。"""
+
+        pretraining_dataset = ObservedChunkDataset(
+            self.dataset.bundle,
+            self.items,
+            chunk_size=3,
+            gamma=0.9,
+            window_size=2,
+            pretraining_only=True,
+        )
+        sample = pretraining_dataset[1]
+        self.assertEqual(set(sample), {
+            "observations",
+            "next_observations",
+            "prefix_next_observations",
+            "actions",
+            "chunk_item_ids",
+            "chunk_valid",
+        })
+        self.assertNotIn("recommended_mask", sample)
+        self.assertNotIn("leave_history_item_ids", sample)
+
     def test_prefix_mask_excludes_unexecuted_actions(self) -> None:
         """验证 padding 动作不影响预测、零步恒等且有效位必须连续。"""
 
@@ -176,6 +210,31 @@ class ChunkDynamicsTest(unittest.TestCase):
             rollout_depth=2,
         )
         self.assertTrue(np.isfinite(list(metrics.values())).all())
+
+    def test_qv_update_can_keep_dynamics_frozen(self) -> None:
+        """ordinary 的 MAC Q/V 更新不得改变共享 checkpoint 中的 dynamics。"""
+
+        agent = build_agent(self.items, self.dataset.state_dim)
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in agent.dynamics.named_parameters()
+        }
+        agent.dynamics.eval().requires_grad_(False)
+        agent.dynamics_loss_weight = 0.0
+        optimizer = torch.optim.Adam(
+            agent.qv_parameters(include_dynamics=False),
+            lr=0.001,
+        )
+        metrics = agent.qv_update(
+            self.batch,
+            optimizer,
+            num_samples_train=2,
+            rollout_depth=2,
+        )
+        self.assertEqual(metrics["dynamics/loss"], 0.0)
+        self.assertFalse(agent.dynamics.training)
+        for name, parameter in agent.dynamics.named_parameters():
+            torch.testing.assert_close(parameter, before[name])
 
     def test_predictions_recur_without_state_reencoding(self) -> None:
         """验证 imagined rollout 的下一块输入严格使用上一块预测。"""
@@ -213,6 +272,51 @@ class ChunkDynamicsTest(unittest.TestCase):
         state["observation_spec"] = {"wrong_state": True}
         with self.assertRaises(ValueError):
             restored.load_checkpoint_state(state, strict=False)
+
+    def test_bc_checkpoint_load_skips_qv_for_transformer_control(self) -> None:
+        """Transformer 对照只复用 BC Actor/Dynamics，并拒绝误载 MLP Q/V。"""
+
+        source = build_agent(self.items, self.dataset.state_dim)
+        checkpoint = source.checkpoint_state({"critic_backbone": "mlp"})
+        transformer = build_agent(
+            self.items,
+            self.dataset.state_dim,
+            critic_backbone=CRITIC_BACKBONE_TRANSFORMER,
+        )
+        transformer.load_checkpoint_state(checkpoint, load_qv=False)
+        for source_parameter, target_parameter in zip(
+            source.actor.parameters(), transformer.actor.parameters(),
+        ):
+            torch.testing.assert_close(source_parameter, target_parameter)
+        metrics = transformer.qv_update(
+            self.batch,
+            torch.optim.Adam(transformer.qv_parameters(), lr=0.001),
+            num_samples_train=2,
+            rollout_depth=2,
+        )
+        self.assertTrue(np.isfinite(list(metrics.values())).all())
+        with self.assertRaises(ValueError):
+            transformer.load_checkpoint_state(checkpoint, load_qv=True)
+
+    def test_critic_controls_share_actor_and_value_initialization(self) -> None:
+        """同 seed 下切换 Critic 不得改变共享 Actor 与 Value 的初始参数。"""
+
+        torch.manual_seed(TEST_SEED)
+        mlp_agent = build_agent(self.items, self.dataset.state_dim)
+        torch.manual_seed(TEST_SEED)
+        transformer_agent = build_agent(
+            self.items,
+            self.dataset.state_dim,
+            critic_backbone=CRITIC_BACKBONE_TRANSFORMER,
+        )
+        for mlp_parameter, transformer_parameter in zip(
+            mlp_agent.actor.parameters(), transformer_agent.actor.parameters(),
+        ):
+            torch.testing.assert_close(mlp_parameter, transformer_parameter)
+        for mlp_parameter, transformer_parameter in zip(
+            mlp_agent.value.parameters(), transformer_agent.value.parameters(),
+        ):
+            torch.testing.assert_close(mlp_parameter, transformer_parameter)
 
 
 if __name__ == "__main__":

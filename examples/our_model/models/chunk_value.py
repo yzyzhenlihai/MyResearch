@@ -9,6 +9,30 @@ from torch import nn
 
 from examples.our_model.models.mlp import MLP
 
+CRITIC_BACKBONE_MLP = "mlp"
+"""原 MAC 使用的拼接式 MLP Critic。"""
+
+CRITIC_BACKBONE_TRANSFORMER = "transformer"
+"""使用状态 token 与 chunk 动作 token 的 Transformer Critic。"""
+
+SUPPORTED_CRITIC_BACKBONES = {
+    CRITIC_BACKBONE_MLP,
+    CRITIC_BACKBONE_TRANSFORMER,
+}
+"""严格 Q/V 架构对照支持的 Critic 类型。"""
+
+DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM = 72
+"""Transformer Critic 默认 token 维度，使参数量与 `(256,256)` MLP 接近。"""
+
+DEFAULT_CRITIC_TRANSFORMER_LAYERS = 2
+"""Transformer Critic 默认编码层数。"""
+
+DEFAULT_CRITIC_TRANSFORMER_HEADS = 4
+"""Transformer Critic 默认注意力头数。"""
+
+DEFAULT_CRITIC_TRANSFORMER_DROPOUT = 0.0
+"""严格架构对照默认关闭 dropout，与原 MLP Critic 保持一致。"""
+
 
 class ChunkValue(nn.Module):
     """状态价值函数 `V(s)`。"""
@@ -72,3 +96,103 @@ class ChunkCritic(nn.Module):
         """
 
         return self.net(torch.cat([states, chunks], dim=-1)).squeeze(-1)
+
+
+class TransformerChunkCritic(nn.Module):
+    """用 Transformer 编码完整 action chunk 的标量 Critic。
+
+    网络把状态映射为一个 state token，把 K 个 item embedding 分别映射为动作
+    token，并使用双向自注意力聚合完整 chunk。输出仍是与原 MAC 完全相同的
+    `Q(s, a_{t:t+K-1})` 标量，因此只替换网络结构，不改变 Q/V 训练目标。
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        hidden_dim: int = DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM,
+        num_layers: int = DEFAULT_CRITIC_TRANSFORMER_LAYERS,
+        num_heads: int = DEFAULT_CRITIC_TRANSFORMER_HEADS,
+        dropout: float = DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
+    ) -> None:
+        """初始化 Transformer Critic。
+
+        Args:
+            state_dim (int): 状态向量维度，必须为正数。
+            action_dim (int): 单个 item embedding 维度，必须为正数。
+            chunk_size (int): action chunk 长度 K，必须为正数。
+            hidden_dim (int): token 隐藏维度，必须能被注意力头数整除。
+            num_layers (int): TransformerEncoder 层数，必须为正数。
+            num_heads (int): 多头注意力头数，必须为正数。
+            dropout (float): dropout 概率，取值范围 `[0, 1)`。
+
+        Raises:
+            ValueError: 网络维度或 dropout 配置不合法时抛出。
+        """
+
+        super().__init__()
+        if min(state_dim, action_dim, chunk_size, hidden_dim, num_layers, num_heads) <= 0:
+            raise ValueError("Transformer critic dimensions must be positive.")
+        if hidden_dim % num_heads != 0:
+            raise ValueError("Transformer critic hidden_dim must be divisible by num_heads.")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("Transformer critic dropout must lie in [0, 1).")
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.chunk_size = int(chunk_size)
+        self.chunk_action_dim = self.action_dim * self.chunk_size
+        self.state_projection = nn.Linear(self.state_dim, hidden_dim)
+        self.action_projection = nn.Linear(self.action_dim, hidden_dim)
+        self.position_embedding = nn.Embedding(self.chunk_size + 1, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            enable_nested_tensor=False,
+        )
+        self.output = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, 1))
+
+    def forward(self, states: torch.Tensor, chunks: torch.Tensor) -> torch.Tensor:
+        """计算完整 chunk 的标量 Q 值。
+
+        Args:
+            states (torch.Tensor): 状态张量，形状为 `(B, state_dim)`。
+            chunks (torch.Tensor): 展平的 chunk embedding，形状为
+                `(B, chunk_size * action_dim)`。
+
+        Returns:
+            torch.Tensor: 标量 Q 值，形状为 `(B,)`。
+
+        Raises:
+            ValueError: 输入 batch 或特征维度与初始化配置不一致时抛出。
+        """
+
+        if states.ndim != 2 or states.shape[1] != self.state_dim:
+            raise ValueError(
+                f"states must have shape (B, {self.state_dim}), got {tuple(states.shape)}."
+            )
+        if chunks.ndim != 2 or chunks.shape[1] != self.chunk_action_dim:
+            raise ValueError(
+                "chunks must have shape "
+                f"(B, {self.chunk_action_dim}), got {tuple(chunks.shape)}."
+            )
+        if states.shape[0] != chunks.shape[0]:
+            raise ValueError("states and chunks must have equal batch sizes.")
+        batch_size = states.shape[0]
+        action_tokens = self.action_projection(
+            chunks.reshape(batch_size, self.chunk_size, self.action_dim)
+        )
+        state_token = self.state_projection(states).unsqueeze(1)
+        tokens = torch.cat((state_token, action_tokens), dim=1)
+        positions = self.position_embedding.weight[: self.chunk_size + 1]
+        encoded = self.encoder(tokens + positions.unsqueeze(0))
+        return self.output(encoded[:, 0]).squeeze(-1)

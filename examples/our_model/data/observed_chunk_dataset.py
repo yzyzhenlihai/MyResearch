@@ -18,15 +18,43 @@ class ObservedChunkDataset(ActionChunkDataset):
     transition 的 `next_observations`，因此训练期无需重新编码交互历史。
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        pretraining_only: bool = False,
+        **kwargs,
+    ) -> None:
         """初始化预编码状态动作块数据集。
 
         Args:
             *args: `ActionChunkDataset` 位置参数。
+            pretraining_only (bool): 只返回 BC 与 dynamics 需要的字段，避免为
+                每个样本构造 rollout 历史和全目录推荐 mask。
             **kwargs: `ActionChunkDataset` 关键字参数。
         """
         super().__init__(*args, **kwargs)
         self.state_dim = self.bundle.state_dim
+        self.pretraining_only = bool(pretraining_only)
+        self._validate_finite_trajectories()
+
+    def _validate_finite_trajectories(self) -> None:
+        """在初始化阶段一次性验证数值，避免每次取样扫描整条轨迹。
+
+        Raises:
+            ValueError: 任一轨迹的状态、动作或奖励包含非有限值。
+        """
+        for trajectory_index, trajectory in enumerate(self.bundle.trajectories):
+            finite = all(
+                np.isfinite(np.asarray(trajectory[key])).all()
+                for key in (
+                    "observations", "next_observations", "actions", "rewards",
+                )
+            )
+            if not finite:
+                raise ValueError(
+                    "Stored transitions must contain finite values: "
+                    f"trajectory={trajectory_index}"
+                )
 
     def _build_sample_index(self, max_chunks: Optional[int]) -> List[Tuple[int, int]]:
         """保留所有真实起点，包括短会话和尾部不足 K 的片段。
@@ -72,17 +100,7 @@ class ObservedChunkDataset(ActionChunkDataset):
         actions = np.asarray(trajectory["actions"], dtype=np.float32)
         rewards = np.asarray(trajectory["rewards"], dtype=np.float32).reshape(-1)
         terminals = np.asarray(trajectory["terminals"], dtype=bool).reshape(-1)
-        if not (
-            np.isfinite(observations).all()
-            and np.isfinite(next_observations).all()
-            and np.isfinite(actions).all()
-            and np.isfinite(rewards).all()
-        ):
-            raise ValueError("Stored transitions must contain finite values.")
-
         item_ids = self._get_item_ids(trajectory_index, actions)
-        previous_terminals = np.flatnonzero(terminals[:position])
-        episode_start = int(previous_terminals[-1] + 1) if len(previous_terminals) else 0
         end = min(position + self.chunk_size, len(actions))
         future_terminals = np.flatnonzero(terminals[position:end])
         if len(future_terminals):
@@ -100,18 +118,25 @@ class ObservedChunkDataset(ActionChunkDataset):
             self.chunk_size, 1,
         )
         prefix_targets[:length] = torch.from_numpy(next_observations[position:end])
-        leave_history = self._build_padded_item_history(
-            item_ids[episode_start:], position - episode_start, self.leave_history_size,
-        )
-        recommended_mask = torch.zeros(self.num_items, dtype=torch.bool)
-        recommended_mask[torch.as_tensor(item_ids[episode_start:position])] = True
-        return {
+        sample = {
             "observations": torch.from_numpy(observations[position]),
             "next_observations": torch.from_numpy(next_observations[end - 1]),
             "prefix_next_observations": prefix_targets,
             "actions": action_chunk.flatten(),
             "chunk_item_ids": item_chunk,
             "chunk_valid": valid,
+        }
+        if self.pretraining_only:
+            return sample
+
+        previous_terminals = np.flatnonzero(terminals[:position])
+        episode_start = int(previous_terminals[-1] + 1) if len(previous_terminals) else 0
+        leave_history = self._build_padded_item_history(
+            item_ids[episode_start:], position - episode_start, self.leave_history_size,
+        )
+        recommended_mask = torch.zeros(self.num_items, dtype=torch.bool)
+        recommended_mask[torch.as_tensor(item_ids[episode_start:position])] = True
+        sample.update({
             "chunk_step_rewards": reward_steps,
             "rewards": (reward_steps * torch.from_numpy(self.discount)).sum().reshape(1),
             "terminals": torch.tensor([bool(terminals[end - 1] or end == len(actions))]),
@@ -121,4 +146,5 @@ class ObservedChunkDataset(ActionChunkDataset):
             "user_id": torch.tensor([int(trajectory["user_id"])]),
             "start_index": torch.tensor([position]),
             "env_step": torch.tensor([0]),
-        }
+        })
+        return sample

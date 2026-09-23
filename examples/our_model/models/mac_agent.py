@@ -10,8 +10,28 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from examples.our_model.models.chunk_actor import CategoricalChunkActor
-from examples.our_model.models.chunk_value import ChunkCritic, ChunkValue
+from examples.our_model.models.chunk_actor import (
+    CategoricalChunkActor,
+    CategoricalFlowChunkActor,
+    CategoricalFlowOneStepActor,
+    DEFAULT_FLOW_DISTILL_WEIGHT,
+    DEFAULT_FLOW_POSITIVE_WEIGHT,
+    DEFAULT_FLOW_SAMPLE_BATCH_SIZE,
+    DEFAULT_FLOW_STEPS,
+    DEFAULT_FLOW_TEMPERATURE,
+)
+from examples.our_model.models.chunk_value import (
+    CRITIC_BACKBONE_MLP,
+    CRITIC_BACKBONE_TRANSFORMER,
+    DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
+    DEFAULT_CRITIC_TRANSFORMER_HEADS,
+    DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM,
+    DEFAULT_CRITIC_TRANSFORMER_LAYERS,
+    SUPPORTED_CRITIC_BACKBONES,
+    ChunkCritic,
+    ChunkValue,
+    TransformerChunkCritic,
+)
 from examples.our_model.models.dorl_reward import DORLRewardModel
 from examples.our_model.models.leave_model import RuleBasedLeaveModel
 from examples.our_model.models.chunk_dynamics import ChunkDynamics
@@ -34,6 +54,30 @@ DEFAULT_INVALID_ACTION_PENALTY = -1.0
 
 _MASK_LOGIT_VALUE = -1.0e9
 """被 `recommended_mask` 屏蔽的候选 item 用于 softmax 的极小 logit。"""
+
+ACTOR_TYPE_CATEGORICAL = "categorical"
+"""原离散交叉熵 categorical actor 类型。"""
+
+ACTOR_TYPE_CATEGORICAL_FLOW = "categorical_flow"
+"""类别顶点空间的 Flow Matching actor 类型。"""
+
+FLOW_SAMPLING_ONESTEP = "onestep"
+"""使用蒸馏后的一步 actor 生成 Flow 候选。"""
+
+FLOW_SAMPLING_TEACHER = "teacher"
+"""使用多步 Euler Flow 教师生成候选。"""
+
+SUPPORTED_FLOW_SAMPLING_MODES = {
+    FLOW_SAMPLING_ONESTEP,
+    FLOW_SAMPLING_TEACHER,
+}
+"""Flow checkpoint 支持的推理路径。"""
+
+SUPPORTED_ACTOR_TYPES = {
+    ACTOR_TYPE_CATEGORICAL,
+    ACTOR_TYPE_CATEGORICAL_FLOW,
+}
+"""当前 checkpoint 和训练入口支持的 actor 类型。"""
 
 
 @dataclass
@@ -127,7 +171,7 @@ class TrajectoryRollout:
 
 
 class MACAgent(nn.Module):
-    """PyTorch 版 DORL-MAC 最小闭环 agent（离散 Categorical + rejection sampling）。
+    """PyTorch DORL-MAC agent，支持 categorical CE 与 categorical Flow actor。
 
     该 agent 管理 chunk actor（离散 Categorical BC）、critic/value、直接
     chunk dynamics、DORL reward model、leave model。整个流水线中动作始终
@@ -154,6 +198,18 @@ class MACAgent(nn.Module):
         target_tau: float = 0.005,
         invalid_action_penalty: float = DEFAULT_INVALID_ACTION_PENALTY,
         dynamics_loss_weight: float = 1.0,
+        actor_type: str = ACTOR_TYPE_CATEGORICAL,
+        flow_steps: int = DEFAULT_FLOW_STEPS,
+        flow_temperature: float = DEFAULT_FLOW_TEMPERATURE,
+        flow_positive_weight: float = DEFAULT_FLOW_POSITIVE_WEIGHT,
+        flow_sample_batch_size: int = DEFAULT_FLOW_SAMPLE_BATCH_SIZE,
+        flow_distill_weight: float = DEFAULT_FLOW_DISTILL_WEIGHT,
+        flow_sampling_mode: str = FLOW_SAMPLING_ONESTEP,
+        critic_backbone: str = CRITIC_BACKBONE_MLP,
+        critic_transformer_hidden_dim: int = DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM,
+        critic_transformer_layers: int = DEFAULT_CRITIC_TRANSFORMER_LAYERS,
+        critic_transformer_heads: int = DEFAULT_CRITIC_TRANSFORMER_HEADS,
+        critic_transformer_dropout: float = DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
     ) -> None:
         """初始化 DORL-MAC agent。
 
@@ -173,6 +229,18 @@ class MACAgent(nn.Module):
             target_tau (float): target value 软更新系数。
             invalid_action_penalty (float): 重复 item 或类别退出规则违规惩罚。
             dynamics_loss_weight (float): dynamics 监督 next-state loss 权重。
+            actor_type (str): `categorical` 或 `categorical_flow`。
+            flow_steps (int): Flow actor 推理时 Euler 积分步数。
+            flow_temperature (float): Flow 终点 categorical softmax 温度。
+            flow_positive_weight (float): Flow 真实类别坐标损失权重，零为自动值。
+            flow_sample_batch_size (int): Flow 推理时单次并行积分的候选数。
+            flow_distill_weight (float): 一步 actor 蒸馏 MSE 的损失权重；零为禁用。
+            flow_sampling_mode (str): `onestep` 使用学生，`teacher` 使用多步积分。
+            critic_backbone (str): Critic 网络类型，支持 `mlp` 或 `transformer`。
+            critic_transformer_hidden_dim (int): Transformer Critic token 维度。
+            critic_transformer_layers (int): Transformer Critic 编码层数。
+            critic_transformer_heads (int): Transformer Critic 注意力头数。
+            critic_transformer_dropout (float): Transformer Critic dropout。
 
         Raises:
             ValueError: 当关键超参数非法时抛出。
@@ -185,6 +253,18 @@ class MACAgent(nn.Module):
             raise ValueError("gamma must be in [0, 1].")
         if not 0 < target_tau <= 1:
             raise ValueError("target_tau must be in (0, 1].")
+        if actor_type not in SUPPORTED_ACTOR_TYPES:
+            raise ValueError(f"Unsupported actor_type: {actor_type}")
+        if flow_distill_weight < 0:
+            raise ValueError("flow_distill_weight must be non-negative")
+        if flow_sampling_mode not in SUPPORTED_FLOW_SAMPLING_MODES:
+            raise ValueError(f"Unsupported flow_sampling_mode: {flow_sampling_mode}")
+        if critic_backbone not in SUPPORTED_CRITIC_BACKBONES:
+            raise ValueError(f"Unsupported critic_backbone: {critic_backbone}")
+        if (actor_type == ACTOR_TYPE_CATEGORICAL_FLOW
+                and flow_sampling_mode == FLOW_SAMPLING_ONESTEP
+                and flow_distill_weight == 0):
+            raise ValueError("onestep Flow sampling requires positive distill weight")
         self.state_dim = int(state_dim)
         self.action_dim = int(action_dim)
         self.chunk_size = int(chunk_size)
@@ -199,21 +279,59 @@ class MACAgent(nn.Module):
         self.target_tau = float(target_tau)
         self.invalid_action_penalty = float(invalid_action_penalty)
         self.dynamics_loss_weight = float(dynamics_loss_weight)
+        self.actor_type = actor_type
+        self.flow_distill_weight = float(flow_distill_weight)
+        self.flow_sampling_mode = flow_sampling_mode
+        self.critic_backbone = critic_backbone
+        self.actor_onestep: Optional[CategoricalFlowOneStepActor] = None
 
-        self.actor = CategoricalChunkActor(
-            state_dim=self.state_dim,
-            chunk_size=self.chunk_size,
-            num_items=self.num_items,
-            hidden_dims=actor_hidden_dims,
-        ).to(device)
-        self.critic = ChunkCritic(
-            self.state_dim,
-            self.chunk_action_dim,
-            value_hidden_dims,
-        ).to(device)
+        if actor_type == ACTOR_TYPE_CATEGORICAL_FLOW:
+            self.actor = CategoricalFlowChunkActor(
+                state_dim=self.state_dim,
+                chunk_size=self.chunk_size,
+                num_items=self.num_items,
+                hidden_dims=actor_hidden_dims,
+                flow_steps=flow_steps,
+                temperature=flow_temperature,
+                positive_weight=flow_positive_weight,
+                sample_batch_size=flow_sample_batch_size,
+            ).to(device)
+            if self.flow_distill_weight > 0:
+                self.actor_onestep = CategoricalFlowOneStepActor(
+                    state_dim=self.state_dim,
+                    chunk_size=self.chunk_size,
+                    num_items=self.num_items,
+                    hidden_dims=actor_hidden_dims,
+                    temperature=flow_temperature,
+                ).to(device)
+        else:
+            self.actor = CategoricalChunkActor(
+                state_dim=self.state_dim,
+                chunk_size=self.chunk_size,
+                num_items=self.num_items,
+                hidden_dims=actor_hidden_dims,
+            ).to(device)
+        # Value 网络在可变 Critic 之前初始化，保证同 seed 下两个架构对照使用
+        # 完全相同的 V/target-V 初始参数。
         self.value = ChunkValue(self.state_dim, value_hidden_dims).to(device)
         self.target_value = copy.deepcopy(self.value).to(device)
         self.target_value.requires_grad_(False)
+        if self.critic_backbone == CRITIC_BACKBONE_TRANSFORMER:
+            self.critic = TransformerChunkCritic(
+                state_dim=self.state_dim,
+                action_dim=self.action_dim,
+                chunk_size=self.chunk_size,
+                hidden_dim=critic_transformer_hidden_dim,
+                num_layers=critic_transformer_layers,
+                num_heads=critic_transformer_heads,
+                dropout=critic_transformer_dropout,
+            ).to(device)
+        else:
+            self.critic = ChunkCritic(
+                self.state_dim,
+                self.chunk_action_dim,
+                value_hidden_dims,
+            ).to(device)
         # rollout 期间缓存的原始 user id；由 rollout 入口设置后供 _rollout_one_chunk 复用。
         self._batch_user_ids: Optional[torch.Tensor] = None
 
@@ -227,17 +345,27 @@ class MACAgent(nn.Module):
             Iterable[nn.Parameter]: categorical actor 参数。
         """
 
-        return list(self.actor.parameters())
+        parameters = list(self.actor.parameters())
+        if self.actor_onestep is not None:
+            parameters += list(self.actor_onestep.parameters())
+        return parameters
 
-    def qv_parameters(self) -> Iterable[nn.Parameter]:
+    def qv_parameters(
+        self,
+        include_dynamics: bool = True,
+    ) -> Iterable[nn.Parameter]:
         """返回 Q/V 训练需要优化的参数。
 
+        Args:
+            include_dynamics (bool): 是否把 dynamics 参数加入优化器。关闭时可复用
+                BC 阶段保存的固定 dynamics，仅训练 critic 与 value。
+
         Returns:
-            Iterable[nn.Parameter]: critic 与 value 参数。
+            Iterable[nn.Parameter]: critic、value 以及可选 dynamics 参数。
         """
 
         parameters = list(self.critic.parameters()) + list(self.value.parameters())
-        if self.dynamics is not None:
+        if include_dynamics and self.dynamics is not None:
             parameters += list(self.dynamics.parameters())
         return parameters
 
@@ -249,17 +377,17 @@ class MACAgent(nn.Module):
         batch: Dict[str, torch.Tensor],
         optimizer: torch.optim.Optimizer,
     ) -> Dict[str, float]:
-        """执行一次离散 categorical BC actor 预训练更新。
+        """按 actor 类型执行交叉熵或类别 Flow Matching BC 更新。
 
-        对 chunk 内每一步 item id 做交叉熵监督，等价于把 chunk 看作 K 个条件独立
-        的离散 action，用离线数据集的真实 item id 作为标签。
+        `categorical` 对每步 item ID 做交叉熵监督；`categorical_flow` 将真实 ID
+        转为 one-hot 类别顶点，并回归高斯噪声到目标顶点的条件速度。
 
         Args:
             batch (Dict[str, torch.Tensor]): ActionChunkDataset 输出的 batch。
             optimizer (torch.optim.Optimizer): actor 优化器。
 
         Returns:
-            Dict[str, float]: 训练指标，含 CE loss、每步平均 log-prob、entropy 等。
+            Dict[str, float]: CE 指标或 Flow 速度回归指标，以及 dynamics 误差。
         """
 
         self.train()
@@ -267,10 +395,52 @@ class MACAgent(nn.Module):
         chunk_item_ids = self._batch_tensor(batch, "chunk_item_ids").long()
         optimizer.zero_grad(set_to_none=True)
 
+        valid = batch.get("chunk_valid", torch.ones_like(chunk_item_ids))
+        valid = valid.to(self.device).bool()
+        if self.actor_type == ACTOR_TYPE_CATEGORICAL_FLOW:
+            flow_loss, flow_metrics = self.actor.flow_matching_loss(
+                states, chunk_item_ids, valid,
+            )
+            distill_loss = torch.zeros((), device=self.device)
+            distill_mae = torch.zeros((), device=self.device)
+            if self.actor_onestep is not None:
+                noises = torch.randn(
+                    len(states), self.chunk_size, self.num_items,
+                    device=self.device, dtype=states.dtype,
+                )
+                with torch.no_grad():
+                    teacher_endpoints = self.actor.integrate(states, noises)
+                student_endpoints = self.actor_onestep(states, noises)
+                endpoint_error = student_endpoints - teacher_endpoints
+                valid_float = valid.to(endpoint_error.dtype)
+                valid_coordinates = valid_float.sum().clamp_min(1) * self.num_items
+                distill_loss = (
+                    endpoint_error.square() * valid_float[..., None]
+                ).sum() / valid_coordinates
+                distill_mae = (
+                    endpoint_error.abs() * valid_float[..., None]
+                ).sum() / valid_coordinates
+            actor_loss = flow_loss + self.flow_distill_weight * distill_loss
+            actor_loss.backward()
+            optimizer.step()
+            dynamics_mse = self.compute_dynamics_mse(batch)
+            return {
+                "actor/loss": float(actor_loss.detach().cpu()),
+                "actor/flow_loss": float(flow_metrics["flow_loss"].cpu()),
+                "actor/distill_loss": float(distill_loss.detach().cpu()),
+                "actor/distill_endpoint_mae": float(distill_mae.detach().cpu()),
+                "actor/distill_weight": self.flow_distill_weight,
+                "actor/velocity_norm": float(flow_metrics["velocity_norm"].cpu()),
+                "actor/target_velocity_norm": float(
+                    flow_metrics["target_velocity_norm"].cpu()
+                ),
+                "actor/time_mean": float(flow_metrics["time_mean"].cpu()),
+                "dynamics/next_state_mse": dynamics_mse,
+            }
+
         logits = self.actor(states)  # (B, K, N)
         log_probs_all = torch.log_softmax(logits, dim=-1)
         gathered = log_probs_all.gather(-1, chunk_item_ids.unsqueeze(-1)).squeeze(-1)  # (B, K)
-        valid = batch.get("chunk_valid", torch.ones_like(chunk_item_ids)).to(self.device).bool()
         bc_loss = -gathered[valid].mean()
         # 诊断：每步分布熵，用来观察 BC 是否过早坍缩到少量 item。
         probs = torch.softmax(logits, dim=-1)
@@ -322,7 +492,14 @@ class MACAgent(nn.Module):
         Returns:
             torch.Tensor: 对有效前缀的平均 next-state MSE。
         """
-        if self.dynamics is None:
+        if (
+            self.dynamics is None
+            or self.dynamics_loss_weight <= 0.0
+            or not any(
+                parameter.requires_grad
+                for parameter in self.dynamics.parameters()
+            )
+        ):
             return torch.zeros((), device=self.device)
         states = self._batch_tensor(batch, "observations").float()
         actions = self._batch_tensor(batch, "actions").float().reshape(
@@ -397,7 +574,7 @@ class MACAgent(nn.Module):
         num_samples: int,
         recommended_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """从离散 categorical actor 采样多个候选 item chunk。
+        """从交叉熵或 Flow categorical actor 采样多个候选 item chunk。
 
         Args:
             states (torch.Tensor): 状态张量，形状为 `(B, state_dim)`。
@@ -419,6 +596,21 @@ class MACAgent(nn.Module):
         if num_samples <= 0:
             raise ValueError("num_samples must be positive.")
         states = states.to(device=self.device, dtype=torch.float32)
+        if self.actor_type == ACTOR_TYPE_CATEGORICAL_FLOW:
+            flow_sampler = self.actor
+            if self.flow_sampling_mode == FLOW_SAMPLING_ONESTEP:
+                if self.actor_onestep is None:
+                    raise RuntimeError("One-step Flow actor is unavailable")
+                flow_sampler = self.actor_onestep
+            sampled_batches = []
+            for start in range(0, num_samples, self.actor.sample_batch_size):
+                current_size = min(self.actor.sample_batch_size, num_samples - start)
+                candidate_logits = flow_sampler.sample_logits(states, current_size)
+                sampled_batches.append(self._sample_flow_candidate_logits(
+                    candidate_logits, recommended_mask,
+                ))
+            sampled_ids = torch.cat(sampled_batches, dim=0)
+            return sampled_ids, self._item_ids_to_chunk_vectors(sampled_ids)
         logits = self.actor(states)  # (B, K, N)
         batch_size = int(logits.shape[0])
         if recommended_mask is None:
@@ -443,6 +635,51 @@ class MACAgent(nn.Module):
             )
         chunk_vectors = self._item_ids_to_chunk_vectors(sampled_ids)
         return sampled_ids, chunk_vectors
+
+    @torch.no_grad()
+    def _sample_flow_candidate_logits(
+        self,
+        candidate_logits: torch.Tensor,
+        recommended_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """从各自独立的 Flow 终点 logits 采样 item，并应用历史屏蔽。
+
+        Args:
+            candidate_logits (torch.Tensor): `(N,B,K,I)` Flow 终点 logits。
+            recommended_mask (Optional[torch.Tensor]): `(B,I)` 历史 item mask。
+
+        Returns:
+            torch.Tensor: `(N,B,K)` 候选 item ID。
+
+        Raises:
+            ValueError: logits 或历史 mask 形状非法。
+        """
+        if candidate_logits.ndim != 4:
+            raise ValueError("Flow candidate logits must have shape (N,B,K,I)")
+        num_samples, batch_size, chunk_size, num_items = candidate_logits.shape
+        if (chunk_size, num_items) != (self.chunk_size, self.num_items):
+            raise ValueError("Flow candidate logits do not match actor catalog")
+        if recommended_mask is None:
+            history_mask = torch.zeros(
+                batch_size, self.num_items, dtype=torch.bool, device=self.device,
+            )
+        else:
+            history_mask = recommended_mask.to(device=self.device, dtype=torch.bool)
+            if tuple(history_mask.shape) != (batch_size, self.num_items):
+                raise ValueError("recommended_mask shape mismatch for Flow actor")
+            all_masked = history_mask.all(dim=1)
+            if all_masked.any():
+                history_mask = history_mask.clone()
+                history_mask[all_masked] = False
+        masked_logits = candidate_logits.masked_fill(
+            history_mask[None, :, None, :], _MASK_LOGIT_VALUE,
+        )
+        probabilities = torch.softmax(masked_logits, dim=-1).reshape(
+            num_samples * batch_size * self.chunk_size, self.num_items,
+        )
+        return torch.multinomial(probabilities, 1).reshape(
+            num_samples, batch_size, self.chunk_size,
+        )
 
     @torch.no_grad()
     def _sample_history_masked_candidate_chunks(
@@ -612,6 +849,8 @@ class MACAgent(nn.Module):
         if not 0.0 <= lambda_chunk <= 1.0:
             raise ValueError("lambda_chunk must be in [0, 1].")
         self.train()
+        if not any(parameter.requires_grad for parameter in self.dynamics.parameters()):
+            self.dynamics.eval()
         states = self._batch_tensor(batch, "observations").float()
         with torch.no_grad():
             trajectory = self.rollout_trajectory(
@@ -1139,21 +1378,34 @@ class MACAgent(nn.Module):
 
         return {
             "format": "mac_origin_precomputed_state_v2",
+            "actor_type": self.actor_type,
+            "critic_backbone": self.critic_backbone,
             "config": dict(config),
             "observation_spec": getattr(self, "observation_spec", None),
             "actor": self.actor.state_dict(),
+            "actor_onestep": (
+                self.actor_onestep.state_dict()
+                if self.actor_onestep is not None else None
+            ),
             "critic": self.critic.state_dict(),
             "value": self.value.state_dict(),
             "target_value": self.target_value.state_dict(),
             "dynamics": self.dynamics.state_dict() if self.dynamics is not None else None,
         }
 
-    def load_checkpoint_state(self, checkpoint: Dict[str, object], strict: bool = True) -> None:
+    def load_checkpoint_state(
+        self,
+        checkpoint: Dict[str, object],
+        strict: bool = True,
+        load_qv: bool = True,
+    ) -> None:
         """从 checkpoint 恢复模型参数。
 
         Args:
             checkpoint (Dict[str, object]): `torch.load` 读取出的 checkpoint。
             strict (bool): 是否使用严格 state_dict 加载。
+            load_qv (bool): 是否恢复 Critic、Value 与 target Value。Q/V 训练从共享
+                BC checkpoint 启动时应设为 `False`，仅复用 Actor 与 Dynamics。
 
         Returns:
             None.
@@ -1164,6 +1416,25 @@ class MACAgent(nn.Module):
 
         if checkpoint.get("format") != "mac_origin_precomputed_state_v2":
             raise ValueError("Incompatible checkpoint: retrain MAC_origin observation and chunk dynamics models.")
+        checkpoint_actor_type = checkpoint.get(
+            "actor_type", checkpoint.get("config", {}).get(
+                "actor_type", ACTOR_TYPE_CATEGORICAL,
+            ),
+        )
+        if checkpoint_actor_type != self.actor_type:
+            raise ValueError(
+                "Checkpoint actor_type differs from the constructed MACAgent: "
+                f"{checkpoint_actor_type} != {self.actor_type}"
+            )
+        checkpoint_critic_backbone = checkpoint.get(
+            "critic_backbone",
+            checkpoint.get("config", {}).get("critic_backbone", CRITIC_BACKBONE_MLP),
+        )
+        if load_qv and checkpoint_critic_backbone != self.critic_backbone:
+            raise ValueError(
+                "Checkpoint critic_backbone differs from the constructed MACAgent: "
+                f"{checkpoint_critic_backbone} != {self.critic_backbone}"
+            )
         if self.dynamics is not None and checkpoint.get("dynamics") is None:
             raise ValueError("MAC_origin checkpoint is missing chunk dynamics weights.")
         if getattr(self, "observation_spec", None) != checkpoint.get("observation_spec"):
@@ -1171,14 +1442,28 @@ class MACAgent(nn.Module):
         if "actor" not in checkpoint:
             raise KeyError("checkpoint missing key: actor")
         self.actor.load_state_dict(checkpoint["actor"], strict=strict)
-        if "critic" in checkpoint:
-            self.critic.load_state_dict(checkpoint["critic"], strict=strict)
-        if "value" in checkpoint:
-            self.value.load_state_dict(checkpoint["value"], strict=strict)
-        if "target_value" in checkpoint:
-            self.target_value.load_state_dict(checkpoint["target_value"], strict=strict)
-        else:
-            self.target_value.load_state_dict(self.value.state_dict(), strict=strict)
+        checkpoint_onestep = checkpoint.get("actor_onestep")
+        if self.actor_onestep is not None:
+            if checkpoint_onestep is None:
+                raise ValueError(
+                    "Checkpoint is missing one-step Flow actor weights; "
+                    "restore it with flow_distill_weight=0 and teacher sampling."
+                )
+            self.actor_onestep.load_state_dict(checkpoint_onestep, strict=strict)
+        elif checkpoint_onestep is not None:
+            raise ValueError(
+                "Checkpoint contains one-step Flow weights but the constructed "
+                "MACAgent has distillation disabled."
+            )
+        if load_qv:
+            if "critic" in checkpoint:
+                self.critic.load_state_dict(checkpoint["critic"], strict=strict)
+            if "value" in checkpoint:
+                self.value.load_state_dict(checkpoint["value"], strict=strict)
+            if "target_value" in checkpoint:
+                self.target_value.load_state_dict(checkpoint["target_value"], strict=strict)
+            else:
+                self.target_value.load_state_dict(self.value.state_dict(), strict=strict)
         if self.dynamics is not None and checkpoint.get("dynamics") is not None:
             self.dynamics.load_state_dict(checkpoint["dynamics"], strict=strict)
 
