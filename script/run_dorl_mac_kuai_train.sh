@@ -71,9 +71,9 @@ case "${ACTOR_TYPE}" in
 esac
 
 case "${CRITIC_BACKBONE}" in
-  mlp|transformer) ;;
+  mlp|transformer|acsac_transformer) ;;
   *)
-    printf '[run_dorl_mac_kuai_train] ERROR: CRITIC_BACKBONE must be mlp or transformer.\n' >&2
+    printf '[run_dorl_mac_kuai_train] ERROR: CRITIC_BACKBONE must be mlp, transformer or acsac_transformer.\n' >&2
     exit 2
     ;;
 esac
@@ -196,7 +196,9 @@ RUN_DIR_WAS_SET=0
 if [[ -n "${RUN_DIR:-}" ]]; then
   RUN_DIR_WAS_SET=1
 else
-  if [[ "${CRITIC_BACKBONE}" == "transformer" ]]; then
+  if [[ "${CRITIC_BACKBONE}" == "acsac_transformer" ]]; then
+    RUN_DIR="${OUTPUT_ROOT}/acsac_transformer/seed-${SEED}"
+  elif [[ "${CRITIC_BACKBONE}" == "transformer" ]]; then
     RUN_DIR="${OUTPUT_ROOT}/transformer/seed-${SEED}"
   else
     RUN_DIR="${OUTPUT_ROOT}/ordinary/seed-${SEED}"

@@ -32,6 +32,10 @@ from src.core.util.entropy_penalty import (  # noqa: E402
 
 from examples.our_model.data import ObservedChunkDataset, TrajectoryLoader  # noqa: E402
 import examples.our_model.models.mac_agent as mac_agent_module  # noqa: E402
+from examples.our_model.models.acsac_agent import (  # noqa: E402
+    ACSAC_CHECKPOINT_FORMAT,
+    ACSACTransformerAgent,
+)
 from examples.our_model.models.dorl_reward import DORLRewardModel  # noqa: E402
 from examples.our_model.models.leave_model import RuleBasedLeaveModel  # noqa: E402
 from examples.our_model.models.chunk_dynamics import (  # noqa: E402
@@ -45,6 +49,7 @@ from examples.our_model.models.chunk_actor import (  # noqa: E402
     DEFAULT_FLOW_TEMPERATURE,
 )
 from examples.our_model.models.chunk_value import (  # noqa: E402
+    CRITIC_BACKBONE_ACSAC_TRANSFORMER,
     CRITIC_BACKBONE_MLP,
     DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
     DEFAULT_CRITIC_TRANSFORMER_HEADS,
@@ -375,7 +380,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--critic_backbone",
         choices=sorted(SUPPORTED_CRITIC_BACKBONES),
         default=CRITIC_BACKBONE_MLP,
-        help="Critic 网络结构；严格架构对照仅切换 mlp/transformer。",
+        help=(
+            "Critic 网络结构；mlp/transformer 保留 Q/V，"
+            "acsac_transformer 使用无独立 V 的因果前缀 Q。"
+        ),
     )
     parser.add_argument(
         "--critic_transformer_hidden_dim",
@@ -524,7 +532,10 @@ def apply_checkpoint_model_config(
     Raises:
         ValueError: checkpoint 为旧 StateTracker 格式时抛出。
     """
-    if checkpoint.get("format") != "mac_origin_precomputed_state_v2":
+    if checkpoint.get("format") not in {
+        "mac_origin_precomputed_state_v2",
+        ACSAC_CHECKPOINT_FORMAT,
+    }:
         raise ValueError("Old StateTracker checkpoints are incompatible; retrain MAC_origin.")
     config = checkpoint["config"]
     for key in ("chunk_size", "window_size", "gamma", "actor_hidden_dims",
@@ -798,7 +809,12 @@ def build_agent(
         chunk_size=args.chunk_size,
         hidden_dims=parse_hidden_dims(args.dynamics_hidden_dims),
     )
-    agent = mac_agent_module.MACAgent(
+    agent_class = (
+        ACSACTransformerAgent
+        if args.critic_backbone == CRITIC_BACKBONE_ACSAC_TRANSFORMER
+        else mac_agent_module.MACAgent
+    )
+    agent = agent_class(
         state_dim=state_dim,
         action_dim=action_mapper.action_dim,
         chunk_size=args.chunk_size,

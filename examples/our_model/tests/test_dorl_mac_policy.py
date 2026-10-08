@@ -79,6 +79,30 @@ class FakeAgent:
         return item_ids, chunk_vectors
 
 
+class FakeAdaptiveAgent(FakeAgent):
+    """依次选择 H=2、H=1 的自适应测试 agent。"""
+
+    adaptive_chunk_selection = True
+
+    def select_adaptive_chunks(
+        self,
+        states: torch.Tensor,
+        num_samples: int,
+        recommended_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """返回确定性 chunk 及逐次变化的执行长度。"""
+
+        item_ids, chunks = self.select_chunks(
+            states, num_samples, recommended_mask,
+        )
+        selected_length = 2 if self.select_call_count == 1 else 1
+        lengths = torch.full(
+            (states.shape[0],), selected_length, dtype=torch.long,
+            device=states.device,
+        )
+        return item_ids, chunks, lengths
+
+
 class FakeActionMapper:
     """只提供适配器构造所需属性的 action mapper 测试替身。"""
 
@@ -196,6 +220,31 @@ class DORLMACPolicyExecutionHorizonTest(unittest.TestCase):
 
         self.assertEqual(outputs, [0, 1, 10, 11, 20])
         self.assertEqual(agent.select_call_count, 3)
+
+    def test_adaptive_agent_uses_learned_per_plan_horizon(self) -> None:
+        """自适应分支应忽略固定 H，并按每次 Q 选择的长度重规划。"""
+
+        agent = FakeAdaptiveAgent(chunk_size=TEST_CHUNK_SIZE)
+        adapter = DORLMACPolicyAdapter(
+            agent=agent,  # type: ignore[arg-type]
+            initial_states=torch.zeros((2, agent.state_dim)),
+            action_mapper=FakeActionMapper(TEST_NUM_ITEMS),  # type: ignore[arg-type]
+            num_samples_test=4,
+            device=torch.device("cpu"),
+            execution_horizon=TEST_CHUNK_SIZE,
+        )
+        states = torch.zeros(1, 3)
+        no_reset = torch.zeros(1, dtype=torch.bool)
+        outputs = [
+            int(adapter._next_chunk_item_ids(states, no_reset, None).item())
+            for _ in range(4)
+        ]
+        self.assertEqual(outputs, [0, 1, 10, 20])
+        self.assertEqual(agent.select_call_count, 3)
+        metadata = adapter.get_evaluation_metadata()
+        self.assertEqual(adapter.execution_horizon, 0)
+        self.assertEqual(metadata["evaluation/execution_horizon_mode"], "adaptive")
+        self.assertAlmostEqual(metadata["evaluation/selected_h_mean"], 4.0 / 3.0)
 
     def test_episode_reset_replans_only_reset_rows(self) -> None:
         """验证并行环境中 episode reset 只使对应行重新规划。"""

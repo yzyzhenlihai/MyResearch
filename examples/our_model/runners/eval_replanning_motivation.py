@@ -1,4 +1,4 @@
-"""用完整未来轨迹回报验证 chunk 失效与及时重规划必要性。"""
+"""用完整未来回报与最终 MCD 验证状态依赖的续执行价值差。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import logging
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from analysis.plot_replanning_motivation import plot_motivation_figure
 from examples.our_model.evaluation import evaluate_branch_point
 from examples.our_model.runners.common import (
     add_common_args,
+    apply_checkpoint_model_config,
     build_agent,
     build_dataset_and_mapper,
     build_env_assets,
@@ -38,6 +40,7 @@ from examples.our_model.runners.common import (
 from examples.our_model.runners.evaluation_utils import (
     build_initial_state_table,
 )
+from examples.our_model.rave.assets import freeze_categories
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,8 +56,29 @@ DEFAULT_BOOTSTRAP_SAMPLES = 2000
 FULL_DELAY_DIAGNOSTIC_POSITION = 1
 """只在 chunk 第一个分支位置枚举全部延迟，控制长期 rollout 计算量。"""
 
-RECORDS_SCHEMA_VERSION = 2
-"""完整未来轨迹回报评估所使用的 CSV schema 版本。"""
+RECORDS_SCHEMA_VERSION = 3
+"""回报与完整会话 MCD 双目标评估使用的 CSV schema 版本。"""
+
+DEFAULT_DOMINANT_TOP_RATE = 0.8
+"""从训练集正反馈类别频次中冻结主导类别集合的累计阈值。"""
+
+DEFAULT_RETURN_NONINFERIORITY_MARGIN = 0.0
+"""默认回报非劣容忍量 epsilon_R。"""
+
+DEFAULT_DIVERSITY_IMPROVEMENT_MARGIN = 0.0
+"""默认多样性最小改善量 epsilon_D。"""
+
+DEFAULT_RETURN_SCALE = 1.0
+"""加权效用中回报优势的预冻结归一化尺度。"""
+
+DEFAULT_DIVERSITY_SCALE = 0.01
+"""加权效用中 DRA 的预冻结归一化尺度，即一个 MCD 百分点。"""
+
+DEFAULT_DIVERSITY_WEIGHT = 1.0
+"""归一化多样性优势在综合效用中的默认权重。"""
+
+MODEL_SEED_PATTERN = re.compile(r"^seed-(?P<seed>-?[0-9]+)$")
+"""从 suite checkpoint 父目录提取训练 seed 的目录名格式。"""
 
 MAX_TORCH_SEED = 2**63 - 1
 """PyTorch Generator 接受的稳定非负种子上界。"""
@@ -80,18 +104,8 @@ SHARED_CHECKPOINT_FIELDS = (
 )
 """不同 K checkpoint 必须一致、且可从 checkpoint 恢复的公共配置。"""
 
-AGENT_CHECKPOINT_FIELDS = (
-    "actor_hidden_dims",
-    "value_hidden_dims",
-    "gamma",
-    "target_tau",
-    "invalid_action_penalty",
-    "dynamics_loss_weight",
-    "dynamics_hidden_dims",
-)
-"""构造每个 K agent 时从 checkpoint 恢复的结构与数值配置。"""
-
 RECORD_FIELDNAMES = (
+    "model_seed",
     "chunk_size",
     "episode_id",
     "user_id",
@@ -115,8 +129,38 @@ RECORD_FIELDNAMES = (
     "long_term_delay_cost",
     "short_term_replanning_gain",
     "short_term_delay_loss",
+    "immediate_final_mcd",
+    "delayed_final_mcd",
+    "continue_final_mcd",
+    "diversity_replanning_advantage",
+    "diversity_delay_cost",
+    "return_noninferior_diversity_improved",
+    "weighted_replanning_advantage",
+    "immediate_dominant_count",
+    "immediate_exposure_count",
+    "delayed_dominant_count",
+    "delayed_exposure_count",
+    "continue_dominant_count",
+    "continue_exposure_count",
 )
-"""完整未来轨迹配对反事实记录的稳定 CSV 字段顺序。"""
+"""schema v3 完整未来轨迹配对反事实记录的稳定 CSV 字段顺序。"""
+
+
+@dataclass(frozen=True)
+class CheckpointRun:
+    """描述一个待评估的独立训练 seed checkpoint。
+
+    Attributes:
+        chunk_size (int): checkpoint 的规划长度 K。
+        model_seed (int): checkpoint 的训练随机种子。
+        path (Path): checkpoint 文件路径。
+        payload (dict[str, Any]): 已加载并通过格式检查的 checkpoint 内容。
+    """
+
+    chunk_size: int
+    model_seed: int
+    path: Path
+    payload: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -155,7 +199,10 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         required=True,
         metavar="K=PATH",
-        help="一个或多个 K=checkpoint 路径，例如 3=.../K3/mac_agent/latest.pt。",
+        help=(
+            "一个或多个 K=checkpoint 路径；允许多个训练 seed 使用相同 K，"
+            "例如 5=.../seed-2023/latest.pt。"
+        ),
     )
     parser.add_argument(
         "--eval-episodes",
@@ -187,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="output_dir",
         type=str,
         default="results/replanning_motivation",
-        help="原始记录、汇总和双子图输出目录。",
+        help="原始记录、汇总和 LRA/DRA 双子图输出目录。",
     )
     parser.add_argument(
         "--bootstrap-samples",
@@ -196,6 +243,42 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_BOOTSTRAP_SAMPLES,
         help="绘图时 episode-level bootstrap 次数。",
+    )
+    parser.add_argument(
+        "--dominant-top-rate",
+        type=float,
+        default=DEFAULT_DOMINANT_TOP_RATE,
+        help="训练集主导类别累计频次阈值，必须位于 (0, 1]。",
+    )
+    parser.add_argument(
+        "--return-noninferiority-margin",
+        type=float,
+        default=DEFAULT_RETURN_NONINFERIORITY_MARGIN,
+        help="回报非劣容忍量 epsilon_R，必须非负。",
+    )
+    parser.add_argument(
+        "--diversity-improvement-margin",
+        type=float,
+        default=DEFAULT_DIVERSITY_IMPROVEMENT_MARGIN,
+        help="多样性最小改善量 epsilon_D，必须非负。",
+    )
+    parser.add_argument(
+        "--return-scale",
+        type=float,
+        default=DEFAULT_RETURN_SCALE,
+        help="加权效用的预冻结回报尺度 s_R，必须为正。",
+    )
+    parser.add_argument(
+        "--diversity-scale",
+        type=float,
+        default=DEFAULT_DIVERSITY_SCALE,
+        help="加权效用的预冻结多样性尺度 s_D，必须为正。",
+    )
+    parser.add_argument(
+        "--diversity-weight",
+        type=float,
+        default=DEFAULT_DIVERSITY_WEIGHT,
+        help="加权效用中的多样性权重 eta_D，必须非负。",
     )
     parser.add_argument(
         "--no-remove-recommended",
@@ -207,27 +290,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def parse_checkpoint_specs(specs: Sequence[str]) -> dict[int, Path]:
+def parse_checkpoint_specs(specs: Sequence[str]) -> tuple[tuple[int, Path], ...]:
     """解析并校验 `K=PATH` checkpoint 列表。
 
     Args:
         specs (Sequence[str]): 命令行传入的 checkpoint 规格。
 
     Returns:
-        dict[int, Path]: 按 K 升序插入的 checkpoint 路径映射。
+        tuple[tuple[int, Path], ...]: 按输入顺序排列的 `(K, path)` 规格。
 
     Raises:
-        ValueError: 当格式非法、K 非正、K 重复或列表为空时抛出。
+        ValueError: 当格式非法、K 非正、路径重复或列表为空时抛出。
         FileNotFoundError: 当任一 checkpoint 文件不存在时抛出。
 
     Example:
         >>> parse_checkpoint_specs(["3=/tmp/k3.pt"])  # doctest: +SKIP
-        {3: PosixPath('/tmp/k3.pt')}
+        ((3, PosixPath('/tmp/k3.pt')),)
     """
 
     if not specs:
         raise ValueError("At least one --mac-ckpts K=PATH entry is required.")
-    parsed: dict[int, Path] = {}
+    parsed: list[tuple[int, Path]] = []
+    seen_paths: set[Path] = set()
     for spec in specs:
         if "=" not in spec:
             raise ValueError(
@@ -245,36 +329,42 @@ def parse_checkpoint_specs(specs: Sequence[str]) -> dict[int, Path]:
                 "Motivation branching requires chunk size K > 1, "
                 f"got K={chunk_size}."
             )
-        if chunk_size in parsed:
-            raise ValueError(f"Duplicate checkpoint chunk size: K={chunk_size}.")
-        checkpoint_path = Path(path_text).expanduser()
+        checkpoint_path = Path(path_text).expanduser().resolve()
         if not checkpoint_path.is_file():
             raise FileNotFoundError(
                 f"Checkpoint for K={chunk_size} does not exist: {checkpoint_path}"
             )
-        parsed[chunk_size] = checkpoint_path
-    return dict(sorted(parsed.items()))
+        if checkpoint_path in seen_paths:
+            raise ValueError(f"Duplicate checkpoint path: {checkpoint_path}.")
+        seen_paths.add(checkpoint_path)
+        parsed.append((chunk_size, checkpoint_path))
+    return tuple(parsed)
 
 
 def load_checkpoint_payloads(
-    checkpoint_paths: dict[int, Path],
-) -> dict[int, dict[str, Any]]:
+    checkpoint_specs: Sequence[tuple[int, Path]],
+) -> tuple[CheckpointRun, ...]:
     """加载并校验全部 MAC checkpoint。
 
     Args:
-        checkpoint_paths (dict[int, Path]): K 到 checkpoint 路径的映射。
+        checkpoint_specs (Sequence[tuple[int, Path]]): `(K, checkpoint)` 规格。
 
     Returns:
-        dict[int, dict[str, Any]]: K 到 checkpoint 字典的映射。
+        tuple[CheckpointRun, ...]: 含训练 seed、路径和 payload 的评估单元。
 
     Raises:
         ValueError: 当 checkpoint 不是字典、缺少 config，或 config 中 K
             与命令行规格不一致时抛出。
     """
 
-    payloads: dict[int, dict[str, Any]] = {}
-    for chunk_size, checkpoint_path in checkpoint_paths.items():
-        payload = torch.load(checkpoint_path, map_location="cpu")
+    runs: list[CheckpointRun] = []
+    seen_identities: set[tuple[int, int]] = set()
+    for chunk_size, checkpoint_path in checkpoint_specs:
+        payload = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
         if not isinstance(payload, dict) or not isinstance(
             payload.get("config"), dict
         ):
@@ -288,19 +378,48 @@ def load_checkpoint_payloads(
                 f"spec={chunk_size}, config={configured_chunk_size}, "
                 f"path={checkpoint_path}."
             )
-        payloads[chunk_size] = payload
-    return payloads
+        configured_seed = payload["config"].get("seed")
+        parent_match = MODEL_SEED_PATTERN.fullmatch(checkpoint_path.parent.name)
+        path_seed = int(parent_match.group("seed")) if parent_match else None
+        if configured_seed is None and path_seed is None:
+            raise ValueError(
+                "Cannot infer training seed from checkpoint config or parent "
+                f"directory seed-* for {checkpoint_path}."
+            )
+        model_seed = int(configured_seed if configured_seed is not None else path_seed)
+        if path_seed is not None and configured_seed is not None:
+            if int(configured_seed) != path_seed:
+                raise ValueError(
+                    "Checkpoint config seed differs from seed-* directory: "
+                    f"config={configured_seed}, directory={path_seed}, "
+                    f"path={checkpoint_path}."
+                )
+        identity = (chunk_size, model_seed)
+        if identity in seen_identities:
+            raise ValueError(
+                f"Duplicate checkpoint identity: K={chunk_size}, seed={model_seed}."
+            )
+        seen_identities.add(identity)
+        runs.append(
+            CheckpointRun(
+                chunk_size=chunk_size,
+                model_seed=model_seed,
+                path=checkpoint_path,
+                payload=payload,
+            )
+        )
+    return tuple(sorted(runs, key=lambda run: (run.chunk_size, run.model_seed)))
 
 
 def apply_shared_checkpoint_config(
     args: argparse.Namespace,
-    checkpoint_payloads: dict[int, dict[str, Any]],
+    checkpoint_runs: Sequence[CheckpointRun],
 ) -> None:
     """从 checkpoint 恢复公共实验配置并检查不同 K 的可比性。
 
     Args:
         args (argparse.Namespace): 会被原地更新的命令行参数。
-        checkpoint_payloads (dict[int, dict[str, Any]]): 已加载 checkpoint。
+        checkpoint_runs (Sequence[CheckpointRun]): 已加载 checkpoint 评估单元。
 
     Returns:
         None.
@@ -309,20 +428,20 @@ def apply_shared_checkpoint_config(
         ValueError: 当不同 K 的关键环境或观测配置不一致时抛出。
     """
 
-    configs = {
-        chunk_size: payload["config"]
-        for chunk_size, payload in checkpoint_payloads.items()
-    }
-    first_chunk_size = next(iter(configs))
-    reference_config = configs[first_chunk_size]
+    if not checkpoint_runs:
+        raise ValueError("checkpoint_runs must not be empty.")
+    reference_run = checkpoint_runs[0]
+    reference_config = reference_run.payload["config"]
     for field_name in SHARED_CHECKPOINT_FIELDS:
         reference_value = reference_config.get(field_name)
         if reference_value is None:
             continue
         inconsistent_values = {
-            chunk_size: config.get(field_name)
-            for chunk_size, config in configs.items()
-            if config.get(field_name) != reference_value
+            f"K{run.chunk_size}/seed-{run.model_seed}": run.payload["config"].get(
+                field_name
+            )
+            for run in checkpoint_runs
+            if run.payload["config"].get(field_name) != reference_value
         }
         if inconsistent_values:
             raise ValueError(
@@ -604,6 +723,8 @@ def select_chunk(
 def _append_branch_records(
     records: list[dict[str, Any]],
     result: Any,
+    args: argparse.Namespace,
+    model_seed: int,
     chunk_size: int,
     episode_id: int,
     user_id: int,
@@ -615,6 +736,8 @@ def _append_branch_records(
     Args:
         records (list[dict[str, Any]]): 会被原地追加的记录列表。
         result (Any): `evaluate_branch_point` 返回结果。
+        args (argparse.Namespace): 含非劣阈值与综合效用冻结参数的实验配置。
+        model_seed (int): 当前 checkpoint 的训练随机种子。
         chunk_size (int): 当前 agent 的规划长度 K。
         episode_id (int): 当前主轨迹编号。
         user_id (int): 当前环境内部用户编号。
@@ -626,11 +749,24 @@ def _append_branch_records(
     """
 
     immediate_evaluation = result.immediate_evaluation
+    continue_evaluation = result.continue_evaluation
     long_term_advantage = float(result.long_term_replanning_advantage)
+    diversity_advantage = float(result.diversity_replanning_advantage)
     short_term_gain = float(result.short_term_replanning_gain)
+    weighted_advantage = (
+        long_term_advantage / args.return_scale
+        + args.diversity_weight
+        * diversity_advantage
+        / args.diversity_scale
+    )
+    constrained_replan = int(
+        long_term_advantage >= -args.return_noninferiority_margin
+        and diversity_advantage > args.diversity_improvement_margin
+    )
     for evaluation in result.evaluations:
         records.append(
             {
+                "model_seed": model_seed,
                 "chunk_size": chunk_size,
                 "episode_id": episode_id,
                 "user_id": user_id,
@@ -675,6 +811,29 @@ def _append_branch_records(
                     - evaluation.local_reward_sum
                 )
                 / result.planned_steps,
+                "immediate_final_mcd": immediate_evaluation.final_mcd,
+                "delayed_final_mcd": evaluation.final_mcd,
+                "continue_final_mcd": continue_evaluation.final_mcd,
+                "diversity_replanning_advantage": diversity_advantage,
+                "diversity_delay_cost": (
+                    evaluation.final_mcd - immediate_evaluation.final_mcd
+                ),
+                "return_noninferior_diversity_improved": constrained_replan,
+                "weighted_replanning_advantage": weighted_advantage,
+                "immediate_dominant_count": (
+                    immediate_evaluation.final_dominant_count
+                ),
+                "immediate_exposure_count": (
+                    immediate_evaluation.final_exposure_count
+                ),
+                "delayed_dominant_count": evaluation.final_dominant_count,
+                "delayed_exposure_count": evaluation.final_exposure_count,
+                "continue_dominant_count": (
+                    continue_evaluation.final_dominant_count
+                ),
+                "continue_exposure_count": (
+                    continue_evaluation.final_exposure_count
+                ),
             }
         )
 
@@ -685,6 +844,8 @@ def evaluate_checkpoint(
     initial_states: torch.Tensor,
     agent: torch.nn.Module,
     chunk_size: int,
+    model_seed: int,
+    dominant_item_mask: Sequence[bool],
     device: torch.device,
 ) -> list[dict[str, Any]]:
     """采集一个 K checkpoint 的配对反事实动机实验记录。
@@ -695,6 +856,8 @@ def evaluate_checkpoint(
         initial_states (torch.Tensor): 共享的离线用户初始状态表。
         agent (torch.nn.Module): 当前 K 的 MAC agent。
         chunk_size (int): 当前规划长度 K。
+        model_seed (int): 当前 checkpoint 的训练随机种子。
+        dominant_item_mask (Sequence[bool]): 冻结主导类别的内部 item 命中表。
         device (torch.device): 模型设备。
 
     Returns:
@@ -831,11 +994,14 @@ def evaluate_checkpoint(
                         cached_suffix=cached_suffix,
                         planner=local_planner,
                         downstream_planner=downstream_planner,
+                        dominant_item_mask=dominant_item_mask,
                         delay_values=delay_values,
                     )
                     _append_branch_records(
                         records=records,
                         result=result,
+                        args=args,
+                        model_seed=model_seed,
                         chunk_size=chunk_size,
                         episode_id=episode_id,
                         user_id=user_id,
@@ -882,8 +1048,35 @@ def save_records(records: Sequence[dict[str, Any]], output_path: Path) -> Path:
     return output_path
 
 
+def validate_experiment_args(args: argparse.Namespace) -> None:
+    """校验双目标实验的统计阈值与归一化参数。
+
+    Args:
+        args (argparse.Namespace): 已解析的命令行参数。
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: 当阈值、尺度、权重或 bootstrap 次数超出允许范围时抛出。
+    """
+
+    if not 0.0 < args.dominant_top_rate <= 1.0:
+        raise ValueError("dominant_top_rate must be in (0, 1].")
+    if args.return_noninferiority_margin < 0.0:
+        raise ValueError("return_noninferiority_margin must be non-negative.")
+    if args.diversity_improvement_margin < 0.0:
+        raise ValueError("diversity_improvement_margin must be non-negative.")
+    if args.return_scale <= 0.0 or args.diversity_scale <= 0.0:
+        raise ValueError("return_scale and diversity_scale must be positive.")
+    if args.diversity_weight < 0.0:
+        raise ValueError("diversity_weight must be non-negative.")
+    if args.bootstrap_samples <= 0:
+        raise ValueError("bootstrap_samples must be positive.")
+
+
 def main(argv: Optional[list[str]] = None) -> Path:
-    """运行多 K 配对反事实实验并生成双子图。
+    """运行多 checkpoint 配对反事实实验并生成 LRA/DRA 双子图。
 
     Args:
         argv (Optional[list[str]]): 可选命令行参数；为空时读取进程参数。
@@ -899,9 +1092,13 @@ def main(argv: Optional[list[str]] = None) -> Path:
     configure_logging()
     set_mpl_cache_to_tmp()
     args = build_parser().parse_args(argv)
-    checkpoint_paths = parse_checkpoint_specs(args.mac_ckpts)
-    checkpoint_payloads = load_checkpoint_payloads(checkpoint_paths)
-    apply_shared_checkpoint_config(args, checkpoint_payloads)
+    validate_experiment_args(args)
+    checkpoint_specs = parse_checkpoint_specs(args.mac_ckpts)
+    checkpoint_runs = load_checkpoint_payloads(checkpoint_specs)
+    apply_shared_checkpoint_config(args, checkpoint_runs)
+    # 共享资产构造也必须使用 checkpoint 的 K 与 Actor/Dynamics 结构配置。
+    # 每个模型进入评估循环时仍会再次恢复自身结构，以兼容未来多 K 输入。
+    apply_checkpoint_model_config(args, checkpoint_runs[0].payload)
     resolve_common_paths(args)
     device = resolve_device(args.device)
     output_dir = ensure_dir(args.output_dir)
@@ -909,30 +1106,51 @@ def main(argv: Optional[list[str]] = None) -> Path:
 
     resolved_config = namespace_to_dict(args)
     resolved_config["mac_ckpts"] = {
-        str(chunk_size): str(path)
-        for chunk_size, path in checkpoint_paths.items()
+        f"K{run.chunk_size}/seed-{run.model_seed}": str(run.path)
+        for run in checkpoint_runs
     }
     save_resolved_config(output_dir, resolved_config)
 
     LOGGER.info(
         "开始构造动机实验共享环境：K=%s, episodes=%s, output=%s",
-        list(checkpoint_paths),
+        sorted({run.chunk_size for run in checkpoint_runs}),
         args.eval_episodes,
         output_dir,
     )
-    env, _, _ = build_env_assets(args)
+    env, env_dataset, _ = build_env_assets(args)
     offline_dataset, action_mapper, _ = build_dataset_and_mapper(args, device=device)
     initial_states = build_initial_state_table(offline_dataset, env, device)
+    training_raw_users = sorted(
+        int(user_id)
+        for user_id in offline_dataset.bundle.initial_observations_by_user
+    )
+    _, dominant_hits, category_metadata = freeze_categories(
+        dataset=env_dataset,
+        env=env,
+        env_name=args.env,
+        train_raw_users=training_raw_users,
+        top_rate=args.dominant_top_rate,
+    )
+    dominant_item_mask = dominant_hits.to(dtype=torch.bool).cpu().tolist()
+    if len(dominant_item_mask) != int(env.mat.shape[1]):
+        raise ValueError(
+            "Frozen dominant category mask does not match environment items: "
+            f"mask={len(dominant_item_mask)}, env={int(env.mat.shape[1])}."
+        )
+    LOGGER.info(
+        "主导类别已从离线训练用户冻结：users=%s, categories=%s, hit_items=%s/%s",
+        len(training_raw_users),
+        len(category_metadata["dominant_categories"]),
+        sum(dominant_item_mask),
+        len(dominant_item_mask),
+    )
 
     all_records: list[dict[str, Any]] = []
-    for chunk_size, checkpoint_path in checkpoint_paths.items():
-        checkpoint = checkpoint_payloads[chunk_size]
+    for checkpoint_run in checkpoint_runs:
+        chunk_size = checkpoint_run.chunk_size
+        checkpoint = checkpoint_run.payload
         agent_args = argparse.Namespace(**vars(args))
-        agent_args.chunk_size = chunk_size
-        checkpoint_config = checkpoint["config"]
-        for field_name in AGENT_CHECKPOINT_FIELDS:
-            if field_name in checkpoint_config:
-                setattr(agent_args, field_name, checkpoint_config[field_name])
+        apply_checkpoint_model_config(agent_args, checkpoint)
         agent = build_agent(
             agent_args,
             device=device,
@@ -944,7 +1162,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
         LOGGER.info(
             "开始评估 K=%s checkpoint=%s",
             chunk_size,
-            checkpoint_path,
+            checkpoint_run.path,
         )
         all_records.extend(
             evaluate_checkpoint(
@@ -953,6 +1171,8 @@ def main(argv: Optional[list[str]] = None) -> Path:
                 initial_states=initial_states,
                 agent=agent,
                 chunk_size=chunk_size,
+                model_seed=checkpoint_run.model_seed,
+                dominant_item_mask=dominant_item_mask,
                 device=device,
             )
         )
@@ -966,6 +1186,8 @@ def main(argv: Optional[list[str]] = None) -> Path:
         output_dir=output_dir,
         bootstrap_samples=args.bootstrap_samples,
         seed=args.seed,
+        return_noninferiority_margin=args.return_noninferiority_margin,
+        diversity_improvement_margin=args.diversity_improvement_margin,
     )
     manifest = {
         "status": "completed",
@@ -973,13 +1195,32 @@ def main(argv: Optional[list[str]] = None) -> Path:
         "primary_metric_definition": (
             "undiscounted_complete_future_trajectory_return_from_branch_state"
         ),
+        "diversity_metric_definition": (
+            "final_complete_session_mcd_including_shared_prefix"
+        ),
+        "dominant_category_source": category_metadata,
+        "utility": {
+            "return_scale": args.return_scale,
+            "diversity_scale": args.diversity_scale,
+            "diversity_weight": args.diversity_weight,
+        },
+        "decision_thresholds": {
+            "return_noninferiority_margin": (
+                args.return_noninferiority_margin
+            ),
+            "diversity_improvement_margin": (
+                args.diversity_improvement_margin
+            ),
+        },
         "downstream_execution_horizon": "checkpoint_chunk_size",
         "full_delay_diagnostic_position": FULL_DELAY_DIAGNOSTIC_POSITION,
         "records": str(records_path),
         "summary": str(summary_path),
         "figures": [str(path) for path in figure_paths],
         "num_records": len(all_records),
-        "chunk_sizes": list(checkpoint_paths),
+        "chunk_sizes": sorted({run.chunk_size for run in checkpoint_runs}),
+        "model_seeds": [run.model_seed for run in checkpoint_runs],
+        "checkpoints": [str(run.path) for run in checkpoint_runs],
     }
     manifest_path = output_dir / "experiment_manifest.json"
     with manifest_path.open("w", encoding="utf-8") as file_obj:

@@ -1,4 +1,4 @@
-"""缓存 action chunk 长期失效与延迟重规划代价的配对反事实评估。"""
+"""缓存 action chunk 状态依赖续执行价值差的配对反事实评估。"""
 
 from __future__ import annotations
 
@@ -42,6 +42,8 @@ class DelayEvaluation:
         future_executed_steps (int): 从分支状态到 episode 结束的实际步数。
         local_terminated (bool): episode 是否在局部窗口内结束。
         terminated (bool): 完整未来 rollout 是否到达自然退出或最大步数。
+        final_dominant_count (int): 包含公共前缀的完整会话主导类别命中数。
+        final_exposure_count (int): 包含公共前缀的完整会话展示数。
     """
 
     delay_steps: int
@@ -51,6 +53,23 @@ class DelayEvaluation:
     future_executed_steps: int
     local_terminated: bool
     terminated: bool
+    final_dominant_count: int
+    final_exposure_count: int
+
+    @property
+    def final_mcd(self) -> float:
+        """计算当前分支最终完整会话的主导类别占比。
+
+        Returns:
+            float: `final_dominant_count / final_exposure_count`。
+
+        Raises:
+            RuntimeError: 当完整会话没有任何有效展示时抛出。
+        """
+
+        if self.final_exposure_count <= 0:
+            raise RuntimeError("Final session must contain at least one exposure.")
+        return self.final_dominant_count / self.final_exposure_count
 
 
 @dataclass(frozen=True)
@@ -131,12 +150,59 @@ class BranchPointResult:
             - self.continue_evaluation.local_reward_sum
         ) / self.planned_steps
 
+    @property
+    def diversity_replanning_advantage(self) -> float:
+        """计算立即重规划相对完整 Continue 的长期多样性优势。
+
+        Returns:
+            float: `MCD_continue - MCD_immediate`；正值表示立即重规划
+            降低最终完整会话 MCD。
+        """
+
+        return (
+            self.continue_evaluation.final_mcd
+            - self.immediate_evaluation.final_mcd
+        )
+
 
 Planner = Callable[[Sequence[int], Sequence[float]], Sequence[int]]
 DownstreamPlanner = Callable[
     [Sequence[int], Sequence[float], int],
     Sequence[int],
 ]
+
+
+def compute_session_mcd_counts(
+    history_items: Sequence[int],
+    dominant_item_mask: Sequence[bool],
+) -> tuple[int, int]:
+    """统计完整会话的主导类别命中数与有效展示数。
+
+    Args:
+        history_items (Sequence[int]): 含可选 reset dummy 的完整内部物品历史。
+        dominant_item_mask (Sequence[bool]): 按内部物品编号排列的冻结主导类别
+            命中表；该表必须在所有反事实分支之间保持不变。
+
+    Returns:
+        tuple[int, int]: 主导类别命中数与有效展示数。
+
+    Raises:
+        ValueError: 当命中表为空、历史物品越界或会话没有有效展示时抛出。
+
+    Example:
+        >>> compute_session_mcd_counts([-1, 0, 2], [True, False, False])
+        (1, 2)
+    """
+
+    if len(dominant_item_mask) <= 0:
+        raise ValueError("dominant_item_mask must not be empty.")
+    valid_items = [int(item_id) for item_id in history_items if int(item_id) >= 0]
+    if not valid_items:
+        raise ValueError("A final session must contain at least one valid item.")
+    if any(item_id >= len(dominant_item_mask) for item_id in valid_items):
+        raise ValueError("history_items contains an out-of-range item id.")
+    dominant_count = sum(bool(dominant_item_mask[item_id]) for item_id in valid_items)
+    return int(dominant_count), len(valid_items)
 
 
 def capture_environment(env: Any) -> EnvironmentSnapshot:
@@ -297,6 +363,7 @@ def _evaluate_delay(
     delay_steps: int,
     planner: Planner,
     downstream_planner: DownstreamPlanner,
+    dominant_item_mask: Sequence[bool],
 ) -> DelayEvaluation:
     """评估一个延迟分支的局部干预和完整未来轨迹。
 
@@ -313,6 +380,8 @@ def _evaluate_delay(
         delay_steps (int): 重规划前继续执行的缓存动作数。
         planner (Planner): 在局部窗口内根据最新历史生成新 chunk 的回调。
         downstream_planner (DownstreamPlanner): 局部窗口后统一使用的策略。
+        dominant_item_mask (Sequence[bool]): 训练数据冻结的内部 item 主导类别
+            命中表，用于计算包含公共前缀的最终完整会话 MCD。
 
     Returns:
         DelayEvaluation: 局部回报与完整未来轨迹回报。
@@ -379,6 +448,10 @@ def _evaluate_delay(
         downstream_planner=downstream_planner,
         initial_terminated=local_terminated,
     )
+    final_dominant_count, final_exposure_count = compute_session_mcd_counts(
+        history_items=branch_items,
+        dominant_item_mask=dominant_item_mask,
+    )
     return DelayEvaluation(
         delay_steps=delay_steps,
         local_reward_sum=local_reward_sum,
@@ -387,6 +460,8 @@ def _evaluate_delay(
         future_executed_steps=local_executed_steps + downstream_steps,
         local_terminated=local_terminated,
         terminated=terminated,
+        final_dominant_count=final_dominant_count,
+        final_exposure_count=final_exposure_count,
     )
 
 
@@ -397,6 +472,7 @@ def evaluate_branch_point(
     cached_suffix: Sequence[int],
     planner: Planner,
     downstream_planner: DownstreamPlanner,
+    dominant_item_mask: Sequence[bool],
     delay_values: Optional[Sequence[int]] = None,
 ) -> BranchPointResult:
     """在同一状态上比较不同延迟分支的完整未来轨迹回报。
@@ -411,6 +487,8 @@ def evaluate_branch_point(
         cached_suffix (Sequence[int]): 原 chunk 未执行的动作。
         planner (Planner): 局部窗口内根据分支最新历史生成动作的回调。
         downstream_planner (DownstreamPlanner): 局部窗口后统一执行的策略。
+        dominant_item_mask (Sequence[bool]): 从训练数据冻结、供所有分支共享的
+            内部 item 主导类别命中表。
         delay_values (Optional[Sequence[int]]): 要评估的延迟集合。为空时
             评估 `0..L`；若指定，仍必须包含立即重规划 `0` 和完整继续 `L`。
 
@@ -454,6 +532,7 @@ def evaluate_branch_point(
                     delay_steps=delay_steps,
                     planner=planner,
                     downstream_planner=downstream_planner,
+                    dominant_item_mask=dominant_item_mask,
                 )
             )
     finally:

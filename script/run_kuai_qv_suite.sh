@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 统一训练五个随机种子的 MAC MLP Q/V、仅 R 单头 Transformer Q/V 和
-# R/T/D/C 多目标前缀 Transformer Q/V。ordinary 保留当前 Actor/Dynamics，
-# 其余数据采样、imagined rollout、TD(lambda) 与 Q/V 结构均使用 MAC runner。
+# 统一训练五个随机种子的三类 Q/V：MAC MLP Q/V、ACSAC 因果 Transformer Q
+# 和 R/T/D/C 多目标前缀 Transformer Q/V。ordinary 与 acsac_transformer
+# 共享当前 Actor/Dynamics 和 MAC 模型化训练流程。
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -12,12 +12,12 @@ cd "${REPO_ROOT}"
 
 ENV_NAME="${ENV_NAME:-KuaiEnv-v0}"
 # ordinary：固定当前 Actor/Dynamics，使用 MAC 离线任意起点、MLP Q/V 与 chunk TD(lambda)。
-# transformer：仅 R 单头前缀 Transformer Q/V，联合选择候选与执行长度 H。
+# acsac_transformer：同 ordinary 流程，但用因果前缀 Q 联合选择候选与 H，且无独立 V。
 # multi_prefix_transformer：R/T/D/C 四头前缀 Transformer Q/V，联合选择候选与 H。
-QV_TYPES="${QV_TYPES:-ordinary}"
+QV_TYPES="${QV_TYPES:-acsac_transformer}"
 SEEDS="${SEEDS:-2023 2024 2025 2026 2027}"
 GPU_IDS="${GPU_IDS:-1 2 3 4 5}"
-CHUNK_SIZE="${CHUNK_SIZE:-5}"
+CHUNK_SIZE="${CHUNK_SIZE:-7}"
 #pretrain：只预训练共享 BC Actor，并保存各 seed 的 BC checkpoint。
 #qv：使用已有 BC checkpoint 训练指定的 Q/V 分支。
   #- ordinary 每步从离线任意起点重生成 fixed-depth imagined rollout，batch 起点接受 MAC Q/V 监督。
@@ -68,7 +68,7 @@ usage() {
 
 参数：
   --env NAME              KuaiEnv-v0 或 KuaiRand-v0
-  --qv-type TYPES         ordinary、transformer、multi_prefix_transformer、all；可传逗号分隔列表
+  --qv-type TYPES         ordinary、acsac_transformer、multi_prefix_transformer、all；可传逗号分隔列表
   --seeds "S1 ... S5"     必须恰好提供五个随机种子
   --gpus "G0 ..."         外部 GPU 编号；五个种子按顺序循环分配
   --chunk-size K          actor chunk 长度
@@ -86,7 +86,7 @@ usage() {
   --rave-steps N          三种 Q/V 的统一更新步数，默认 100000
   --rave-epochs N         三种 Q/V 的统一 epoch 数，默认 100
   --rave-eval-every N     每 N 个 epoch 记录一次 RAVE-H-Eval，默认 1
-  --batch-size N          三个 Q/V 分支统一训练 batch size；ordinary 是离线起点数，默认 256
+  --batch-size N          三个 Q/V 分支统一训练 batch size；MAC 系分支是离线起点数，默认 256
   --train-candidates N    三个 Q/V 分支每状态训练候选数，默认 8
   --episodes-per-collect N 仅用于 Transformer 每次收集的完整 episode 数，默认 32
   --ordinary-rollout-depth N ordinary 每轮 imagined rollout 的 chunk 深度，默认 3
@@ -200,13 +200,13 @@ if [[ "${#GPU_VALUES[@]}" -lt 1 ]]; then
   exit 2
 fi
 if [[ "${#QV_TYPE_VALUES[@]}" -eq 1 && "${QV_TYPE_VALUES[0]}" == "all" ]]; then
-  QV_TYPE_VALUES=(ordinary transformer multi_prefix_transformer)
+  QV_TYPE_VALUES=(ordinary acsac_transformer multi_prefix_transformer)
 fi
 ORDINARY_ENABLED=0
 for qv_type in "${QV_TYPE_VALUES[@]}"; do
   case "${qv_type}" in
-    ordinary) ORDINARY_ENABLED=1 ;;
-    transformer|multi_prefix_transformer) ;;
+    ordinary|acsac_transformer) ORDINARY_ENABLED=1 ;;
+    multi_prefix_transformer) ;;
     *) printf '不支持的 Q/V 类型：%s\n' "${qv_type}" >&2; exit 2 ;;
   esac
 done
@@ -335,7 +335,11 @@ run_qv() {
   fi
 
   local -a command
-  if [[ "${qv_type}" == "ordinary" ]]; then
+  if [[ "${qv_type}" == "ordinary" || "${qv_type}" == "acsac_transformer" ]]; then
+    local critic_backbone="mlp"
+    if [[ "${qv_type}" == "acsac_transformer" ]]; then
+      critic_backbone="acsac_transformer"
+    fi
     command=(env
       "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
       "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
@@ -348,7 +352,7 @@ run_qv() {
       "GAMMA=${GAMMA}" "BUFFER_SIZE=${BUFFER_SIZE}"
       "OUTPUT_ROOT=${OUTPUT_ROOT}" "BC_ACTOR_CKPT=${checkpoint}"
       "BC_SAVE_DIR=$(dirname "${checkpoint}")" "MAC_SAVE_DIR=${output_dir}"
-      "RUN_DIR=${output_dir}" "TRAIN_STAGES=qv" "CRITIC_BACKBONE=mlp"
+      "RUN_DIR=${output_dir}" "TRAIN_STAGES=qv" "CRITIC_BACKBONE=${critic_backbone}"
       "FREEZE_DYNAMICS_DURING_QV=1" "DYNAMICS_LOSS_WEIGHT=0" "EPOCH=${RAVE_EPOCHS}"
       "STEP_PER_EPOCH=${STEP_PER_EPOCH}" "EVAL_EVERY_N_EPOCHS=${RAVE_EVAL_EVERY_EPOCHS}"
       "EVAL_EPISODES=${EVAL_EPISODES}" "QV_SWANLAB_PROJECT=RAVE-H-QV-Suite"
@@ -415,7 +419,11 @@ run_rave_eval() {
     return 0
   fi
   local -a command
-  if [[ "${qv_type}" == "ordinary" ]]; then
+  if [[ "${qv_type}" == "ordinary" || "${qv_type}" == "acsac_transformer" ]]; then
+    local critic_backbone="mlp"
+    if [[ "${qv_type}" == "acsac_transformer" ]]; then
+      critic_backbone="acsac_transformer"
+    fi
     command=(env
       "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
       "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
@@ -424,7 +432,7 @@ run_rave_eval() {
       "COMPLETION_WINDOW=${CHUNK_SIZE}" "TEST_NUM=${TEST_NUM}"
       "NUM_SAMPLES_TEST=${NUM_SAMPLES_TEST}" "BUFFER_SIZE=${BUFFER_SIZE}"
       "OUTPUT_ROOT=${OUTPUT_ROOT}" "RUN_DIR=${output_dir}" "MAC_SAVE_DIR=${output_dir}"
-      "EVAL_SAVE_DIR=${eval_dir}" "TRAIN_STAGES=eval" "CRITIC_BACKBONE=mlp"
+      "EVAL_SAVE_DIR=${eval_dir}" "TRAIN_STAGES=eval" "CRITIC_BACKBONE=${critic_backbone}"
       "EVAL_EPISODES=${EVAL_EPISODES}" "EVAL_RUN_NAME=${run_name}"
       "EVAL_SWANLAB_PROJECT=${EVAL_SWANLAB_PROJECT}" "SWANLAB_MODE=${SWANLAB_MODE}"
       bash script/run_dorl_mac_kuai_train.sh)

@@ -1313,8 +1313,8 @@ class RAVEShellRoutingTest(unittest.TestCase):
         )
         self.assertIn("--fixed_horizon 3", fixed_result.stdout)
 
-    def test_suite_routes_ordinary_to_mac_and_transformers_to_rave(self) -> None:
-        """ordinary 应走冻结 Dynamics 的 MAC，Transformer 保持 RAVE。"""
+    def test_suite_replaces_transformer_with_acsac_transformer(self) -> None:
+        """suite 应以 ACSAC 取代旧单头 Transformer，且保留多头 RAVE。"""
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             result = subprocess.run(
@@ -1333,7 +1333,7 @@ class RAVEShellRoutingTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-        self.assertIn("QV_TYPE=transformer", result.stdout)
+        self.assertNotIn("QV_TYPE=transformer", result.stdout)
         self.assertIn("QV_TYPE=multi_prefix_transformer", result.stdout)
         self.assertNotIn("QV_TYPE=ordinary", result.stdout)
         self.assertIn("ROLLOUT_DEPTH=3", result.stdout)
@@ -1342,7 +1342,29 @@ class RAVEShellRoutingTest(unittest.TestCase):
         self.assertIn("DYNAMICS_LOSS_WEIGHT=0", result.stdout)
         self.assertIn("run_dorl_mac_kuai_train.sh", result.stdout)
         self.assertIn("CRITIC_BACKBONE=mlp", result.stdout)
+        self.assertIn("CRITIC_BACKBONE=acsac_transformer", result.stdout)
         self.assertNotIn("FIXED_HORIZON=", result.stdout)
+
+    def test_suite_rejects_removed_transformer_option(self) -> None:
+        """旧 `transformer` suite 类型应明确报错，避免产生第四个实验分支。"""
+
+        result = subprocess.run(
+            [
+                "bash", "script/run_kuai_qv_suite.sh",
+                "--stage", "qv",
+                "--qv-type", "transformer",
+                "--seeds", "2023 2024 2025 2026 2027",
+                "--gpus", "0",
+                "--serial",
+                "--dry-run",
+            ],
+            cwd=self.repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不支持的 Q/V 类型：transformer", result.stderr)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from analysis.plot_replanning_motivation import (
 )
 from examples.our_model.evaluation.replanning_motivation import (
     capture_environment,
+    compute_session_mcd_counts,
     evaluate_branch_point,
 )
 from examples.our_model.runners.eval_replanning_motivation import (
@@ -76,6 +77,7 @@ class ReplanningBranchTest(unittest.TestCase):
             cached_suffix=[0, 0],
             planner=lambda items, rewards: [2, 2],
             downstream_planner=lambda items, rewards, index: [2, 2],
+            dominant_item_mask=[True] + [False] * 9,
         )
 
         self.assertEqual(result.planned_steps, 2)
@@ -94,6 +96,9 @@ class ReplanningBranchTest(unittest.TestCase):
         self.assertTrue(
             all(evaluation.terminated for evaluation in result.evaluations)
         )
+        self.assertAlmostEqual(result.immediate_evaluation.final_mcd, 0.0)
+        self.assertAlmostEqual(result.continue_evaluation.final_mcd, 0.5)
+        self.assertAlmostEqual(result.diversity_replanning_advantage, 0.5)
         self.assertEqual(capture_environment(env), original_snapshot)
 
     def test_delay_subset_keeps_immediate_and_continue_endpoints(self) -> None:
@@ -109,6 +114,7 @@ class ReplanningBranchTest(unittest.TestCase):
             "downstream_planner": (
                 lambda items, rewards, index: [2, 2]
             ),
+            "dominant_item_mask": [True] + [False] * 9,
         }
 
         result = evaluate_branch_point(**kwargs, delay_values=[0, 2])
@@ -125,21 +131,37 @@ class ReplanningBranchTest(unittest.TestCase):
 class MotivationInputTest(unittest.TestCase):
     """验证 checkpoint 规格与推荐历史 mask 边界。"""
 
-    def test_checkpoint_specs_reject_duplicate_or_small_k(self) -> None:
-        """验证 K 必须大于一且不能重复。"""
+    def test_checkpoint_specs_allow_same_k_but_reject_duplicate_path(self) -> None:
+        """验证多个 seed 可共享 K，但同一路径不能重复输入。"""
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            checkpoint_path = Path(temp_dir) / "latest.pt"
+            checkpoint_path = Path(temp_dir) / "first.pt"
+            second_path = Path(temp_dir) / "second.pt"
             checkpoint_path.touch()
+            second_path.touch()
             with self.assertRaisesRegex(ValueError, "K > 1"):
                 parse_checkpoint_specs([f"1={checkpoint_path}"])
+            parsed = parse_checkpoint_specs(
+                [f"5={checkpoint_path}", f"5={second_path}"]
+            )
+            self.assertEqual([chunk_size for chunk_size, _ in parsed], [5, 5])
             with self.assertRaisesRegex(ValueError, "Duplicate"):
                 parse_checkpoint_specs(
                     [
-                        f"3={checkpoint_path}",
-                        f"3={checkpoint_path}",
+                        f"5={checkpoint_path}",
+                        f"5={checkpoint_path}",
                     ]
                 )
+
+    def test_session_mcd_counts_include_public_prefix(self) -> None:
+        """验证最终 MCD 统计包含公共前缀且忽略 reset dummy。"""
+
+        dominant_count, exposure_count = compute_session_mcd_counts(
+            history_items=[-1, 0, 2, 1],
+            dominant_item_mask=[True, False, True],
+        )
+
+        self.assertEqual((dominant_count, exposure_count), (2, 3))
 
     def test_recommended_mask_ignores_reset_dummy_and_deduplicates(self) -> None:
         """验证 reset dummy 不进入 mask，重复历史只屏蔽一次。"""
@@ -208,6 +230,7 @@ class MotivationSummaryTest(unittest.TestCase):
         """验证左图只取 delay 等于剩余步数的记录。"""
 
         base_record = {
+            "model_seed": 2023,
             "chunk_size": 3,
             "episode_id": 0,
             "user_id": 0,
@@ -230,6 +253,19 @@ class MotivationSummaryTest(unittest.TestCase):
             "long_term_delay_cost": 0.0,
             "short_term_replanning_gain": 2.0,
             "short_term_delay_loss": 0.0,
+            "immediate_final_mcd": 0.25,
+            "delayed_final_mcd": 0.25,
+            "continue_final_mcd": 0.50,
+            "diversity_replanning_advantage": 0.25,
+            "diversity_delay_cost": 0.0,
+            "return_noninferior_diversity_improved": 1,
+            "weighted_replanning_advantage": 29.0,
+            "immediate_dominant_count": 1,
+            "immediate_exposure_count": 4,
+            "delayed_dominant_count": 1,
+            "delayed_exposure_count": 4,
+            "continue_dominant_count": 2,
+            "continue_exposure_count": 4,
         }
         records = []
         for delay_steps, (local_reward, future_return) in enumerate(
@@ -243,6 +279,8 @@ class MotivationSummaryTest(unittest.TestCase):
             record["short_term_delay_loss"] = (
                 4.0 - local_reward
             ) / 2.0
+            record["delayed_final_mcd"] = 0.25 + 0.125 * delay_steps
+            record["diversity_delay_cost"] = 0.125 * delay_steps
             records.append(record)
 
         summaries = build_plot_summaries(
@@ -259,6 +297,8 @@ class MotivationSummaryTest(unittest.TestCase):
         self.assertEqual(gain_summary["state_count"], 1)
         self.assertAlmostEqual(float(gain_summary["mean"]), 4.0)
         self.assertEqual(len(summaries["long_term_delay_cost"]), 3)
+        self.assertEqual(len(summaries["diversity_delay_cost"]), 3)
+        self.assertTrue(summaries["delay_optima"][0]["shared_optimum_exists"])
 
 
 if __name__ == "__main__":

@@ -83,6 +83,9 @@ class DORLMACPolicyAdapter:
         self.n_items = action_mapper.num_items
         self.action_dim = action_mapper.action_dim
         self.chunk_size = agent.chunk_size
+        self.adaptive_chunk_selection = bool(
+            getattr(agent, "adaptive_chunk_selection", False)
+        )
         resolved_execution_horizon = (
             self.chunk_size if execution_horizon is None else int(execution_horizon)
         )
@@ -91,7 +94,12 @@ class DORLMACPolicyAdapter:
                 "execution_horizon must satisfy "
                 f"1 <= H <= chunk_size ({self.chunk_size}), got {resolved_execution_horizon}."
             )
-        self.execution_horizon = resolved_execution_horizon
+        self.execution_horizon = (
+            0 if self.adaptive_chunk_selection else resolved_execution_horizon
+        )
+        self.execution_horizon_mode = (
+            "adaptive" if self.adaptive_chunk_selection else "fixed"
+        )
         self.enable_open_loop_diagnostics = bool(enable_open_loop_diagnostics)
         self.adr_comparison = ADR_COMPARISON_CATEGORY_OVERLAP
         self._item_category_matrix = self._build_item_category_matrix(
@@ -105,10 +113,12 @@ class DORLMACPolicyAdapter:
         # chunk 内每步的 item id 缓存，`(B, K)`；`positions` 指向下一步应该出的 chunk step。
         self._cached_item_ids: Optional[torch.Tensor] = None
         self._cached_positions: Optional[torch.Tensor] = None
+        self._cached_execution_lengths: Optional[torch.Tensor] = None
         self._model_states: Optional[torch.Tensor] = None
         self._pending_actions: Optional[torch.Tensor] = None
         self._pending_lengths: Optional[torch.Tensor] = None
         self._last_item_ids: Optional[torch.Tensor] = None
+        self._selected_h_counts = torch.zeros(self.chunk_size, dtype=torch.long)
         self.reset_open_loop_diagnostics()
 
     def __call__(
@@ -253,10 +263,12 @@ class DORLMACPolicyAdapter:
 
         self._cached_item_ids = None
         self._cached_positions = None
+        self._cached_execution_lengths = None
         self._model_states = None
         self._pending_actions = None
         self._pending_lengths = None
         self._last_item_ids = None
+        self._selected_h_counts = torch.zeros(self.chunk_size, dtype=torch.long)
 
     @staticmethod
     def _infer_batch_size(batch: Batch) -> int:
@@ -382,7 +394,12 @@ class DORLMACPolicyAdapter:
             self._pending_actions[rows, positions] = action_embeddings
             self._pending_lengths[rows] = positions + 1
 
-            commit_mask = self._pending_lengths >= self.execution_horizon
+            execution_lengths = self._cached_execution_lengths
+            if execution_lengths is None:
+                execution_lengths = torch.full_like(
+                    self._pending_lengths, self.execution_horizon,
+                )
+            commit_mask = self._pending_lengths >= execution_lengths
             if commit_mask.any():
                 committed_predictions = self._predict_pending_states()
                 self._model_states[commit_mask] = committed_predictions[commit_mask]
@@ -578,11 +595,18 @@ class DORLMACPolicyAdapter:
         if device.type == "cuda":
             cuda_rng_state = torch.cuda.get_rng_state(device)
         try:
-            shadow_item_ids, _ = self.agent.select_chunks(
-                states,
-                num_samples=self.num_samples_test,
-                recommended_mask=recommended_mask,
-            )
+            if self.adaptive_chunk_selection:
+                shadow_item_ids, _, _ = self.agent.select_adaptive_chunks(
+                    states,
+                    num_samples=self.num_samples_test,
+                    recommended_mask=recommended_mask,
+                )
+            else:
+                shadow_item_ids, _ = self.agent.select_chunks(
+                    states,
+                    num_samples=self.num_samples_test,
+                    recommended_mask=recommended_mask,
+                )
         finally:
             torch.random.set_rng_state(cpu_rng_state)
             if cuda_rng_state is not None:
@@ -629,11 +653,18 @@ class DORLMACPolicyAdapter:
                 dtype=torch.long,
                 device=self.device,
             )
+            self._cached_execution_lengths = torch.full(
+                (batch_size,),
+                self.execution_horizon,
+                dtype=torch.long,
+                device=self.device,
+            )
 
         reset_mask = reset_mask.to(device=self.device, dtype=torch.bool)
-        self._cached_positions[reset_mask] = self.execution_horizon
+        assert self._cached_execution_lengths is not None
+        self._cached_positions[reset_mask] = self._cached_execution_lengths[reset_mask]
         # H < K 时主动丢弃旧 chunk 的未执行后缀，形成滚动时域重规划。
-        refill_mask = self._cached_positions >= self.execution_horizon
+        refill_mask = self._cached_positions >= self._cached_execution_lengths
         if refill_mask.any():
             refill_states = states[refill_mask].to(device=self.device, dtype=torch.float32)
             refill_recommended_mask = None
@@ -641,11 +672,23 @@ class DORLMACPolicyAdapter:
                 refill_recommended_mask = recommended_mask.to(
                     device=self.device, dtype=torch.bool
                 )[refill_mask]
-            new_item_ids, _ = self.agent.select_chunks(
-                refill_states,
-                num_samples=self.num_samples_test,
-                recommended_mask=refill_recommended_mask,
-            )
+            if self.adaptive_chunk_selection:
+                new_item_ids, _, new_lengths = self.agent.select_adaptive_chunks(
+                    refill_states,
+                    num_samples=self.num_samples_test,
+                    recommended_mask=refill_recommended_mask,
+                )
+                self._cached_execution_lengths[refill_mask] = new_lengths
+                selected_counts = torch.bincount(
+                    new_lengths.detach().cpu(), minlength=self.chunk_size + 1,
+                )[1:]
+                self._selected_h_counts += selected_counts
+            else:
+                new_item_ids, _ = self.agent.select_chunks(
+                    refill_states,
+                    num_samples=self.num_samples_test,
+                    recommended_mask=refill_recommended_mask,
+                )
             self._cached_item_ids[refill_mask] = new_item_ids
             self._cached_positions[refill_mask] = 0
 
@@ -692,6 +735,34 @@ class DORLMACPolicyAdapter:
                     )
         self._cached_positions = self._cached_positions + 1
         return item_ids
+
+    def get_evaluation_metadata(self) -> dict[str, Any]:
+        """返回固定/自适应执行模式及自适应 H 分布。
+
+        Returns:
+            dict[str, Any]: 可直接合并进 evaluator summary 的元数据。
+        """
+
+        metadata: dict[str, Any] = {
+            "evaluation/execution_horizon_mode": self.execution_horizon_mode,
+        }
+        if not self.adaptive_chunk_selection:
+            return metadata
+        total = int(self._selected_h_counts.sum().item())
+        weighted_sum = sum(
+            length * int(self._selected_h_counts[length - 1].item())
+            for length in range(1, self.chunk_size + 1)
+        )
+        metadata["evaluation/selected_h_count"] = total
+        metadata["evaluation/selected_h_mean"] = (
+            float(weighted_sum) / float(total) if total > 0 else 0.0
+        )
+        for length in range(1, self.chunk_size + 1):
+            count = int(self._selected_h_counts[length - 1].item())
+            metadata[f"evaluation/selected_h_{length}_ratio"] = (
+                float(count) / float(total) if total > 0 else 0.0
+            )
+        return metadata
 
     def _get_reset_mask(self, batch: Batch, batch_size: int) -> torch.Tensor:
         """从 Collector batch 中读取 episode 起始标记。

@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from examples.our_model.models.chunk_value import (
+    CausalTransformerPrefixCritic,
     ChunkCritic,
     TransformerChunkCritic,
 )
@@ -86,6 +87,28 @@ class TransformerChunkCriticTest(unittest.TestCase):
         )
         relative_difference = abs(transformer_parameters - mlp_parameters) / mlp_parameters
         self.assertLess(relative_difference, 0.03)
+
+    def test_causal_prefix_outputs_ignore_future_actions(self) -> None:
+        """修改后缀动作不得影响更短前缀的 Q 值。"""
+
+        critic = CausalTransformerPrefixCritic(
+            state_dim=3,
+            action_dim=4,
+            chunk_size=4,
+            hidden_dim=16,
+            num_layers=2,
+            num_heads=4,
+            dropout=0.0,
+        ).eval()
+        states = torch.randn(2, 3)
+        chunks = torch.randn(2, 4, 4)
+        altered = chunks.clone()
+        altered[:, 2:] = torch.randn_like(altered[:, 2:]) * 100.0
+        original_values = critic(states, chunks)
+        altered_values = critic(states, altered)
+        self.assertEqual(tuple(original_values.shape), (2, 4))
+        torch.testing.assert_close(original_values[:, :2], altered_values[:, :2])
+        self.assertFalse(torch.allclose(original_values[:, 2:], altered_values[:, 2:]))
 
 
 if __name__ == "__main__":

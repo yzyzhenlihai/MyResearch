@@ -21,6 +21,7 @@ from examples.our_model.models.chunk_actor import (
     DEFAULT_FLOW_TEMPERATURE,
 )
 from examples.our_model.models.chunk_value import (
+    CRITIC_BACKBONE_ACSAC_TRANSFORMER,
     CRITIC_BACKBONE_MLP,
     CRITIC_BACKBONE_TRANSFORMER,
     DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
@@ -236,7 +237,8 @@ class MACAgent(nn.Module):
             flow_sample_batch_size (int): Flow 推理时单次并行积分的候选数。
             flow_distill_weight (float): 一步 actor 蒸馏 MSE 的损失权重；零为禁用。
             flow_sampling_mode (str): `onestep` 使用学生，`teacher` 使用多步积分。
-            critic_backbone (str): Critic 网络类型，支持 `mlp` 或 `transformer`。
+            critic_backbone (str): Critic 网络类型；普通 MACAgent 支持 `mlp`
+                或 `transformer`，`acsac_transformer` 由 runner 构造独立子类。
             critic_transformer_hidden_dim (int): Transformer Critic token 维度。
             critic_transformer_layers (int): Transformer Critic 编码层数。
             critic_transformer_heads (int): Transformer Critic 注意力头数。
@@ -261,6 +263,10 @@ class MACAgent(nn.Module):
             raise ValueError(f"Unsupported flow_sampling_mode: {flow_sampling_mode}")
         if critic_backbone not in SUPPORTED_CRITIC_BACKBONES:
             raise ValueError(f"Unsupported critic_backbone: {critic_backbone}")
+        if critic_backbone == CRITIC_BACKBONE_ACSAC_TRANSFORMER:
+            raise ValueError(
+                "acsac_transformer must be constructed as ACSACTransformerAgent."
+            )
         if (actor_type == ACTOR_TYPE_CATEGORICAL_FLOW
                 and flow_sampling_mode == FLOW_SAMPLING_ONESTEP
                 and flow_distill_weight == 0):
@@ -1024,6 +1030,7 @@ class MACAgent(nn.Module):
         history_state: RolloutHistoryState,
         repeat_policy: str,
         leave_policy: str = LEAVE_POLICY_PENALTY,
+        execution_lengths: Optional[torch.Tensor] = None,
     ) -> tuple[RolloutResult, RolloutHistoryState]:
         """执行单个 chunk，直接消费离散 item id，不再走连续→离散映射。
 
@@ -1044,6 +1051,8 @@ class MACAgent(nn.Module):
             history_state (RolloutHistoryState): 当前 chunk 起点的历史缓存。
             repeat_policy (str): 重复推荐处理策略。
             leave_policy (str): 退出规则处理策略，支持 `penalty` 和 `terminate`。
+            execution_lengths (Optional[torch.Tensor]): 每行计划执行的前缀长度，
+                形状为 ``(B,)`` 且位于 ``[1, K]``；为空时执行完整 chunk。
 
         Returns:
             tuple[RolloutResult, RolloutHistoryState]: rollout 结果与更新后的历史缓存。
@@ -1060,6 +1069,20 @@ class MACAgent(nn.Module):
 
         chunk_item_ids = chunk_item_ids.to(device=self.device, dtype=torch.long)
         batch_size = int(chunk_item_ids.shape[0])
+        if execution_lengths is None:
+            execution_lengths = torch.full(
+                (batch_size,), self.chunk_size, dtype=torch.long, device=self.device,
+            )
+        else:
+            execution_lengths = execution_lengths.to(
+                device=self.device, dtype=torch.long,
+            ).reshape(-1)
+            if execution_lengths.shape[0] != batch_size:
+                raise ValueError("execution_lengths must have shape (B,).")
+            if torch.any(execution_lengths < 1) or torch.any(
+                execution_lengths > self.chunk_size
+            ):
+                raise ValueError("execution_lengths must lie in [1, chunk_size].")
         executed_action_embeddings = torch.zeros(
             batch_size,
             self.chunk_size,
@@ -1099,6 +1122,7 @@ class MACAgent(nn.Module):
                 (rollout_start_steps + step_index < self.leave_model.max_turn)
                 & (~already_terminated)
                 & (~leave_terminated)
+                & (step_index < execution_lengths)
             )
             # 关键性能点：不再 `.item()` 提前判空跳过 —— 该 sync 会强制 CPU↔GPU 屏障，
             # 严重拖慢 chunk 循环。直接进入后续计算，让 batch 内无效样本走 mask 分支即可。
