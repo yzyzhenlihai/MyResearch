@@ -31,6 +31,9 @@ from examples.our_model.models.mac_agent import (
 ACSAC_CHECKPOINT_FORMAT = "model_based_acsac_transformer_v1"
 """模型化 ACSAC Transformer 分支的 checkpoint 格式。"""
 
+DEFAULT_ALL_PREFIX_AUX_WEIGHT = 1.0
+"""所有合法前缀一步 target-Q 辅助损失的默认权重。"""
+
 
 @dataclass
 class AdaptiveTrajectoryStep:
@@ -55,6 +58,25 @@ class AdaptiveTrajectoryRollout:
     executed_chunks: torch.Tensor
 
 
+@dataclass
+class AllPrefixOneStepTarget:
+    """同一候选 chunk 的全部合法前缀一步 TD 目标。
+
+    Attributes:
+        values (torch.Tensor): 每个前缀的一步 target-Q 目标，形状 ``(B,K)``。
+        valid (torch.Tensor): 决策时合法且样本未终止的前缀标记，形状 ``(B,K)``。
+        rewards (torch.Tensor): 每个前缀的折扣累计 chunk reward，形状 ``(B,K)``。
+        effective_steps (torch.Tensor): 各前缀实际执行的底层步数，形状 ``(B,K)``。
+        done (torch.Tensor): 各前缀执行后的终止标记，形状 ``(B,K)``。
+    """
+
+    values: torch.Tensor
+    valid: torch.Tensor
+    rewards: torch.Tensor
+    effective_steps: torch.Tensor
+    done: torch.Tensor
+
+
 class ACSACTransformerAgent(MACAgent):
     """保留 ordinary 流程、仅替换 Q/V 与 chunk 选择的独立 agent。
 
@@ -73,6 +95,7 @@ class ACSACTransformerAgent(MACAgent):
         critic_transformer_layers: int = DEFAULT_CRITIC_TRANSFORMER_LAYERS,
         critic_transformer_heads: int = DEFAULT_CRITIC_TRANSFORMER_HEADS,
         critic_transformer_dropout: float = DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
+        all_prefix_aux_weight: float = DEFAULT_ALL_PREFIX_AUX_WEIGHT,
         **kwargs: object,
     ) -> None:
         """初始化共享 Actor/Dynamics 与 ACSAC online/target Q。
@@ -83,8 +106,16 @@ class ACSACTransformerAgent(MACAgent):
             critic_transformer_layers (int): Transformer 层数。
             critic_transformer_heads (int): 注意力头数。
             critic_transformer_dropout (float): dropout 概率。
+            all_prefix_aux_weight (float): 所有合法前缀一步 target-Q 辅助损失
+                的非负权重；设为 0 时关闭辅助目标并跳过额外 rollout。
             **kwargs (object): 传给 ``MACAgent`` 的其余参数。
+
+        Raises:
+            ValueError: 当 ``all_prefix_aux_weight`` 为负数时抛出。
         """
+
+        if all_prefix_aux_weight < 0.0:
+            raise ValueError("all_prefix_aux_weight must be non-negative.")
 
         base_kwargs = dict(kwargs)
         base_kwargs["critic_backbone"] = CRITIC_BACKBONE_MLP
@@ -111,6 +142,7 @@ class ACSACTransformerAgent(MACAgent):
         del self.value
         del self.target_value
         self.critic_backbone = CRITIC_BACKBONE_ACSAC_TRANSFORMER
+        self.all_prefix_aux_weight = float(all_prefix_aux_weight)
 
     def qv_parameters(self, include_dynamics: bool = True) -> Iterable[nn.Parameter]:
         """返回 online Q 与可选 Dynamics 参数，不包含独立 V。
@@ -345,6 +377,152 @@ class ACSACTransformerAgent(MACAgent):
             )
         return continuation.detach()
 
+    @staticmethod
+    def _repeat_history_state(
+        history_state: RolloutHistoryState,
+        repeats: int,
+    ) -> RolloutHistoryState:
+        """为每个样本复制多份相互独立的 rollout 历史。
+
+        复制顺序采用逐样本 ``repeat_interleave``，从而与扁平化后的
+        ``[h=1, ..., K]`` 前缀长度顺序严格对齐。
+
+        Args:
+            history_state (RolloutHistoryState): 原始 batch 的 chunk 起点历史。
+            repeats (int): 每个样本的复制次数，必须为正数。
+
+        Returns:
+            RolloutHistoryState: batch 维扩展为原来 ``repeats`` 倍的新历史。
+
+        Raises:
+            ValueError: 当 ``repeats`` 不是正数时抛出。
+        """
+
+        if repeats <= 0:
+            raise ValueError("repeats must be positive.")
+        return RolloutHistoryState(
+            states=history_state.states.repeat_interleave(repeats, dim=0),
+            leave_history=history_state.leave_history.repeat_interleave(
+                repeats, dim=0,
+            ),
+            recommended_mask=history_state.recommended_mask.repeat_interleave(
+                repeats, dim=0,
+            ),
+            env_step=history_state.env_step.repeat_interleave(repeats, dim=0),
+            terminated=history_state.terminated.repeat_interleave(repeats, dim=0),
+        )
+
+    @torch.no_grad()
+    def _all_prefix_one_step_target(
+        self,
+        batch: Dict[str, torch.Tensor],
+        first_step: AdaptiveTrajectoryStep,
+        num_samples: int,
+        repeat_policy: str,
+        leave_policy: str,
+    ) -> AllPrefixOneStepTarget:
+        """向量化构造首个候选 chunk 的全部合法前缀一步 TD 目标。
+
+        对每个起点复制 ``K`` 份历史，并分别计划执行 ``h=1...K``。每个
+        前缀使用自己的累计 reward、Dynamics 末状态、done 与
+        ``gamma ** effective_steps``，随后由 target Q 在下一状态的候选与合法
+        长度上取最大值。该辅助目标只展开一个 chunk，不改变 selected-H 的
+        完整 TD(lambda) imagined trajectory。
+
+        Args:
+            batch (Dict[str, torch.Tensor]): ActionChunkDataset 训练 batch。
+            first_step (AdaptiveTrajectoryStep): 主 rollout 的第一个宏动作，提供
+                已经联合选中的完整候选 chunk。
+            num_samples (int): 下一状态 target-Q 的候选 chunk 数量。
+            repeat_policy (str): 重复推荐处理策略。
+            leave_policy (str): 退出规则处理策略。
+
+        Returns:
+            AllPrefixOneStepTarget: 形状均为 ``(B,K)`` 的目标及辅助统计。
+
+        Raises:
+            ValueError: 当候选数非正、repeat 策略非法或首步张量形状不匹配时抛出。
+        """
+
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive.")
+        if repeat_policy not in {REPEAT_POLICY_TRUNCATE, REPEAT_POLICY_MASK}:
+            raise ValueError(f"Unsupported repeat_policy: {repeat_policy}")
+
+        history_state = self._initial_history_state(batch)
+        if repeat_policy == REPEAT_POLICY_MASK:
+            self._reset_local_rollout_recommended_mask(history_state)
+            active, _ = self._prepare_rollout_sampling_mask(history_state)
+        else:
+            active = ~history_state.terminated
+
+        batch_size = int(history_state.states.shape[0])
+        expected_item_shape = (batch_size, self.chunk_size)
+        if tuple(first_step.selected_item_ids.shape) != expected_item_shape:
+            raise ValueError(
+                "selected_item_ids shape mismatch: expected "
+                f"{expected_item_shape}, got {tuple(first_step.selected_item_ids.shape)}."
+            )
+
+        prefix_lengths = torch.arange(
+            1,
+            self.chunk_size + 1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        budgets = self._execution_budgets(history_state)
+        valid = active.unsqueeze(1) & (
+            prefix_lengths.unsqueeze(0) <= budgets.unsqueeze(1)
+        )
+
+        expanded_history = self._repeat_history_state(
+            history_state,
+            repeats=self.chunk_size,
+        )
+        expanded_item_ids = first_step.selected_item_ids.repeat_interleave(
+            self.chunk_size,
+            dim=0,
+        )
+        expanded_lengths = prefix_lengths.repeat(batch_size)
+
+        # Reward 模型通过 agent 暂存的 user id 对齐 batch；前缀展开时必须同步复制。
+        original_user_ids = self._batch_user_ids
+        batch_user_ids = self._batch_tensor(batch, "user_id").long().view(-1)
+        if batch_user_ids.shape[0] != batch_size:
+            raise ValueError("user_id batch size does not match observations.")
+        self._batch_user_ids = batch_user_ids.repeat_interleave(self.chunk_size)
+        try:
+            prefix_rollout, next_history = self._rollout_one_chunk(
+                expanded_item_ids,
+                expanded_history,
+                repeat_policy=repeat_policy,
+                leave_policy=leave_policy,
+                execution_lengths=expanded_lengths,
+            )
+            next_values = self._target_state_values(
+                next_history,
+                num_samples=num_samples,
+                repeat_policy=repeat_policy,
+            )
+        finally:
+            self._batch_user_ids = original_user_ids
+
+        chunk_discount = self.gamma ** prefix_rollout.effective_steps.float()
+        flat_targets = prefix_rollout.reward_chunks + (
+            1.0 - prefix_rollout.done_chunks.float()
+        ) * chunk_discount * next_values
+        return AllPrefixOneStepTarget(
+            values=flat_targets.reshape(batch_size, self.chunk_size).detach(),
+            valid=valid,
+            rewards=prefix_rollout.reward_chunks.reshape(
+                batch_size, self.chunk_size,
+            ),
+            effective_steps=prefix_rollout.effective_steps.reshape(
+                batch_size, self.chunk_size,
+            ),
+            done=prefix_rollout.done_chunks.reshape(batch_size, self.chunk_size),
+        )
+
     def qv_update(
         self,
         batch: Dict[str, torch.Tensor],
@@ -355,12 +533,35 @@ class ACSACTransformerAgent(MACAgent):
         lambda_chunk: float = 1.0,
         leave_policy: str = LEAVE_POLICY_PENALTY,
     ) -> Dict[str, float]:
-        """执行一次无独立 V 的自适应 Transformer Q 更新。"""
+        """执行 selected-H TD(lambda) 与全前缀一步 TD 的联合 Q 更新。
+
+        主损失仅在联合 argmax 选中的 H 上回归完整 imagined rollout 的
+        TD(lambda) 目标；辅助损失则让同一候选的所有合法前缀分别回归各自的
+        一步 target-Q 目标。两项均为 MSE，且不更新 Actor 与 target Q。
+
+        Args:
+            batch (Dict[str, torch.Tensor]): ActionChunkDataset 训练 batch。
+            optimizer (torch.optim.Optimizer): online Q 与可选 Dynamics 优化器。
+            num_samples_train (int): 每个状态的候选 chunk 数量。
+            repeat_policy (str): 重复推荐处理策略。
+            rollout_depth (int): selected-H imagined rollout 的 chunk 深度。
+            lambda_chunk (float): selected-H chunk TD(lambda) 系数。
+            leave_policy (str): 退出规则处理策略。
+
+        Returns:
+            Dict[str, float]: loss、Q 值、rollout 与合法前缀统计。
+
+        Raises:
+            RuntimeError: 当 rollout 所需依赖未配置时抛出。
+            ValueError: 当候选数、深度或 lambda 参数非法时抛出。
+        """
 
         if self.dynamics is None or self.reward_model is None or self.leave_model is None:
             raise RuntimeError("qv_update requires dynamics, reward_model and leave_model.")
         if rollout_depth <= 0:
             raise ValueError("rollout_depth must be positive.")
+        if num_samples_train <= 0:
+            raise ValueError("num_samples_train must be positive.")
         if not 0.0 <= lambda_chunk <= 1.0:
             raise ValueError("lambda_chunk must be in [0, 1].")
         self.train()
@@ -377,6 +578,15 @@ class ACSACTransformerAgent(MACAgent):
             )
             target_q = self._td_lambda_target(trajectory, lambda_chunk)
             first_step = trajectory.steps[0]
+            all_prefix_target = None
+            if self.all_prefix_aux_weight > 0.0:
+                all_prefix_target = self._all_prefix_one_step_target(
+                    batch=batch,
+                    first_step=first_step,
+                    num_samples=num_samples_train,
+                    repeat_policy=repeat_policy,
+                    leave_policy=leave_policy,
+                )
         optimizer.zero_grad(set_to_none=True)
         prefix_q_values = self.critic(
             first_step.states,
@@ -385,7 +595,28 @@ class ACSACTransformerAgent(MACAgent):
         selected_q_values = prefix_q_values.gather(
             1, first_step.selected_lengths.unsqueeze(1) - 1,
         ).squeeze(1)
-        critic_loss = F.mse_loss(selected_q_values, target_q)
+        selected_td_lambda_loss = F.mse_loss(selected_q_values, target_q)
+        if all_prefix_target is None:
+            all_prefix_aux_loss = prefix_q_values.sum() * 0.0
+            valid_prefix_q = prefix_q_values.new_empty(0)
+            valid_prefix_targets = prefix_q_values.new_empty(0)
+            legal_prefixes_mean = 0.0
+        else:
+            valid_prefix_q = prefix_q_values[all_prefix_target.valid]
+            valid_prefix_targets = all_prefix_target.values[all_prefix_target.valid]
+            if valid_prefix_q.numel() == 0:
+                all_prefix_aux_loss = prefix_q_values.sum() * 0.0
+            else:
+                all_prefix_aux_loss = F.mse_loss(
+                    valid_prefix_q,
+                    valid_prefix_targets,
+                )
+            legal_prefixes_mean = float(
+                all_prefix_target.valid.sum(dim=1).float().mean().cpu()
+            )
+        critic_loss = selected_td_lambda_loss + (
+            self.all_prefix_aux_weight * all_prefix_aux_loss
+        )
         dynamics_loss = self.supervised_dynamics_loss(batch)
         loss = critic_loss + self.dynamics_loss_weight * dynamics_loss
         loss.backward()
@@ -394,9 +625,24 @@ class ACSACTransformerAgent(MACAgent):
         first_rollout = first_step.rollout
         metrics = {
             "critic/critic_loss": float(critic_loss.detach().cpu()),
+            "critic/selected_td_lambda_loss": float(
+                selected_td_lambda_loss.detach().cpu()
+            ),
+            "critic/all_prefix_aux_loss": float(
+                all_prefix_aux_loss.detach().cpu()
+            ),
+            "critic/all_prefix_aux_weight": self.all_prefix_aux_weight,
             "dynamics/loss": float(dynamics_loss.detach().cpu()),
             "critic/q_mean": float(selected_q_values.detach().mean().cpu()),
             "critic/target_q_mean": float(target_q.detach().mean().cpu()),
+            "critic/all_prefix_q_mean": (
+                float(valid_prefix_q.detach().mean().cpu())
+                if valid_prefix_q.numel() > 0 else 0.0
+            ),
+            "critic/all_prefix_target_q_mean": (
+                float(valid_prefix_targets.detach().mean().cpu())
+                if valid_prefix_targets.numel() > 0 else 0.0
+            ),
             "rollout/depth": float(rollout_depth),
             "rollout/lambda_chunk": float(lambda_chunk),
             "rollout/trajectory_reward": float(
@@ -423,6 +669,7 @@ class ACSACTransformerAgent(MACAgent):
             "rollout/selected_h_mean": float(
                 first_step.selected_lengths.float().detach().mean().cpu()
             ),
+            "rollout/legal_prefixes_mean": legal_prefixes_mean,
             "rollout/done_ratio": float(
                 first_rollout.done_chunks.float().detach().mean().cpu()
             ),

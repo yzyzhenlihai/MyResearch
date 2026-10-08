@@ -1337,6 +1337,7 @@ class RAVEShellRoutingTest(unittest.TestCase):
         self.assertIn("QV_TYPE=multi_prefix_transformer", result.stdout)
         self.assertNotIn("QV_TYPE=ordinary", result.stdout)
         self.assertIn("ROLLOUT_DEPTH=3", result.stdout)
+        self.assertIn("ALL_PREFIX_AUX_WEIGHT=1.0", result.stdout)
         self.assertIn("TRAIN_STAGES=qv", result.stdout)
         self.assertIn("FREEZE_DYNAMICS_DURING_QV=1", result.stdout)
         self.assertIn("DYNAMICS_LOSS_WEIGHT=0", result.stdout)

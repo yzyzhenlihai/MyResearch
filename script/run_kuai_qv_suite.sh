@@ -38,6 +38,7 @@ RAVE_ROLLOUT_CANDIDATES="${RAVE_ROLLOUT_CANDIDATES:-8}"
 RAVE_EPISODES_PER_COLLECT="${RAVE_EPISODES_PER_COLLECT:-32}"
 ORDINARY_ROLLOUT_DEPTH="${ORDINARY_ROLLOUT_DEPTH:-3}"
 LAMBDA_CHUNK="${LAMBDA_CHUNK:-1.0}"
+ALL_PREFIX_AUX_WEIGHT="${ALL_PREFIX_AUX_WEIGHT:-1.0}"
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-100000}"
 DYNAMICS_PRETRAIN_STEPS="${DYNAMICS_PRETRAIN_STEPS:-10000}"
 SWANLAB_MODE="${SWANLAB_MODE:-cloud}"
@@ -91,6 +92,7 @@ usage() {
   --episodes-per-collect N 仅用于 Transformer 每次收集的完整 episode 数，默认 32
   --ordinary-rollout-depth N ordinary 每轮 imagined rollout 的 chunk 深度，默认 3
   --lambda-chunk X        ordinary 的 MAC chunk-level TD(lambda) 系数，默认 1.0
+  --all-prefix-aux-weight X ACSAC 全部合法 H 的一步 target-Q 辅助损失权重，默认 1.0
   --train-eval-episodes N 与 --eval-episodes 等价；三个 Q/V 分支统一使用该轨迹数
   --pretrain-steps N       Flow/CE BC 更新步数
   --dynamics-steps N      chunk dynamics 更新步数
@@ -135,6 +137,7 @@ while (( $# > 0 )); do
     --episodes-per-collect) RAVE_EPISODES_PER_COLLECT="$2"; shift 2 ;;
     --ordinary-rollout-depth) ORDINARY_ROLLOUT_DEPTH="$2"; shift 2 ;;
     --lambda-chunk) LAMBDA_CHUNK="$2"; shift 2 ;;
+    --all-prefix-aux-weight) ALL_PREFIX_AUX_WEIGHT="$2"; shift 2 ;;
     --train-eval-episodes) EVAL_EPISODES="$2"; RAVE_TRAIN_EVAL_EPISODES="$2"; shift 2 ;;
     --pretrain-steps) PRETRAIN_STEPS="$2"; shift 2 ;;
     --dynamics-steps) DYNAMICS_PRETRAIN_STEPS="$2"; shift 2 ;;
@@ -243,6 +246,10 @@ if ! awk -v value="${LAMBDA_CHUNK}" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?
   printf -- '--lambda-chunk 必须位于 [0,1]：%s\n' "${LAMBDA_CHUNK}" >&2
   exit 2
 fi
+if ! awk -v value="${ALL_PREFIX_AUX_WEIGHT}" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 0) }'; then
+  printf -- '--all-prefix-aux-weight 必须为非负数：%s\n' "${ALL_PREFIX_AUX_WEIGHT}" >&2
+  exit 2
+fi
 if (( ORDINARY_ENABLED == 1 && RAVE_STEPS % RAVE_EPOCHS != 0 )); then
   printf -- '--rave-steps 必须能被 --rave-epochs 整除，才能映射为 MAC step_per_epoch：%s / %s\n' \
     "${RAVE_STEPS}" "${RAVE_EPOCHS}" >&2
@@ -349,6 +356,7 @@ run_qv() {
       "TEST_NUM=${TEST_NUM}" "NUM_SAMPLES_TEST=${NUM_SAMPLES_TEST}"
       "BATCH_SIZE=${QV_BATCH_SIZE}" "NUM_SAMPLES_TRAIN=${RAVE_ROLLOUT_CANDIDATES}"
       "ROLLOUT_DEPTH=${ORDINARY_ROLLOUT_DEPTH}" "LAMBDA_CHUNK=${LAMBDA_CHUNK}"
+      "ALL_PREFIX_AUX_WEIGHT=${ALL_PREFIX_AUX_WEIGHT}"
       "GAMMA=${GAMMA}" "BUFFER_SIZE=${BUFFER_SIZE}"
       "OUTPUT_ROOT=${OUTPUT_ROOT}" "BC_ACTOR_CKPT=${checkpoint}"
       "BC_SAVE_DIR=$(dirname "${checkpoint}")" "MAC_SAVE_DIR=${output_dir}"

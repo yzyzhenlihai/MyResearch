@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 import types
 import unittest
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -70,6 +70,98 @@ class FixedPrefixCritic(nn.Module):
 
         del states, chunks
         return self.values
+
+
+class LearnablePrefixCritic(nn.Module):
+    """为每个前缀维护一个独立标量参数的测试 Q 网络。"""
+
+    def __init__(self, initial_values: torch.Tensor) -> None:
+        """初始化可学习的前缀价值。
+
+        Args:
+            initial_values (torch.Tensor): 形状 ``(K,)`` 的初始前缀价值。
+        """
+
+        super().__init__()
+        self.prefix_values = nn.Parameter(initial_values.clone().float())
+
+    def forward(self, states: torch.Tensor, chunks: torch.Tensor) -> torch.Tensor:
+        """将独立前缀参数扩展到输入 batch。
+
+        Args:
+            states (torch.Tensor): 状态 batch，仅用于确定 batch size。
+            chunks (torch.Tensor): chunk batch，仅用于接口兼容。
+
+        Returns:
+            torch.Tensor: 形状 ``(B,K)`` 的可学习前缀价值。
+        """
+
+        del chunks
+        return self.prefix_values.unsqueeze(0).expand(states.shape[0], -1)
+
+
+class ZeroPrefixCritic(nn.Module):
+    """返回动态 batch 形状全零价值的固定 target Q 网络。"""
+
+    def __init__(self, chunk_size: int) -> None:
+        """保存输出前缀数量。
+
+        Args:
+            chunk_size (int): 输出前缀数量 K，必须为正数。
+
+        Raises:
+            ValueError: 当 ``chunk_size`` 非正时抛出。
+        """
+
+        super().__init__()
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive.")
+        self.chunk_size = chunk_size
+
+    def forward(self, states: torch.Tensor, chunks: torch.Tensor) -> torch.Tensor:
+        """返回与状态 batch 对齐的零价值。
+
+        Args:
+            states (torch.Tensor): 状态 batch，形状 ``(B,state_dim)``。
+            chunks (torch.Tensor): chunk batch，仅用于保持接口一致。
+
+        Returns:
+            torch.Tensor: 形状 ``(B,K)`` 的零张量。
+        """
+
+        del chunks
+        return states.new_zeros((states.shape[0], self.chunk_size))
+
+
+class ItemIdRewardModel:
+    """用 ``item_id + 1`` 生成确定性 step reward 的测试模型。"""
+
+    def reward_components(
+        self,
+        raw_user_ids: torch.Tensor,
+        item_ids: torch.Tensor,
+        history_item_ids: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """返回便于手算各前缀累计回报的 reward 分量。
+
+        Args:
+            raw_user_ids (torch.Tensor): 用户 id，本测试不使用。
+            item_ids (torch.Tensor): 当前 item id，形状 ``(B,)``。
+            history_item_ids (torch.Tensor): 历史 item id，本测试不使用。
+
+        Returns:
+            dict[str, torch.Tensor]: reward、预测、熵和不确定性分量。
+        """
+
+        del raw_user_ids, history_item_ids
+        reward = item_ids.float() + 1.0
+        zeros = torch.zeros_like(reward)
+        return {
+            "reward": reward,
+            "pred_reward": reward,
+            "entropy": zeros,
+            "uncertainty": zeros,
+        }
 
 
 class ACSACTransformerAgentTest(unittest.TestCase):
@@ -158,6 +250,116 @@ class ACSACTransformerAgentTest(unittest.TestCase):
         restored.load_checkpoint_state(checkpoint)
         for source, target in zip(agent.critic.parameters(), restored.critic.parameters()):
             torch.testing.assert_close(source, target)
+
+    def test_all_prefix_auxiliary_loss_updates_every_horizon(self) -> None:
+        """辅助一步 TD 应让未被 argmax 选中的合法 H 也获得梯度。"""
+
+        _, _, batch = build_fixture()
+        agent = build_agent()
+        agent.invalid_action_penalty = 0.0
+        agent.critic = LearnablePrefixCritic(torch.tensor([3.0, 2.0, 1.0]))
+        agent.target_critic = ZeroPrefixCritic(agent.chunk_size)
+        optimizer = torch.optim.SGD(
+            agent.qv_parameters(include_dynamics=False),
+            lr=0.01,
+        )
+        before = agent.critic.prefix_values.detach().clone()
+
+        metrics = agent.qv_update(
+            batch,
+            optimizer,
+            num_samples_train=2,
+            rollout_depth=2,
+            lambda_chunk=0.7,
+        )
+
+        after = agent.critic.prefix_values.detach()
+        self.assertTrue(bool(torch.all(after < before)))
+        self.assertAlmostEqual(metrics["critic/selected_td_lambda_loss"], 9.0)
+        self.assertAlmostEqual(
+            metrics["critic/all_prefix_aux_loss"],
+            14.0 / 3.0,
+            places=5,
+        )
+        self.assertAlmostEqual(
+            metrics["critic/critic_loss"],
+            9.0 + 14.0 / 3.0,
+            places=5,
+        )
+        self.assertEqual(metrics["rollout/legal_prefixes_mean"], 3.0)
+
+    def test_all_prefix_targets_use_individual_discounted_rewards(self) -> None:
+        """每个 H 应使用自身累计 reward，而不是复制 selected-H 的目标。"""
+
+        agent = build_agent()
+        agent.reward_model = ItemIdRewardModel()
+        agent.invalid_action_penalty = 0.0
+        agent.target_critic = ZeroPrefixCritic(agent.chunk_size)
+        batch = {
+            "observations": torch.zeros(1, agent.state_dim),
+            "leave_history_item_ids": torch.full((1, 1), -1, dtype=torch.long),
+            "recommended_mask": torch.zeros(
+                1,
+                agent.num_items,
+                dtype=torch.bool,
+            ),
+            "env_step": torch.zeros(1, dtype=torch.long),
+            "initial_terminals": torch.zeros(1, dtype=torch.bool),
+            "user_id": torch.zeros(1, dtype=torch.long),
+        }
+        first_step = types.SimpleNamespace(
+            selected_item_ids=torch.tensor([[0, 1, 2]], dtype=torch.long),
+        )
+
+        target = agent._all_prefix_one_step_target(
+            batch=batch,
+            first_step=first_step,
+            num_samples=2,
+            repeat_policy="truncate",
+            leave_policy="penalty",
+        )
+
+        expected = torch.tensor([[1.0, 2.8, 5.23]])
+        torch.testing.assert_close(target.values, expected)
+        self.assertTrue(bool(target.valid.all()))
+        self.assertEqual(target.effective_steps.tolist(), [[1, 2, 3]])
+
+    def test_zero_aux_weight_skips_all_prefix_rollout(self) -> None:
+        """权重为零时应恢复 selected-H 路径且不构造额外前缀目标。"""
+
+        _, _, batch = build_fixture()
+        agent = build_agent()
+        agent.all_prefix_aux_weight = 0.0
+
+        def fail_if_called(*args: object, **kwargs: object) -> None:
+            """在被意外调用时立即使测试失败。
+
+            Args:
+                *args (object): 被替换方法的位置参数。
+                **kwargs (object): 被替换方法的关键字参数。
+
+            Raises:
+                AssertionError: 本函数任何时候都不应被调用。
+            """
+
+            del args, kwargs
+            raise AssertionError("all-prefix rollout should be skipped")
+
+        agent._all_prefix_one_step_target = fail_if_called
+        optimizer = torch.optim.Adam(
+            agent.qv_parameters(include_dynamics=False),
+            lr=0.001,
+        )
+
+        metrics = agent.qv_update(
+            batch,
+            optimizer,
+            num_samples_train=2,
+            rollout_depth=1,
+        )
+
+        self.assertEqual(metrics["critic/all_prefix_aux_loss"], 0.0)
+        self.assertEqual(metrics["critic/all_prefix_aux_weight"], 0.0)
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@ CRITIC_TRANSFORMER_HIDDEN_DIM="${CRITIC_TRANSFORMER_HIDDEN_DIM:-72}"
 CRITIC_TRANSFORMER_LAYERS="${CRITIC_TRANSFORMER_LAYERS:-2}"
 CRITIC_TRANSFORMER_HEADS="${CRITIC_TRANSFORMER_HEADS:-4}"
 CRITIC_TRANSFORMER_DROPOUT="${CRITIC_TRANSFORMER_DROPOUT:-0.0}"
+ALL_PREFIX_AUX_WEIGHT="${ALL_PREFIX_AUX_WEIGHT:-1.0}"
 
 case "${ACTOR_TYPE}" in
   categorical_flow)
@@ -245,6 +246,7 @@ COMMON_ARGS=(
   --critic_transformer_layers "${CRITIC_TRANSFORMER_LAYERS}"
   --critic_transformer_heads "${CRITIC_TRANSFORMER_HEADS}"
   --critic_transformer_dropout "${CRITIC_TRANSFORMER_DROPOUT}"
+  --all_prefix_aux_weight "${ALL_PREFIX_AUX_WEIGHT}"
   --num_leave_compute "${NUM_LEAVE_COMPUTE}"
   --leave_threshold "${LEAVE_THRESHOLD}"
   --max_turn "${MAX_TURN}"
@@ -369,10 +371,10 @@ printf '[run_dorl_mac_kuai_train] pretrain: actor=%s, steps=%s, flow_steps=%s, d
 printf '[run_dorl_mac_kuai_train] qv: epoch=%s, step_per_epoch=%s, test_num=%s, rollout_depth=%s, lambda_chunk=%s, leave_policy=%s, repeat_policy=%s\n' \
   "${EPOCH}" "${STEP_PER_EPOCH}" "${TEST_NUM}" \
   "${ROLLOUT_DEPTH}" "${LAMBDA_CHUNK}" "${LEAVE_POLICY}" "${REPEAT_POLICY}"
-printf '[run_dorl_mac_kuai_train] critic: backbone=%s, hidden_dim=%s, layers=%s, heads=%s, dropout=%s\n' \
+printf '[run_dorl_mac_kuai_train] critic: backbone=%s, hidden_dim=%s, layers=%s, heads=%s, dropout=%s, all_prefix_aux_weight=%s\n' \
   "${CRITIC_BACKBONE}" "${CRITIC_TRANSFORMER_HIDDEN_DIM}" \
   "${CRITIC_TRANSFORMER_LAYERS}" "${CRITIC_TRANSFORMER_HEADS}" \
-  "${CRITIC_TRANSFORMER_DROPOUT}"
+  "${CRITIC_TRANSFORMER_DROPOUT}" "${ALL_PREFIX_AUX_WEIGHT}"
 printf '[run_dorl_mac_kuai_train] reward: entropy=%s(lambda=%s, window=%s), uncertainty=%s(lambda=%s), invalid_penalty=%s, pred_mat_normalize=%s\n' \
   "${USE_ENTROPY_REWARD}" "${LAMBDA_ENTROPY}" "${ENTROPY_WINDOW}" \
   "${USE_UNCERTAINTY_PENALTY}" "${LAMBDA_VARIANCE}" "${INVALID_ACTION_PENALTY}" \

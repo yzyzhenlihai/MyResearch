@@ -92,6 +92,8 @@ def build_common_argv(args: argparse.Namespace) -> List[str]:
         str(args.rollout_depth),
         "--lambda_chunk",
         str(args.lambda_chunk),
+        "--all_prefix_aux_weight",
+        str(args.all_prefix_aux_weight),
         "--leave_policy",
         args.leave_policy,
         "--predicted_mat_normalize",

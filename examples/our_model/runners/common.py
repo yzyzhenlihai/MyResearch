@@ -35,6 +35,7 @@ import examples.our_model.models.mac_agent as mac_agent_module  # noqa: E402
 from examples.our_model.models.acsac_agent import (  # noqa: E402
     ACSAC_CHECKPOINT_FORMAT,
     ACSACTransformerAgent,
+    DEFAULT_ALL_PREFIX_AUX_WEIGHT,
 )
 from examples.our_model.models.dorl_reward import DORLRewardModel  # noqa: E402
 from examples.our_model.models.leave_model import RuleBasedLeaveModel  # noqa: E402
@@ -406,6 +407,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
     )
     parser.add_argument(
+        "--all_prefix_aux_weight",
+        type=float,
+        default=DEFAULT_ALL_PREFIX_AUX_WEIGHT,
+        help=(
+            "ACSAC Transformer 所有合法 H 的一步 target-Q 辅助 MSE 权重；"
+            "0 表示关闭并跳过额外全前缀 rollout。"
+        ),
+    )
+    parser.add_argument(
         "--actor_type", choices=["categorical", "categorical_flow"],
         default="categorical_flow",
         help="chunk BC 类型；默认在类别顶点空间使用 Flow Matching。",
@@ -553,6 +563,7 @@ def apply_checkpoint_model_config(
             ("critic_transformer_layers", DEFAULT_CRITIC_TRANSFORMER_LAYERS),
             ("critic_transformer_heads", DEFAULT_CRITIC_TRANSFORMER_HEADS),
             ("critic_transformer_dropout", DEFAULT_CRITIC_TRANSFORMER_DROPOUT),
+            ("all_prefix_aux_weight", DEFAULT_ALL_PREFIX_AUX_WEIGHT),
         ):
             setattr(args, key, config.get(key, default_value))
     for key in (
@@ -814,6 +825,9 @@ def build_agent(
         if args.critic_backbone == CRITIC_BACKBONE_ACSAC_TRANSFORMER
         else mac_agent_module.MACAgent
     )
+    acsac_kwargs = {}
+    if agent_class is ACSACTransformerAgent:
+        acsac_kwargs["all_prefix_aux_weight"] = args.all_prefix_aux_weight
     agent = agent_class(
         state_dim=state_dim,
         action_dim=action_mapper.action_dim,
@@ -841,6 +855,7 @@ def build_agent(
         critic_transformer_layers=args.critic_transformer_layers,
         critic_transformer_heads=args.critic_transformer_heads,
         critic_transformer_dropout=args.critic_transformer_dropout,
+        **acsac_kwargs,
     )
     # 固定观测契约写入 checkpoint，避免误加载上一版重构状态的参数。
     agent.observation_spec = {
