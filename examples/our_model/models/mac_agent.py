@@ -23,6 +23,7 @@ from examples.our_model.models.chunk_actor import (
 from examples.our_model.models.chunk_value import (
     CRITIC_BACKBONE_ACSAC_TRANSFORMER,
     CRITIC_BACKBONE_MLP,
+    CRITIC_BACKBONE_MULTI_PREFIX_TRANSFORMER,
     CRITIC_BACKBONE_TRANSFORMER,
     DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
     DEFAULT_CRITIC_TRANSFORMER_HEADS,
@@ -263,9 +264,12 @@ class MACAgent(nn.Module):
             raise ValueError(f"Unsupported flow_sampling_mode: {flow_sampling_mode}")
         if critic_backbone not in SUPPORTED_CRITIC_BACKBONES:
             raise ValueError(f"Unsupported critic_backbone: {critic_backbone}")
-        if critic_backbone == CRITIC_BACKBONE_ACSAC_TRANSFORMER:
+        if critic_backbone in {
+            CRITIC_BACKBONE_ACSAC_TRANSFORMER,
+            CRITIC_BACKBONE_MULTI_PREFIX_TRANSFORMER,
+        }:
             raise ValueError(
-                "acsac_transformer must be constructed as ACSACTransformerAgent."
+                f"{critic_backbone} must be constructed with its dedicated agent."
             )
         if (actor_type == ACTOR_TYPE_CATEGORICAL_FLOW
                 and flow_sampling_mode == FLOW_SAMPLING_ONESTEP

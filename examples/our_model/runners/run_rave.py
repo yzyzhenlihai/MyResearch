@@ -133,23 +133,9 @@ def build_parser():
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--alpha_v", type=float, default=1.0)
-    parser.add_argument(
-        "--eta_t", type=float, default=None,
-        help="四头模型的展示长度权重；未设置时为 0.2，单 R 头必须为 0。",
-    )
-    parser.add_argument(
-        "--eta_d", type=float, default=None,
-        help="四头模型的 MCD 改善权重；未设置时为 0.2，单 R 头必须为 0。",
-    )
-    parser.add_argument(
-        "--eta_c", type=float, default=None,
-        help="四头模型的规划成本权重；未设置时为 0.05，单 R 头必须为 0。",
-    )
     parser.add_argument("--epsilon", type=float, default=0.1)
-    parser.add_argument("--top_rate", type=float, default=0.8)
     parser.add_argument("--validation_fraction", type=float, default=0.1)
     parser.add_argument("--test_fraction", type=float, default=0.1)
-    parser.add_argument("--scale_samples", type=int, default=10000)
     parser.add_argument("--eval_episodes", type=int, default=20)
     parser.add_argument(
         "--test-num", "--test_num", dest="test_num", type=int, default=10,

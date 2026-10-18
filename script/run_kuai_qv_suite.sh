@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 统一训练五个随机种子的三类 Q/V：MAC MLP Q/V、ACSAC 因果 Transformer Q
-# 和 R/T/D/C 多目标前缀 Transformer Q/V。ordinary 与 acsac_transformer
-# 共享当前 Actor/Dynamics 和 MAC 模型化训练流程。
+# 统一训练五个随机种子的三类 critic：MAC MLP Q/V、ACSAC
+# 因果 Transformer Q 和 R/T/D/C 四头前缀 Transformer Q。三者共享
+# 当前 Actor/Dynamics 和 MAC 模型化训练流程。
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # 命令行参数优先；未传命令行时允许用同名环境变量配置批量任务。
-
+#  KuaiEnv-v0 KuaiRand-v0
 ENV_NAME="${ENV_NAME:-KuaiEnv-v0}"
 # ordinary：固定当前 Actor/Dynamics，使用 MAC 离线任意起点、MLP Q/V 与 chunk TD(lambda)。
 # acsac_transformer：同 ordinary 流程，但用因果前缀 Q 联合选择候选与 H，且无独立 V。
-# multi_prefix_transformer：R/T/D/C 四头前缀 Transformer Q/V，联合选择候选与 H。
-QV_TYPES="${QV_TYPES:-acsac_transformer}"
+# multi_prefix_transformer：R/T/D/C 四头前缀 Transformer Q，联合选择候选与 H，无独立 V。
+QV_TYPES="${QV_TYPES:-multi_prefix_transformer}"
 SEEDS="${SEEDS:-2023 2024 2025 2026 2027}"
-GPU_IDS="${GPU_IDS:-1 2 3 4 5}"
-CHUNK_SIZE="${CHUNK_SIZE:-7}"
+GPU_IDS="${GPU_IDS:-5 6 7}"
+CHUNK_SIZE="${CHUNK_SIZE:-5}"
 #pretrain：只预训练共享 BC Actor，并保存各 seed 的 BC checkpoint。
 #qv：使用已有 BC checkpoint 训练指定的 Q/V 分支。
   #- ordinary 每步从离线任意起点重生成 fixed-depth imagined rollout，batch 起点接受 MAC Q/V 监督。
   #- ordinary 的 Actor/Dynamics 从共享 checkpoint 恢复并冻结，R 与原 MAC/DORL 保持一致。
-  #- 两个 Transformer 仍使用完整 episode replay 和 ACSAC 全前缀 Q。
+  #- 两个 Transformer 均使用 fresh imagined rollout：selected-H 完整
+  #  chunk TD(lambda) + 所有合法 H 的一步 target-Q 辅助监督。
   #- 加 --no-eval-after-train 可关闭训练后的独立评估。
 #eval：不训练，单独加载已有 checkpoint，评估 --qv-type 指定的分支。三个分支都支持。
 #all：依次执行 pretrain 和 qv，并保留 qv 阶段默认的训练后评估行为。
@@ -59,7 +60,7 @@ LEAVE_THRESHOLD="${LEAVE_THRESHOLD:-0}"
 MAX_TURN="${MAX_TURN:-100}"
 LEAVE_POLICY="${LEAVE_POLICY:-terminate}"
 ETA_T="${ETA_T:-0.2}"
-ETA_D="${ETA_D:-0.2}"
+ETA_D="${ETA_D:-0.5}"
 ETA_C="${ETA_C:-0.05}"
 GAMMA="${GAMMA:-0.9}"
 
@@ -89,7 +90,7 @@ usage() {
   --rave-eval-every N     每 N 个 epoch 记录一次 RAVE-H-Eval，默认 1
   --batch-size N          三个 Q/V 分支统一训练 batch size；MAC 系分支是离线起点数，默认 256
   --train-candidates N    三个 Q/V 分支每状态训练候选数，默认 8
-  --episodes-per-collect N 仅用于 Transformer 每次收集的完整 episode 数，默认 32
+  --episodes-per-collect N 保留的旧 RAVE 参数；当前三个分支不使用
   --ordinary-rollout-depth N ordinary 每轮 imagined rollout 的 chunk 深度，默认 3
   --lambda-chunk X        ordinary 的 MAC chunk-level TD(lambda) 系数，默认 1.0
   --all-prefix-aux-weight X ACSAC 全部合法 H 的一步 target-Q 辅助损失权重，默认 1.0
@@ -324,7 +325,6 @@ run_qv() {
   local seed="$2"
   local gpu="$3"
   local checkpoint output_dir latest log_file status="complete"
-  local qv_eta_t="" qv_eta_d="" qv_eta_c=""
   checkpoint="$(bc_checkpoint "${seed}")"
   output_dir="${OUTPUT_ROOT}/${qv_type}/seed-${seed}"
   log_file="${LOG_ROOT}/${qv_type}-seed${seed}.log"
@@ -341,58 +341,32 @@ run_qv() {
     return 0
   fi
 
-  local -a command
-  if [[ "${qv_type}" == "ordinary" || "${qv_type}" == "acsac_transformer" ]]; then
-    local critic_backbone="mlp"
-    if [[ "${qv_type}" == "acsac_transformer" ]]; then
-      critic_backbone="acsac_transformer"
-    fi
-    command=(env
-      "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
-      "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
-      "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
-      "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
-      "COMPLETION_WINDOW=${CHUNK_SIZE}"
-      "TEST_NUM=${TEST_NUM}" "NUM_SAMPLES_TEST=${NUM_SAMPLES_TEST}"
-      "BATCH_SIZE=${QV_BATCH_SIZE}" "NUM_SAMPLES_TRAIN=${RAVE_ROLLOUT_CANDIDATES}"
-      "ROLLOUT_DEPTH=${ORDINARY_ROLLOUT_DEPTH}" "LAMBDA_CHUNK=${LAMBDA_CHUNK}"
-      "ALL_PREFIX_AUX_WEIGHT=${ALL_PREFIX_AUX_WEIGHT}"
-      "GAMMA=${GAMMA}" "BUFFER_SIZE=${BUFFER_SIZE}"
-      "OUTPUT_ROOT=${OUTPUT_ROOT}" "BC_ACTOR_CKPT=${checkpoint}"
-      "BC_SAVE_DIR=$(dirname "${checkpoint}")" "MAC_SAVE_DIR=${output_dir}"
-      "RUN_DIR=${output_dir}" "TRAIN_STAGES=qv" "CRITIC_BACKBONE=${critic_backbone}"
-      "FREEZE_DYNAMICS_DURING_QV=1" "DYNAMICS_LOSS_WEIGHT=0" "EPOCH=${RAVE_EPOCHS}"
-      "STEP_PER_EPOCH=${STEP_PER_EPOCH}" "EVAL_EVERY_N_EPOCHS=${RAVE_EVAL_EVERY_EPOCHS}"
-      "EVAL_EPISODES=${EVAL_EPISODES}" "QV_SWANLAB_PROJECT=RAVE-H-QV-Suite"
-      "QV_RUN_NAME=qv-suite-${DATASET_TAG}-K${CHUNK_SIZE}-${qv_type}-seed${seed}"
-      "SWANLAB_MODE=${SWANLAB_MODE}" bash script/run_dorl_mac_kuai_train.sh)
-  else
-    if [[ "${qv_type}" == "multi_prefix_transformer" ]]; then
-      qv_eta_t="${ETA_T}"
-      qv_eta_d="${ETA_D}"
-      qv_eta_c="${ETA_C}"
-    fi
-    command=(env
-      "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "SEED=${seed}"
-      "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
-      "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
-      "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}"
-      "COMPLETION_WINDOW=${CHUNK_SIZE}"
-      "TEST_NUM=${TEST_NUM}" "NUM_CANDIDATES=${NUM_SAMPLES_TEST}"
-      "BATCH_SIZE=${QV_BATCH_SIZE}" "ROLLOUT_CANDIDATES=${RAVE_ROLLOUT_CANDIDATES}"
-      "EPISODES_PER_COLLECT=${RAVE_EPISODES_PER_COLLECT}"
-      "LAMBDA_CHUNK=${LAMBDA_CHUNK}" "GAMMA=${GAMMA}"
-      "BUFFER_SIZE=${BUFFER_SIZE}" "OUTPUT_ROOT=${OUTPUT_ROOT}"
-      "MAC_CHECKPOINT=${checkpoint}" "QV_TYPE=${qv_type}"
-      "ETA_T=${qv_eta_t}" "ETA_D=${qv_eta_d}" "ETA_C=${qv_eta_c}"
-      "RUN_NAME=qv-suite-${DATASET_TAG}-K${CHUNK_SIZE}-${qv_type}-seed${seed}"
-      "OUTPUT_DIR=${output_dir}" "STEPS=${RAVE_STEPS}" "EPOCHS=${RAVE_EPOCHS}"
-      "EVAL_EVERY_EPOCHS=${RAVE_EVAL_EVERY_EPOCHS}"
-      "TRAIN_EVAL_EPISODES=${EVAL_EPISODES}"
-      "EVAL_SWANLAB_PROJECT=${EVAL_SWANLAB_PROJECT}"
-      "SWANLAB_PROJECT=RAVE-H-QV-Suite" "SWANLAB_MODE=${SWANLAB_MODE}"
-      "MODE=train" bash script/run_rave_kuai.sh)
+  local critic_backbone="mlp"
+  if [[ "${qv_type}" == "acsac_transformer" ]]; then
+    critic_backbone="acsac_transformer"
+  elif [[ "${qv_type}" == "multi_prefix_transformer" ]]; then
+    critic_backbone="multi_prefix_transformer"
   fi
+  local -a command=(env
+    "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
+    "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
+    "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
+    "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
+    "COMPLETION_WINDOW=${CHUNK_SIZE}"
+    "TEST_NUM=${TEST_NUM}" "NUM_SAMPLES_TEST=${NUM_SAMPLES_TEST}"
+    "BATCH_SIZE=${QV_BATCH_SIZE}" "NUM_SAMPLES_TRAIN=${RAVE_ROLLOUT_CANDIDATES}"
+    "ROLLOUT_DEPTH=${ORDINARY_ROLLOUT_DEPTH}" "LAMBDA_CHUNK=${LAMBDA_CHUNK}"
+    "ALL_PREFIX_AUX_WEIGHT=${ALL_PREFIX_AUX_WEIGHT}"
+    "ETA_T=${ETA_T}" "ETA_D=${ETA_D}" "ETA_C=${ETA_C}"
+    "GAMMA=${GAMMA}" "BUFFER_SIZE=${BUFFER_SIZE}"
+    "OUTPUT_ROOT=${OUTPUT_ROOT}" "BC_ACTOR_CKPT=${checkpoint}"
+    "BC_SAVE_DIR=$(dirname "${checkpoint}")" "MAC_SAVE_DIR=${output_dir}"
+    "RUN_DIR=${output_dir}" "TRAIN_STAGES=qv" "CRITIC_BACKBONE=${critic_backbone}"
+    "FREEZE_DYNAMICS_DURING_QV=1" "DYNAMICS_LOSS_WEIGHT=0" "EPOCH=${RAVE_EPOCHS}"
+    "STEP_PER_EPOCH=${STEP_PER_EPOCH}" "EVAL_EVERY_N_EPOCHS=${RAVE_EVAL_EVERY_EPOCHS}"
+    "EVAL_EPISODES=${EVAL_EPISODES}" "QV_SWANLAB_PROJECT=RAVE-H-QV-Suite"
+    "QV_RUN_NAME=qv-suite-${DATASET_TAG}-K${CHUNK_SIZE}-${qv_type}-seed${seed}"
+    "SWANLAB_MODE=${SWANLAB_MODE}" bash script/run_dorl_mac_kuai_train.sh)
   printf '[run] qv_type=%s seed=%s gpu=%s output=%s\n' \
     "${qv_type}" "${seed}" "${gpu}" "${output_dir}"
   if [[ "${DRY_RUN}" == "1" ]]; then print_command "${command[@]}"; return 0; fi
@@ -426,38 +400,25 @@ run_rave_eval() {
       "${qv_type}" "${seed}" "${result}"
     return 0
   fi
-  local -a command
-  if [[ "${qv_type}" == "ordinary" || "${qv_type}" == "acsac_transformer" ]]; then
-    local critic_backbone="mlp"
-    if [[ "${qv_type}" == "acsac_transformer" ]]; then
-      critic_backbone="acsac_transformer"
-    fi
-    command=(env
-      "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
-      "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
-      "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
-      "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
-      "COMPLETION_WINDOW=${CHUNK_SIZE}" "TEST_NUM=${TEST_NUM}"
-      "NUM_SAMPLES_TEST=${NUM_SAMPLES_TEST}" "BUFFER_SIZE=${BUFFER_SIZE}"
-      "OUTPUT_ROOT=${OUTPUT_ROOT}" "RUN_DIR=${output_dir}" "MAC_SAVE_DIR=${output_dir}"
-      "EVAL_SAVE_DIR=${eval_dir}" "TRAIN_STAGES=eval" "CRITIC_BACKBONE=${critic_backbone}"
-      "EVAL_EPISODES=${EVAL_EPISODES}" "EVAL_RUN_NAME=${run_name}"
-      "EVAL_SWANLAB_PROJECT=${EVAL_SWANLAB_PROJECT}" "SWANLAB_MODE=${SWANLAB_MODE}"
-      bash script/run_dorl_mac_kuai_train.sh)
-  else
-    command=(env
-      "CUDA_VISIBLE_DEVICES=${gpu}" "DEVICE=cuda:0" "SEED=${seed}"
-      "ENV_NAME=${ENV_NAME}" "CHUNK_SIZE=${CHUNK_SIZE}" "OUTPUT_ROOT=${OUTPUT_ROOT}"
-      "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
-      "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}"
-      "COMPLETION_WINDOW=${CHUNK_SIZE}"
-      "TEST_NUM=${TEST_NUM}" "NUM_CANDIDATES=${NUM_SAMPLES_TEST}"
-      "BUFFER_SIZE=${BUFFER_SIZE}" "DORL_EVAL_PARITY=1"
-      "RAVE_CHECKPOINT=${checkpoint}" "RUN_NAME=${run_name}"
-      "OUTPUT_DIR=${eval_dir}" "SWANLAB_PROJECT=${EVAL_SWANLAB_PROJECT}"
-      "SWANLAB_MODE=${SWANLAB_MODE}" "EVAL_SPLIT=${EVAL_SPLIT}"
-      "EVAL_EPISODES=${EVAL_EPISODES}" "MODE=eval" bash script/run_rave_kuai.sh)
+  local critic_backbone="mlp"
+  if [[ "${qv_type}" == "acsac_transformer" ]]; then
+    critic_backbone="acsac_transformer"
+  elif [[ "${qv_type}" == "multi_prefix_transformer" ]]; then
+    critic_backbone="multi_prefix_transformer"
   fi
+  local -a command=(env
+    "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
+    "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
+    "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
+    "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
+    "COMPLETION_WINDOW=${CHUNK_SIZE}" "TEST_NUM=${TEST_NUM}"
+    "NUM_SAMPLES_TEST=${NUM_SAMPLES_TEST}" "BUFFER_SIZE=${BUFFER_SIZE}"
+    "ETA_T=${ETA_T}" "ETA_D=${ETA_D}" "ETA_C=${ETA_C}"
+    "OUTPUT_ROOT=${OUTPUT_ROOT}" "RUN_DIR=${output_dir}" "MAC_SAVE_DIR=${output_dir}"
+    "EVAL_SAVE_DIR=${eval_dir}" "TRAIN_STAGES=eval" "CRITIC_BACKBONE=${critic_backbone}"
+    "EVAL_EPISODES=${EVAL_EPISODES}" "EVAL_RUN_NAME=${run_name}"
+    "EVAL_SWANLAB_PROJECT=${EVAL_SWANLAB_PROJECT}" "SWANLAB_MODE=${SWANLAB_MODE}"
+    bash script/run_dorl_mac_kuai_train.sh)
   printf '[run] eval qv_type=%s seed=%s gpu=%s output=%s\n' \
     "${qv_type}" "${seed}" "${gpu}" "${eval_dir}"
   if [[ "${DRY_RUN}" == "1" ]]; then print_command "${command[@]}"; return 0; fi

@@ -37,6 +37,10 @@ from examples.our_model.models.acsac_agent import (  # noqa: E402
     ACSACTransformerAgent,
     DEFAULT_ALL_PREFIX_AUX_WEIGHT,
 )
+from examples.our_model.models.multi_prefix_agent import (  # noqa: E402
+    MULTI_PREFIX_CHECKPOINT_FORMAT,
+    MultiPrefixTransformerAgent,
+)
 from examples.our_model.models.dorl_reward import DORLRewardModel  # noqa: E402
 from examples.our_model.models.leave_model import RuleBasedLeaveModel  # noqa: E402
 from examples.our_model.models.chunk_dynamics import (  # noqa: E402
@@ -52,6 +56,7 @@ from examples.our_model.models.chunk_actor import (  # noqa: E402
 from examples.our_model.models.chunk_value import (  # noqa: E402
     CRITIC_BACKBONE_ACSAC_TRANSFORMER,
     CRITIC_BACKBONE_MLP,
+    CRITIC_BACKBONE_MULTI_PREFIX_TRANSFORMER,
     DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
     DEFAULT_CRITIC_TRANSFORMER_HEADS,
     DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM,
@@ -59,6 +64,7 @@ from examples.our_model.models.chunk_value import (  # noqa: E402
     SUPPORTED_CRITIC_BACKBONES,
 )
 from examples.our_model.policy import ActionMapper  # noqa: E402
+from examples.our_model.rave.model import Utility  # noqa: E402
 
 LOGGER = logging.getLogger(__name__)
 
@@ -73,6 +79,12 @@ DEFAULT_DATASET_PATH = SUPPORTED_KUAI_DATASET_PATHS["KuaiEnv-v0"]
 
 DEFAULT_SAVE_ROOT = "saved_models"
 """默认模型保存根目录。"""
+
+DEFAULT_MULTI_TOP_RATE = 0.8
+"""R/T/D/C 分支冻结主导类别集合时使用的累计频率阈值。"""
+
+DEFAULT_MULTI_SCALE_SAMPLES = 10_000
+"""R/T/D/C 分支估计固定 R 尺度时抽取的训练 reward 数。"""
 
 DEFAULT_ACTOR_HIDDEN_DIMS = (256, 256)
 """MVP actor 默认隐藏层维度。"""
@@ -383,7 +395,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default=CRITIC_BACKBONE_MLP,
         help=(
             "Critic 网络结构；mlp/transformer 保留 Q/V，"
-            "acsac_transformer 使用无独立 V 的因果前缀 Q。"
+            "acsac_transformer 使用无独立 V 的单头因果前缀 Q，"
+            "multi_prefix_transformer 使用 R/T/D/C 四头因果前缀 Q。"
         ),
     )
     parser.add_argument(
@@ -414,6 +427,36 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
             "ACSAC Transformer 所有合法 H 的一步 target-Q 辅助 MSE 权重；"
             "0 表示关闭并跳过额外全前缀 rollout。"
         ),
+    )
+    parser.add_argument(
+        "--eta_t",
+        type=float,
+        default=None,
+        help="multi_prefix_transformer 的展示长度业务权重；未设置时为 0.2。",
+    )
+    parser.add_argument(
+        "--eta_d",
+        type=float,
+        default=None,
+        help="multi_prefix_transformer 的 MCD 改善业务权重；未设置时为 0.2。",
+    )
+    parser.add_argument(
+        "--eta_c",
+        type=float,
+        default=None,
+        help="multi_prefix_transformer 的非负规划成本业务权重；未设置时为 0.05。",
+    )
+    parser.add_argument(
+        "--top_rate",
+        type=float,
+        default=DEFAULT_MULTI_TOP_RATE,
+        help="冻结 MCD 主导类别集合的累计频率阈值。",
+    )
+    parser.add_argument(
+        "--scale_samples",
+        type=int,
+        default=DEFAULT_MULTI_SCALE_SAMPLES,
+        help="估计四头固定 R 尺度时的训练 reward 采样数。",
     )
     parser.add_argument(
         "--actor_type", choices=["categorical", "categorical_flow"],
@@ -545,6 +588,7 @@ def apply_checkpoint_model_config(
     if checkpoint.get("format") not in {
         "mac_origin_precomputed_state_v2",
         ACSAC_CHECKPOINT_FORMAT,
+        MULTI_PREFIX_CHECKPOINT_FORMAT,
     }:
         raise ValueError("Old StateTracker checkpoints are incompatible; retrain MAC_origin.")
     config = checkpoint["config"]
@@ -566,6 +610,9 @@ def apply_checkpoint_model_config(
             ("all_prefix_aux_weight", DEFAULT_ALL_PREFIX_AUX_WEIGHT),
         ):
             setattr(args, key, config.get(key, default_value))
+        for key in ("eta_t", "eta_d", "eta_c", "top_rate", "scale_samples"):
+            if key in config:
+                setattr(args, key, config[key])
     for key in (
         "flow_steps", "flow_sample_batch_size", "flow_temperature",
         "flow_positive_weight",
@@ -797,6 +844,8 @@ def build_agent(
     state_dim: int,
     reward_model: DORLRewardModel | None = None,
     leave_model: RuleBasedLeaveModel | None = None,
+    multi_prefix_utility: Utility | None = None,
+    dominant_hits: torch.Tensor | None = None,
 ) -> mac_agent_module.MACAgent:
     """构造 MACAgent。
 
@@ -807,6 +856,8 @@ def build_agent(
         state_dim (int): pkl observation 的状态维度。
         reward_model (DORLRewardModel | None): reward 模型，可为空。
         leave_model (RuleBasedLeaveModel | None): leave 模型，可为空。
+        multi_prefix_utility (Utility | None): 四头分支的冻结尺度与权重。
+        dominant_hits (torch.Tensor | None): 四头 D reward 的 item 主导类别命中表。
 
     Returns:
         mac_agent_module.MACAgent: 初始化后的 agent。
@@ -820,14 +871,20 @@ def build_agent(
         chunk_size=args.chunk_size,
         hidden_dims=parse_hidden_dims(args.dynamics_hidden_dims),
     )
-    agent_class = (
-        ACSACTransformerAgent
-        if args.critic_backbone == CRITIC_BACKBONE_ACSAC_TRANSFORMER
-        else mac_agent_module.MACAgent
-    )
+    if args.critic_backbone == CRITIC_BACKBONE_ACSAC_TRANSFORMER:
+        agent_class = ACSACTransformerAgent
+    elif args.critic_backbone == CRITIC_BACKBONE_MULTI_PREFIX_TRANSFORMER:
+        agent_class = MultiPrefixTransformerAgent
+    else:
+        agent_class = mac_agent_module.MACAgent
     acsac_kwargs = {}
-    if agent_class is ACSACTransformerAgent:
+    if issubclass(agent_class, ACSACTransformerAgent):
         acsac_kwargs["all_prefix_aux_weight"] = args.all_prefix_aux_weight
+    if agent_class is MultiPrefixTransformerAgent:
+        acsac_kwargs.update({
+            "utility": multi_prefix_utility,
+            "dominant_hits": dominant_hits,
+        })
     agent = agent_class(
         state_dim=state_dim,
         action_dim=action_mapper.action_dim,

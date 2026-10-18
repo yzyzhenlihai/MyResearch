@@ -1314,7 +1314,7 @@ class RAVEShellRoutingTest(unittest.TestCase):
         self.assertIn("--fixed_horizon 3", fixed_result.stdout)
 
     def test_suite_replaces_transformer_with_acsac_transformer(self) -> None:
-        """suite 应以 ACSAC 取代旧单头 Transformer，且保留多头 RAVE。"""
+        """三个 suite 分支应统一走 MAC fresh imagined rollout runner。"""
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             result = subprocess.run(
@@ -1334,7 +1334,7 @@ class RAVEShellRoutingTest(unittest.TestCase):
                 text=True,
             )
         self.assertNotIn("QV_TYPE=transformer", result.stdout)
-        self.assertIn("QV_TYPE=multi_prefix_transformer", result.stdout)
+        self.assertNotIn("QV_TYPE=multi_prefix_transformer", result.stdout)
         self.assertNotIn("QV_TYPE=ordinary", result.stdout)
         self.assertIn("ROLLOUT_DEPTH=3", result.stdout)
         self.assertIn("ALL_PREFIX_AUX_WEIGHT=1.0", result.stdout)
@@ -1344,6 +1344,8 @@ class RAVEShellRoutingTest(unittest.TestCase):
         self.assertIn("run_dorl_mac_kuai_train.sh", result.stdout)
         self.assertIn("CRITIC_BACKBONE=mlp", result.stdout)
         self.assertIn("CRITIC_BACKBONE=acsac_transformer", result.stdout)
+        self.assertIn("CRITIC_BACKBONE=multi_prefix_transformer", result.stdout)
+        self.assertNotIn("run_rave_kuai.sh", result.stdout)
         self.assertNotIn("FIXED_HORIZON=", result.stdout)
 
     def test_suite_rejects_removed_transformer_option(self) -> None:

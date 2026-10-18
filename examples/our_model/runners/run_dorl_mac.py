@@ -16,6 +16,7 @@ from examples.our_model.runners.common import add_common_args, configure_logging
 from examples.our_model.runners.eval_dorl_mac import main as eval_main
 from examples.our_model.runners.pretrain_categorical_bc import main as pretrain_main
 from examples.our_model.runners.train_dorl_mac_qv import main as train_qv_main
+from examples.our_model.models.multi_prefix_agent import DEFAULT_MULTI_WEIGHTS
 
 LOGGER = logging.getLogger(__name__)
 
@@ -94,6 +95,26 @@ def build_common_argv(args: argparse.Namespace) -> List[str]:
         str(args.lambda_chunk),
         "--all_prefix_aux_weight",
         str(args.all_prefix_aux_weight),
+        "--critic_backbone",
+        args.critic_backbone,
+        "--critic_transformer_hidden_dim",
+        str(args.critic_transformer_hidden_dim),
+        "--critic_transformer_layers",
+        str(args.critic_transformer_layers),
+        "--critic_transformer_heads",
+        str(args.critic_transformer_heads),
+        "--critic_transformer_dropout",
+        str(args.critic_transformer_dropout),
+        "--eta_t",
+        str(args.eta_t if args.eta_t is not None else DEFAULT_MULTI_WEIGHTS[1]),
+        "--eta_d",
+        str(args.eta_d if args.eta_d is not None else DEFAULT_MULTI_WEIGHTS[2]),
+        "--eta_c",
+        str(args.eta_c if args.eta_c is not None else -DEFAULT_MULTI_WEIGHTS[3]),
+        "--top_rate",
+        str(args.top_rate),
+        "--scale_samples",
+        str(args.scale_samples),
         "--leave_policy",
         args.leave_policy,
         "--predicted_mat_normalize",

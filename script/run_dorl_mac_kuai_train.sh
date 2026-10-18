@@ -55,6 +55,11 @@ CRITIC_TRANSFORMER_LAYERS="${CRITIC_TRANSFORMER_LAYERS:-2}"
 CRITIC_TRANSFORMER_HEADS="${CRITIC_TRANSFORMER_HEADS:-4}"
 CRITIC_TRANSFORMER_DROPOUT="${CRITIC_TRANSFORMER_DROPOUT:-0.0}"
 ALL_PREFIX_AUX_WEIGHT="${ALL_PREFIX_AUX_WEIGHT:-1.0}"
+ETA_T="${ETA_T:-0.2}"
+ETA_D="${ETA_D:-0.2}"
+ETA_C="${ETA_C:-0.05}"
+TOP_RATE="${TOP_RATE:-0.8}"
+SCALE_SAMPLES="${SCALE_SAMPLES:-10000}"
 
 case "${ACTOR_TYPE}" in
   categorical_flow)
@@ -72,9 +77,10 @@ case "${ACTOR_TYPE}" in
 esac
 
 case "${CRITIC_BACKBONE}" in
-  mlp|transformer|acsac_transformer) ;;
+  mlp|transformer|acsac_transformer|multi_prefix_transformer) ;;
   *)
-    printf '[run_dorl_mac_kuai_train] ERROR: CRITIC_BACKBONE must be mlp, transformer or acsac_transformer.\n' >&2
+    printf '[run_dorl_mac_kuai_train] ERROR: unsupported CRITIC_BACKBONE=%s.\n' \
+      "${CRITIC_BACKBONE}" >&2
     exit 2
     ;;
 esac
@@ -199,6 +205,8 @@ if [[ -n "${RUN_DIR:-}" ]]; then
 else
   if [[ "${CRITIC_BACKBONE}" == "acsac_transformer" ]]; then
     RUN_DIR="${OUTPUT_ROOT}/acsac_transformer/seed-${SEED}"
+  elif [[ "${CRITIC_BACKBONE}" == "multi_prefix_transformer" ]]; then
+    RUN_DIR="${OUTPUT_ROOT}/multi_prefix_transformer/seed-${SEED}"
   elif [[ "${CRITIC_BACKBONE}" == "transformer" ]]; then
     RUN_DIR="${OUTPUT_ROOT}/transformer/seed-${SEED}"
   else
@@ -247,6 +255,11 @@ COMMON_ARGS=(
   --critic_transformer_heads "${CRITIC_TRANSFORMER_HEADS}"
   --critic_transformer_dropout "${CRITIC_TRANSFORMER_DROPOUT}"
   --all_prefix_aux_weight "${ALL_PREFIX_AUX_WEIGHT}"
+  --eta_t "${ETA_T}"
+  --eta_d "${ETA_D}"
+  --eta_c "${ETA_C}"
+  --top_rate "${TOP_RATE}"
+  --scale_samples "${SCALE_SAMPLES}"
   --num_leave_compute "${NUM_LEAVE_COMPUTE}"
   --leave_threshold "${LEAVE_THRESHOLD}"
   --max_turn "${MAX_TURN}"
@@ -375,6 +388,8 @@ printf '[run_dorl_mac_kuai_train] critic: backbone=%s, hidden_dim=%s, layers=%s,
   "${CRITIC_BACKBONE}" "${CRITIC_TRANSFORMER_HIDDEN_DIM}" \
   "${CRITIC_TRANSFORMER_LAYERS}" "${CRITIC_TRANSFORMER_HEADS}" \
   "${CRITIC_TRANSFORMER_DROPOUT}" "${ALL_PREFIX_AUX_WEIGHT}"
+printf '[run_dorl_mac_kuai_train] multi-prefix: eta_t=%s, eta_d=%s, eta_c=%s, top_rate=%s, scale_samples=%s\n' \
+  "${ETA_T}" "${ETA_D}" "${ETA_C}" "${TOP_RATE}" "${SCALE_SAMPLES}"
 printf '[run_dorl_mac_kuai_train] reward: entropy=%s(lambda=%s, window=%s), uncertainty=%s(lambda=%s), invalid_penalty=%s, pred_mat_normalize=%s\n' \
   "${USE_ENTROPY_REWARD}" "${LAMBDA_ENTROPY}" "${ENTROPY_WINDOW}" \
   "${USE_UNCERTAINTY_PENALTY}" "${LAMBDA_VARIANCE}" "${INVALID_ACTION_PENALTY}" \

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -17,7 +18,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from examples.our_model.logging import SwanLabLogger
+from examples.our_model.models.chunk_value import (
+    CRITIC_BACKBONE_MULTI_PREFIX_TRANSFORMER,
+)
+from examples.our_model.models.multi_prefix_agent import DEFAULT_MULTI_WEIGHTS
 from examples.our_model.models.mac_agent import REPEAT_POLICY_MASK, REPEAT_POLICY_TRUNCATE
+from examples.our_model.rave.assets import freeze_categories
+from examples.our_model.rave.model import Utility
 from examples.our_model.runners.common import (
     add_common_args,
     build_agent,
@@ -77,6 +84,103 @@ Q_MEAN_TARGET_GAP_RATIO = 0.02
 
 Q_GAP_NOISE_RATIO = 0.5
 """展示型 Q 间隔使用的相对抖动折减比例。"""
+
+
+def build_multi_prefix_assets(
+    args: argparse.Namespace,
+    offline_dataset: object,
+    env: object,
+    env_dataset: object,
+    reward_model: object,
+    num_items: int,
+    device: torch.device,
+) -> tuple[Utility, torch.Tensor, dict[str, object]]:
+    """构造四头训练使用的冻结效用尺度和主导类别命中表。
+
+    R 尺度复用现有 R/T/D/C 方案：从当前训练用户和 item 目录采样 DORL
+    shaped reward，取绝对值 95% 分位数并乘 ``max_turn``。主导类别集合复用
+    RAVE-H 与 DORL evaluator 的冻结统计口径。
+
+    Args:
+        args (argparse.Namespace): 包含 seed、eta、top-rate、采样数和任务预算。
+        offline_dataset (object): `ObservedChunkDataset`，提供训练轨迹用户。
+        env (object): 当前真实环境，提供内部 item 映射。
+        env_dataset (object): BaseData 数据源，提供主导类别统计。
+        reward_model (object): 当前 ACSAC 使用的 DORL reward model。
+        num_items (int): 内部 item 目录大小。
+        device (torch.device): reward 计算设备。
+
+    Returns:
+        tuple[Utility, torch.Tensor, dict[str, object]]: 冻结效用、item 主导类别
+        命中表和可复现类别元数据。
+
+    Raises:
+        ValueError: 当训练用户、item 数、采样数或业务权重不合法时抛出。
+    """
+
+    if num_items <= 0:
+        raise ValueError("num_items must be positive.")
+    if args.scale_samples <= 0:
+        raise ValueError("scale_samples must be positive.")
+    resolved_weights = []
+    for value, default in zip(
+        (args.eta_t, args.eta_d, args.eta_c),
+        DEFAULT_MULTI_WEIGHTS[1:3] + (-DEFAULT_MULTI_WEIGHTS[3],),
+    ):
+        resolved = default if value is None else float(value)
+        if not np.isfinite(resolved) or resolved < 0.0:
+            raise ValueError("eta_t, eta_d and eta_c must be finite and non-negative.")
+        resolved_weights.append(resolved)
+    args.eta_t, args.eta_d, args.eta_c = resolved_weights
+
+    trajectories = getattr(getattr(offline_dataset, "bundle", None), "trajectories", ())
+    train_raw_users = sorted({int(trajectory["user_id"]) for trajectory in trajectories})
+    if not train_raw_users:
+        raise ValueError("multi-prefix training requires at least one offline user.")
+    _, dominant_hits, metadata = freeze_categories(
+        dataset=env_dataset,
+        env=env,
+        env_name=args.env,
+        train_raw_users=train_raw_users,
+        top_rate=args.top_rate,
+    )
+    if dominant_hits.shape != (num_items,):
+        raise ValueError("Frozen dominant-hit table does not match the item catalog.")
+
+    generator = np.random.default_rng(args.seed)
+    sampled_users = generator.choice(
+        np.asarray(train_raw_users, dtype=np.int64),
+        size=args.scale_samples,
+        replace=True,
+    )
+    sampled_items = generator.integers(
+        low=0,
+        high=num_items,
+        size=args.scale_samples,
+        dtype=np.int64,
+    )
+    raw_user_ids = torch.as_tensor(sampled_users, dtype=torch.long, device=device)
+    item_ids = torch.as_tensor(sampled_items, dtype=torch.long, device=device)
+    reward_samples = reward_model.reward(
+        raw_user_ids,
+        item_ids,
+        history_item_ids=item_ids.unsqueeze(1),
+    )
+    utility = Utility.from_training_rewards(
+        reward_samples.detach().cpu(),
+        max_turn=args.max_turn,
+        eta_t=args.eta_t,
+        eta_d=args.eta_d,
+        eta_c=args.eta_c,
+    )
+    metadata = dict(metadata)
+    metadata.update({
+        "reward_definition": "dorl_shaped_reward_v1",
+        "reward_scale_samples": int(args.scale_samples),
+        "utility_scales": list(utility.scales),
+        "utility_weights": list(utility.weights),
+    })
+    return utility, dominant_hits.to(device), metadata
 
 
 class QVTrainingMetricCalibrator:
@@ -718,9 +822,6 @@ def main(argv: Optional[list[str]] = None) -> Path:
     )
     metrics_log_path = build_timestamped_metrics_path(save_dir)
     args.metrics_log_path = str(metrics_log_path)
-    config = namespace_to_dict(args)
-    save_resolved_config(save_dir, config)
-
     dataset, action_mapper, _ = build_dataset_and_mapper(args, device=device)
     env, env_dataset, kwargs_um = build_env_assets(args)
     reward_model, leave_model = build_reward_and_leave(
@@ -729,6 +830,21 @@ def main(argv: Optional[list[str]] = None) -> Path:
         dataset=env_dataset,
         device=device,
     )
+    multi_prefix_utility = None
+    dominant_hits = None
+    multi_prefix_metadata = None
+    if args.critic_backbone == CRITIC_BACKBONE_MULTI_PREFIX_TRANSFORMER:
+        multi_prefix_utility, dominant_hits, multi_prefix_metadata = (
+            build_multi_prefix_assets(
+                args=args,
+                offline_dataset=dataset,
+                env=env,
+                env_dataset=env_dataset,
+                reward_model=reward_model,
+                num_items=action_mapper.num_items,
+                device=device,
+            )
+        )
     agent = build_agent(
         args,
         device=device,
@@ -736,6 +852,8 @@ def main(argv: Optional[list[str]] = None) -> Path:
         state_dim=dataset.state_dim,
         reward_model=reward_model,
         leave_model=leave_model,
+        multi_prefix_utility=multi_prefix_utility,
+        dominant_hits=dominant_hits,
     )
     # BC checkpoint 内的 Q/V 从未训练。两个架构都从当前 seed 的新初始化开始，
     # 只恢复完全共享的 Actor 与 Dynamics，避免随机占位 Q/V 形成额外变量。
@@ -746,6 +864,10 @@ def main(argv: Optional[list[str]] = None) -> Path:
     # MLP 与 Transformer 初始化消耗的随机数数量不同。此处重置随机流，使后续
     # DataLoader shuffle 和 Flow 候选采样在同 seed 下从相同状态开始。
     set_seed(args.seed)
+    config = namespace_to_dict(args)
+    if multi_prefix_metadata is not None:
+        config["multi_prefix_category_metadata"] = multi_prefix_metadata
+    save_resolved_config(save_dir, config)
     initial_states = build_initial_state_table(dataset, env, device)
     eval_save_dir = ensure_dir(args.eval_save_dir or save_dir / "eval_during_train")
     periodic_evaluator = build_dorl_mac_evaluator(

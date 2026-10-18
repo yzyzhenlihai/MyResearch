@@ -18,10 +18,14 @@ CRITIC_BACKBONE_TRANSFORMER = "transformer"
 CRITIC_BACKBONE_ACSAC_TRANSFORMER = "acsac_transformer"
 """ACSAC 风格的因果前缀 Transformer Q。"""
 
+CRITIC_BACKBONE_MULTI_PREFIX_TRANSFORMER = "multi_prefix_transformer"
+"""R/T/D/C 四头 ACSAC 因果前缀 Transformer Q。"""
+
 SUPPORTED_CRITIC_BACKBONES = {
     CRITIC_BACKBONE_MLP,
     CRITIC_BACKBONE_TRANSFORMER,
     CRITIC_BACKBONE_ACSAC_TRANSFORMER,
+    CRITIC_BACKBONE_MULTI_PREFIX_TRANSFORMER,
 }
 """ordinary 架构对照与独立 ACSAC 分支支持的 Critic 类型。"""
 
@@ -315,3 +319,78 @@ class CausalTransformerPrefixCritic(nn.Module):
         )
         encoded = self.encoder(tokens + positions.unsqueeze(0), mask=causal_mask)
         return self.output(encoded[:, 1:]).squeeze(-1)
+
+
+class MultiHeadCausalTransformerPrefixCritic(CausalTransformerPrefixCritic):
+    """共享因果 Transformer 主干并输出 R/T/D/C 四个前缀 Q。
+
+    网络输入与 :class:`CausalTransformerPrefixCritic` 完全一致。每个动作位置
+    共享同一隐藏表示，最后通过四维线性输出层分别预测反馈、展示长度、MCD
+    改善和规划成本的长期价值，输出形状为 ``(B,K,4)``。
+    """
+
+    num_components = 4
+    """固定的 R/T/D/C 价值分量数。"""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        chunk_size: int,
+        hidden_dim: int = DEFAULT_CRITIC_TRANSFORMER_HIDDEN_DIM,
+        num_layers: int = DEFAULT_CRITIC_TRANSFORMER_LAYERS,
+        num_heads: int = DEFAULT_CRITIC_TRANSFORMER_HEADS,
+        dropout: float = DEFAULT_CRITIC_TRANSFORMER_DROPOUT,
+    ) -> None:
+        """初始化四头因果前缀 Q 网络。
+
+        Args:
+            state_dim (int): 状态向量维度。
+            action_dim (int): 单步动作 embedding 维度。
+            chunk_size (int): 最大候选长度 K。
+            hidden_dim (int): Transformer token 维度。
+            num_layers (int): 编码层数。
+            num_heads (int): 注意力头数。
+            dropout (float): dropout 概率，范围 ``[0,1)``。
+
+        Raises:
+            ValueError: 网络维度或 dropout 配置不合法时由父类抛出。
+        """
+
+        super().__init__(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+        self.output = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, self.num_components),
+        )
+
+    def forward(self, states: torch.Tensor, chunks: torch.Tensor) -> torch.Tensor:
+        """计算所有前缀的四分量 Q 值。
+
+        Args:
+            states (torch.Tensor): 状态，形状 ``(B,state_dim)``。
+            chunks (torch.Tensor): 展平或未展平动作块，形状
+                ``(B,K*action_dim)`` 或 ``(B,K,action_dim)``。
+
+        Returns:
+            torch.Tensor: 四头前缀价值，形状 ``(B,K,4)``。
+
+        Raises:
+            ValueError: 输入形状与父类网络配置不一致时抛出。
+        """
+
+        values = super().forward(states, chunks)
+        expected_shape = (states.shape[0], self.chunk_size, self.num_components)
+        if tuple(values.shape) != expected_shape:
+            raise RuntimeError(
+                "multi-head prefix critic produced unexpected shape: "
+                f"expected {expected_shape}, got {tuple(values.shape)}."
+            )
+        return values
