@@ -20,6 +20,7 @@ from src.core.state_tracker.Average import StateTrackerAvg
 from src.core.state_tracker.GRU import StateTracker_GRU
 from src.core.state_tracker.NextItNet import StateTracker_NextItNet
 from src.core.state_tracker.SASRec import StateTracker_SASRec
+from src.core.state_tracker.Attention import StateTracker_Attention
 from src.core.util.inputs import get_dataset_columns
 from src.core.userModel.user_model_ensemble import EnsembleModel
 from src.core.envs.Simulated_Env.base import BaseSimulatedEnv
@@ -288,6 +289,25 @@ def setup_state_tracker(args, ensemble_models, env, train_envs, test_envs_dict, 
                                             saved_embedding=saved_embedding,
                                             device=args.device, window_size=args.window_size,
                                             dropout_rate=args.dropout_rate, num_heads=args.num_heads).to(args.device)
+    elif args.which_tracker.lower() == "att":
+        state_tracker = StateTracker_Attention(
+            user_columns,
+            action_columns,
+            feedback_columns,
+            args.state_dim,
+            train_max,
+            train_min,
+            test_max,
+            test_min,
+            reward_handle=args.reward_handle,
+            saved_embedding=saved_embedding,
+            device=args.device,
+            use_userEmbedding=args.use_userEmbedding,
+            window_size=args.window_size,
+            dropout_rate=getattr(args, "att_dropout", args.dropout_rate),
+            num_heads=args.num_heads,
+            num_layers=getattr(args, "num_att_layers", 2),
+        ).to(args.device)
     elif args.which_tracker.lower() == "nextitnet":
         state_tracker = StateTracker_NextItNet(user_columns, action_columns, feedback_columns, args.state_dim,
                                                train_max, train_min, test_max, test_min,

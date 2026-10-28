@@ -25,7 +25,9 @@ class PenaltyEntExpSimulatedEnv(BaseSimulatedEnv):
                  entropy_max=0,
                  feature_level=False,
                  map_item_feat=None,
-                 is_sorted=True
+                 is_sorted=True,
+                 reward_min_base_override=None,
+                 reward_max_base_override=None,
                  ):
         super().__init__(ensemble_models, env_task_class, task_env_param, task_name, predicted_mat)
         self.feature_level = feature_level
@@ -42,8 +44,18 @@ class PenaltyEntExpSimulatedEnv(BaseSimulatedEnv):
         self.step_n_actions = step_n_actions
         self.lambda_entropy = lambda_entropy
 
-        self.MIN_R = predicted_mat.min() + lambda_entropy * entropy_min
-        self.MAX_R = predicted_mat.max() + lambda_entropy * entropy_max
+        reward_min_base = (
+            predicted_mat.min()
+            if reward_min_base_override is None
+            else reward_min_base_override
+        )
+        reward_max_base = (
+            predicted_mat.max()
+            if reward_max_base_override is None
+            else reward_max_base_override
+        )
+        self.MIN_R = reward_min_base + lambda_entropy * entropy_min
+        self.MAX_R = reward_max_base + lambda_entropy * entropy_max
 
         self._reset_history_exposure()
 

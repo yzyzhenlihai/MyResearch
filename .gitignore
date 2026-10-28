@@ -40,3 +40,8 @@ events.*
 *.pickle
 temp.*
 *.dat
+
+results/
+results_analysis/
+reports/
+docs/

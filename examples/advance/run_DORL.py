@@ -168,7 +168,10 @@ def get_save_entropy_mat(dataset, entropy_window, ent_savepath, feature_level=Tr
 
 
 def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
+    """构造 DORL 训练环境，并允许复现实验覆盖预测奖励矩阵路径。"""
+
     entropy_dict = dict()
+    map_item_feat = None
     # if 0 in args.entropy_window:
     #     entropy_path = os.path.join(ensemble_models.Entropy_PATH, "user_entropy.csv")
     #     entropy = pd.read_csv(entropy_path)
@@ -189,8 +192,14 @@ def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
             entropy_min += min([v for k, v in entropy_dict["map"].items() if len(k) == entropy_term] + [1])
             entropy_max += max([v for k, v in entropy_dict["map"].items() if len(k) == entropy_term] + [1])
 
-    with open(ensemble_models.PREDICTION_MAT_PATH, "rb") as file:
-        predicted_mat = pickle.load(file)
+    prediction_path = getattr(
+        args, "predicted_mat_path", ensemble_models.PREDICTION_MAT_PATH
+    )
+    if str(prediction_path).lower().endswith(".npy"):
+        predicted_mat = np.load(prediction_path, mmap_mode="r", allow_pickle=False)
+    else:
+        with open(prediction_path, "rb") as file:
+            predicted_mat = pickle.load(file)
 
     alpha_u, beta_i = None, None  ## TODO
 
@@ -214,7 +223,13 @@ def prepare_train_envs(args, ensemble_models, env, dataset, kwargs_um):
         "entropy_max": entropy_max,
         "feature_level": args.feature_level,
         "map_item_feat": map_item_feat,
-        "is_sorted": args.is_sorted
+        "is_sorted": args.is_sorted,
+        "reward_min_base_override": getattr(
+            args, "reward_min_base_override", None
+        ),
+        "reward_max_base_override": getattr(
+            args, "reward_max_base_override", None
+        ),
     }
 
     train_envs = DummyVectorEnv(
