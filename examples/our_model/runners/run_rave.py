@@ -1028,6 +1028,7 @@ def main(argv=None):
             "mode", "rave_checkpoint", "output_dir", "eval_episodes",
             "eval_split", "device", "cpu", "torch_threads",
             "swanlab_project", "run_name", "dorl_eval_parity",
+            "mcd_segment_length",
         ]
         if args.dorl_eval_parity:
             runtime_names.extend([
@@ -1057,7 +1058,7 @@ def main(argv=None):
                 "rollout_candidates", "episodes_per_collect", "num_candidates", "test_num",
                 "replay_capacity", "scale_samples", "eval_every", "eval_episodes",
                 "log_every", "max_turn", "matched_length", "torch_threads",
-                "ordinary_rollout_depth")
+                "ordinary_rollout_depth", "mcd_segment_length")
     if any(getattr(args, name) <= 0 for name in positive) or args.mc_samples < 0:
         raise ValueError("Training and evaluation counts must be positive")
     resolve_epoch_schedule(args.steps, args.epochs)

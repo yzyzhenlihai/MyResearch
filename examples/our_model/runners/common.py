@@ -24,6 +24,7 @@ for relative_path in ["./src", "./src/DeepCTR-Torch", "./src/tianshou", "./examp
     if resolved not in sys.path:
         sys.path.insert(0, resolved)
 
+from src.core.evaluation.utils import DEFAULT_MCD_SEGMENT_LENGTH  # noqa: E402
 from src.core.util.data import get_env_args, get_true_env  # noqa: E402
 from src.core.util.entropy_penalty import (  # noqa: E402
     accumulate_entropy_counts_for_row,
@@ -348,6 +349,17 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "CCR@W 的固定环境步窗口 W，必须为正数且不超过 "
             "max_turn；该参数与 chunk_size 和 execution_horizon 独立。"
+        ),
+    )
+    parser.add_argument(
+        "--mcd-segment-length",
+        "--mcd_segment_length",
+        dest="mcd_segment_length",
+        type=int,
+        default=DEFAULT_MCD_SEGMENT_LENGTH,
+        help=(
+            "分段 MCD 的连续窗口长度；尾段不足该长度时仍作为一个等权分段，"
+            "默认 30。"
         ),
     )
     parser.add_argument(

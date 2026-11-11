@@ -5,12 +5,49 @@
 import numpy as np
 import torch
 
-
-from src.core.evaluation.utils import get_feat_dominate_dict
 from src.core.evaluation.metrics import get_diversity, get_novelty
+from src.core.evaluation.utils import (
+    DEFAULT_MCD_SEGMENT_LENGTH,
+    get_feat_dominate_dict,
+    get_trajectory_feat_dominate_dict,
+)
 
-class Evaluator_Feat():
-    def __init__(self, test_collector_set, df_item_val, need_transform, item_feat_domination, lbe_item, top_rate, draw_bar=False):
+
+class Evaluator_Feat:
+    """统计旧版 pooled MCD、轨迹等权 MCD 与轨迹内分段 MCD。"""
+
+    def __init__(
+        self,
+        test_collector_set,
+        df_item_val,
+        need_transform,
+        item_feat_domination,
+        lbe_item,
+        top_rate,
+        draw_bar=False,
+        mcd_segment_length=DEFAULT_MCD_SEGMENT_LENGTH,
+    ):
+        """初始化特征支配度评估器。
+
+        Args:
+            test_collector_set (CollectorSet): 包含 FB、NX_0 与 NX_force
+                collector 的评估集合。
+            df_item_val (pandas.DataFrame): 以原始 item id 为索引的特征表。
+            need_transform (bool): 是否需要将内部 item id 反变换为原始 id。
+            item_feat_domination (dict | None): 训练数据的类别频次降序表。
+            lbe_item (LabelEncoder | None): item id 反变换器。
+            top_rate (float): 主导类别累计频率阈值。
+            draw_bar (bool): 是否保留旧版类别柱状图数据。
+            mcd_segment_length (int): 分段 MCD 的连续窗口长度。
+
+        Raises:
+            ValueError: 当分段长度不是正整数时抛出。
+        """
+        if (
+            not isinstance(mcd_segment_length, (int, np.integer))
+            or mcd_segment_length <= 0
+        ):
+            raise ValueError("mcd_segment_length must be a positive integer.")
         self.collector_dict = test_collector_set.collector_dict
         # self.num_items = test_collector_set.env.get_env_attr("mat")[0].shape[1]
 
@@ -21,23 +58,38 @@ class Evaluator_Feat():
         self.lbe_item = lbe_item
         self.top_rate = top_rate
         self.draw_bar = draw_bar
+        self.mcd_segment_length = int(mcd_segment_length)
 
     def on_epoch_begin(self, epoch):
+        """保留 callback 接口；该评估器无需 epoch 初始化。"""
         pass
 
     def on_train_begin(self):
+        """保留 callback 接口；该评估器无需训练初始化。"""
         pass
 
     def on_train_end(self):
+        """保留 callback 接口；该评估器无需训练收尾。"""
         pass
 
     def on_epoch_end(self, epoch, results=None, **kwargs):
+        """从 collector buffer 汇总三个分支的 MCD 指标。
+
+        Args:
+            epoch (int): 当前评估 epoch，仅用于兼容 callback 接口。
+            results (dict): collector 结果及各分支轨迹起始索引。
+            **kwargs: 兼容其他 callback 传入的扩展参数。
+
+        Returns:
+            dict: 原始结果加上旧版 pooled、轨迹等权整轨及分段 MCD。
+        """
 
         def get_actions_feat(buffer, indices, draw_bar=False):
+            """恢复逐轨迹动作并计算三种 MCD 聚合口径。"""
 
             num_tests = len(indices)
             live_mat = np.zeros([0, num_tests], dtype=bool)
-            act_mat = np.zeros([0, num_tests], dtype=bool)
+            act_mat = np.zeros([0, num_tests], dtype=np.int64)
 
             is_end = np.zeros([num_tests], dtype=bool)
 
@@ -53,13 +105,34 @@ class Evaluator_Feat():
                 is_end[done] = True
                 indices = buffer.next(indices)
 
-            all_acts = act_mat[live_mat]
-
+            trajectory_actions = [
+                act_mat[:, trajectory_index][live_mat[:, trajectory_index]]
+                for trajectory_index in range(num_tests)
+            ]
             if self.need_transform:
-                all_acts_origin = self.lbe_item.inverse_transform(all_acts)
+                trajectory_actions_origin = [
+                    self.lbe_item.inverse_transform(actions)
+                    for actions in trajectory_actions
+                ]
             else:
-                all_acts_origin = all_acts
-            feat_dominate_dict = get_feat_dominate_dict(self.df_item_val, all_acts_origin, self.item_feat_domination, top_rate=self.top_rate, draw_bar=draw_bar)
+                trajectory_actions_origin = trajectory_actions
+            all_acts_origin = np.concatenate(trajectory_actions_origin)
+            feat_dominate_dict = get_feat_dominate_dict(
+                self.df_item_val,
+                all_acts_origin,
+                self.item_feat_domination,
+                top_rate=self.top_rate,
+                draw_bar=draw_bar,
+            )
+            feat_dominate_dict.update(
+                get_trajectory_feat_dominate_dict(
+                    self.df_item_val,
+                    trajectory_actions_origin,
+                    self.item_feat_domination,
+                    top_rate=self.top_rate,
+                    segment_length=self.mcd_segment_length,
+                )
+            )
 
             return feat_dominate_dict
 
@@ -68,9 +141,19 @@ class Evaluator_Feat():
         for name, collector in self.collector_dict.items():
             buffer = collector.buffer
             indices = results[name + "_idxs"] if name != "FB" else results["idxs"]
-            feat_dominate_dict = get_actions_feat(buffer, indices, draw_bar=self.draw_bar)
-            feat_dominate_dict_k = {name + "_" + k: v for k, v in
-                                    feat_dominate_dict.items()} if name != "FB" else feat_dominate_dict
+            feat_dominate_dict = get_actions_feat(
+                buffer,
+                indices,
+                draw_bar=self.draw_bar,
+            )
+            feat_dominate_dict_k = (
+                {
+                    name + "_" + metric_name: metric_value
+                    for metric_name, metric_value in feat_dominate_dict.items()
+                }
+                if name != "FB"
+                else feat_dominate_dict
+            )
             results_all.update(feat_dominate_dict_k)
 
         results.update(results_all)

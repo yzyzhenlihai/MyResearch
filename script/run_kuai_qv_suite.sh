@@ -58,6 +58,7 @@ SHARED_PRETRAIN_ROOT="${SHARED_PRETRAIN_ROOT:-}"
 NUM_LEAVE_COMPUTE="${NUM_LEAVE_COMPUTE:-1}"
 LEAVE_THRESHOLD="${LEAVE_THRESHOLD:-0}"
 MAX_TURN="${MAX_TURN:-100}"
+MCD_SEGMENT_LENGTH="${MCD_SEGMENT_LENGTH:-30}"
 LEAVE_POLICY="${LEAVE_POLICY:-terminate}"
 ETA_T="${ETA_T:-0.2}"
 ETA_D="${ETA_D:-0.5}"
@@ -77,6 +78,7 @@ usage() {
   --num-leave-compute N  退出规则观察的最近 N 个 item；两个环境默认均为 1
   --leave-threshold X    类别历史计数严格大于 X 时，匹配候选会触发退出
   --max-turn N           会话最大展示步数，默认 100
+  --mcd-segment-length N 分段 MCD 的连续窗口长度，默认 30
   --leave-policy MODE    ordinary 与 Transformer 均仅支持 terminate；保留该参数用于显式校验
   --eta-t X              四头模型的展示长度权重；默认 0.2
   --eta-d X              四头模型的 MCD 改善权重；默认 0.2
@@ -122,6 +124,7 @@ while (( $# > 0 )); do
     --num-leave-compute) NUM_LEAVE_COMPUTE="$2"; shift 2 ;;
     --leave-threshold) LEAVE_THRESHOLD="$2"; shift 2 ;;
     --max-turn) MAX_TURN="$2"; shift 2 ;;
+    --mcd-segment-length) MCD_SEGMENT_LENGTH="$2"; shift 2 ;;
     --leave-policy) LEAVE_POLICY="$2"; shift 2 ;;
     --eta-t) ETA_T="$2"; shift 2 ;;
     --eta-d) ETA_D="$2"; shift 2 ;;
@@ -221,7 +224,8 @@ for numeric_value in "${CHUNK_SIZE}" "${RAVE_STEPS}" "${RAVE_EPOCHS}" \
                      "${QV_BATCH_SIZE}" "${RAVE_ROLLOUT_CANDIDATES}" \
                      "${RAVE_EPISODES_PER_COLLECT}" \
                      "${ORDINARY_ROLLOUT_DEPTH}" \
-                     "${NUM_LEAVE_COMPUTE}" "${MAX_TURN}" "${EVAL_EPISODES}" \
+                     "${NUM_LEAVE_COMPUTE}" "${MAX_TURN}" \
+                     "${MCD_SEGMENT_LENGTH}" "${EVAL_EPISODES}" \
                      "${TEST_NUM}" "${NUM_SAMPLES_TEST}"; do
   if [[ ! "${numeric_value}" =~ ^[1-9][0-9]*$ ]]; then
     printf '训练计数和 chunk-size 必须为正整数：%s\n' "${numeric_value}" >&2
@@ -301,6 +305,7 @@ run_pretrain() {
     "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
     "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
     "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
+    "MCD_SEGMENT_LENGTH=${MCD_SEGMENT_LENGTH}"
     "OUTPUT_ROOT=${OUTPUT_ROOT}"
     "RUN_NAME=qv-suite-${DATASET_TAG}-${ACTOR_TAG}" "RUN_DIR=${shared_dir}"
     "BC_SAVE_DIR=${shared_dir}/${BC_SUBDIR}" "TRAIN_STAGES=bc"
@@ -352,6 +357,7 @@ run_qv() {
     "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
     "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
     "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
+    "MCD_SEGMENT_LENGTH=${MCD_SEGMENT_LENGTH}"
     "COMPLETION_WINDOW=${CHUNK_SIZE}"
     "TEST_NUM=${TEST_NUM}" "NUM_SAMPLES_TEST=${NUM_SAMPLES_TEST}"
     "BATCH_SIZE=${QV_BATCH_SIZE}" "NUM_SAMPLES_TRAIN=${RAVE_ROLLOUT_CANDIDATES}"
@@ -411,6 +417,7 @@ run_rave_eval() {
     "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
     "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
     "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
+    "MCD_SEGMENT_LENGTH=${MCD_SEGMENT_LENGTH}"
     "COMPLETION_WINDOW=${CHUNK_SIZE}" "TEST_NUM=${TEST_NUM}"
     "NUM_SAMPLES_TEST=${NUM_SAMPLES_TEST}" "BUFFER_SIZE=${BUFFER_SIZE}"
     "ETA_T=${ETA_T}" "ETA_D=${ETA_D}" "ETA_C=${ETA_C}"

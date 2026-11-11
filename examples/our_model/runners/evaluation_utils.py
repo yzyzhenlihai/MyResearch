@@ -20,6 +20,7 @@ from src.core.evaluation.evaluator import (
     Evaluator_User_Experience,
 )
 from src.core.evaluation.loggers import LoggerEval_Policy
+from src.core.evaluation.utils import DEFAULT_MCD_SEGMENT_LENGTH
 
 import examples.our_model.models.mac_agent as mac_agent_module
 from examples.our_model.policy import ActionMapper, DORLMACPolicyAdapter
@@ -103,6 +104,7 @@ class DORLMACEvaluator:
         force_length (int): `NX_force_length` 评估分支长度。
         completion_window (int): CCR@W 的固定环境步窗口 W。
         max_turn (int): FB/NX_0 分支的最大轨迹长度，用于识别右删失窗口。
+        mcd_segment_length (int): 轨迹内分段 MCD 的连续窗口长度。
     """
 
     policy: Any
@@ -113,6 +115,7 @@ class DORLMACEvaluator:
     force_length: int
     completion_window: int
     max_turn: int
+    mcd_segment_length: int
 
     def evaluate(self, epoch: int, global_step: int | None = None) -> Dict[str, Any]:
         """按原 DORL trainer 的 test step 语义执行一次评估。
@@ -163,6 +166,14 @@ class DORLMACEvaluator:
         summary.setdefault(
             "evaluation/completion_window",
             int(self.completion_window),
+        )
+        summary.setdefault(
+            "evaluation/mcd_segment_length",
+            int(self.mcd_segment_length),
+        )
+        summary.setdefault(
+            "evaluation/mcd_segment_aggregation",
+            "equal_segments_within_trajectory_then_equal_trajectories",
         )
         summary.setdefault(
             "evaluation/adr_enabled",
@@ -1020,6 +1031,13 @@ def build_dorl_policy_callbacks(
             lbe_item=env.lbe_item if need_transform else None,
             top_rate=float(getattr(args, "top_rate", 0.8)),
             draw_bar=bool(getattr(args, "draw_bar", False)),
+            mcd_segment_length=int(
+                getattr(
+                    args,
+                    "mcd_segment_length",
+                    DEFAULT_MCD_SEGMENT_LENGTH,
+                )
+            ),
         ),
         Evaluator_Coverage_Count(collector_set, df_item_val, need_transform),
         Evaluator_User_Experience(
@@ -1074,6 +1092,11 @@ def build_dorl_policy_evaluator(
             "completion_window must not exceed max_turn, "
             f"got window={completion_window}, max_turn={args.max_turn}."
         )
+    mcd_segment_length = int(
+        getattr(args, "mcd_segment_length", DEFAULT_MCD_SEGMENT_LENGTH)
+    )
+    if mcd_segment_length <= 0:
+        raise ValueError("mcd_segment_length must be positive.")
     required_policy_attributes = (
         "chunk_size",
         "execution_horizon",
@@ -1129,6 +1152,7 @@ def build_dorl_policy_evaluator(
         force_length=args.force_length,
         completion_window=completion_window,
         max_turn=args.max_turn,
+        mcd_segment_length=mcd_segment_length,
     )
 
 
