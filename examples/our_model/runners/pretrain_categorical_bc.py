@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import sys
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,6 +17,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from examples.our_model.logging import SwanLabLogger
+from examples.our_model.data import ObservedChunkDataset
+from examples.our_model.policy import ActionMapper
 from examples.our_model.runners.common import (
     add_common_args,
     build_agent,
@@ -74,6 +77,74 @@ def cycle_dataloader(dataloader: DataLoader) -> Iterable[dict]:
         yield from dataloader
 
 
+def build_pretraining_datasets(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> Tuple[ObservedChunkDataset, ObservedChunkDataset, ActionMapper]:
+    """分别构造 BC Actor 与 Dynamics 预训练数据集。
+
+    Actor 数据始终读取 `dataset_path` 与 `item_embedding_path`；Dynamics
+    数据读取独立的 `dynamics_dataset_path` 与
+    `dynamics_item_embedding_path`。当两组路径相同时复用同一数据集，
+    保持旧模式的内存与加载开销。
+
+    Args:
+        args (argparse.Namespace): 已完成公共路径解析的训练参数。
+        device (torch.device): ActionMapper 所在设备。
+
+    Returns:
+        Tuple[ObservedChunkDataset, ObservedChunkDataset, ActionMapper]:
+        Actor 数据集、Dynamics 数据集和 small/test Actor action mapper。
+
+    Raises:
+        ValueError: 两个数据集的 state/action 维度不一致时抛出。
+    """
+
+    actor_dataset, action_mapper, _ = build_dataset_and_mapper(
+        args,
+        device=device,
+        pretraining_only=True,
+    )
+    actor_paths = (
+        Path(args.dataset_path).resolve(),
+        Path(args.item_embedding_path).resolve(),
+    )
+    dynamics_paths = (
+        Path(args.dynamics_dataset_path).resolve(),
+        Path(args.dynamics_item_embedding_path).resolve(),
+    )
+    if dynamics_paths == actor_paths:
+        dynamics_dataset = actor_dataset
+        LOGGER.info("Dynamics 与 BC Actor 复用同一离线数据集：%s", args.dataset_path)
+    else:
+        dynamics_args = copy.copy(args)
+        dynamics_args.dataset_path = args.dynamics_dataset_path
+        dynamics_args.item_embedding_path = args.dynamics_item_embedding_path
+        dynamics_dataset, _, _ = build_dataset_and_mapper(
+            dynamics_args,
+            device=device,
+            pretraining_only=True,
+        )
+        LOGGER.info(
+            "Dynamics 使用独立数据集：dataset=%s, embedding=%s",
+            args.dynamics_dataset_path,
+            args.dynamics_item_embedding_path,
+        )
+
+    actor_dimensions = (actor_dataset.state_dim, actor_dataset.action_dim)
+    dynamics_dimensions = (
+        dynamics_dataset.state_dim,
+        dynamics_dataset.action_dim,
+    )
+    if dynamics_dimensions != actor_dimensions:
+        raise ValueError(
+            "Dynamics 与 BC Actor 数据维度不兼容："
+            f"dynamics(state,action)={dynamics_dimensions}, "
+            f"actor(state,action)={actor_dimensions}."
+        )
+    return actor_dataset, dynamics_dataset, action_mapper
+
+
 def main(argv: Optional[list[str]] = None) -> Path:
     """执行 actor 预训练。
 
@@ -108,12 +179,20 @@ def main(argv: Optional[list[str]] = None) -> Path:
     )
     config = namespace_to_dict(args)
     save_resolved_config(save_dir, config)
-    dataset, action_mapper, _ = build_dataset_and_mapper(
-        args, device=device, pretraining_only=True,
+    actor_dataset, dynamics_dataset, action_mapper = build_pretraining_datasets(
+        args,
+        device=device,
     )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=min(args.batch_size, len(dataset)),
+    actor_dataloader = DataLoader(
+        actor_dataset,
+        batch_size=min(args.batch_size, len(actor_dataset)),
+        shuffle=True,
+        num_workers=0,
+        drop_last=False,
+    )
+    dynamics_dataloader = DataLoader(
+        dynamics_dataset,
+        batch_size=min(args.batch_size, len(dynamics_dataset)),
         shuffle=True,
         num_workers=0,
         drop_last=False,
@@ -122,7 +201,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
         args,
         device=device,
         action_mapper=action_mapper,
-        state_dim=dataset.state_dim,
+        state_dim=actor_dataset.state_dim,
     )
     optimizer = torch.optim.Adam(agent.actor_parameters(), lr=args.actor_lr)
     logger = SwanLabLogger(
@@ -133,7 +212,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
     )
 
     dynamics_optimizer = torch.optim.Adam(agent.dynamics.parameters(), lr=args.dynamics_lr)
-    batch_iterator = cycle_dataloader(dataloader)
+    batch_iterator = cycle_dataloader(dynamics_dataloader)
     LOGGER.info("开始直接 chunk dynamics 预训练：steps=%s", args.dynamics_pretrain_steps)
     for dynamics_step in range(1, args.dynamics_pretrain_steps + 1):
         metrics = agent.dynamics_update(next(batch_iterator), dynamics_optimizer)
@@ -147,7 +226,7 @@ def main(argv: Optional[list[str]] = None) -> Path:
         args.actor_type, args.pretrain_steps, args.flow_steps,
         args.flow_distill_weight, args.flow_sampling_mode,
     )
-    batch_iterator = cycle_dataloader(dataloader)
+    batch_iterator = cycle_dataloader(actor_dataloader)
     last_metrics = {}
     for step in range(1, args.pretrain_steps + 1):
         batch = next(batch_iterator)

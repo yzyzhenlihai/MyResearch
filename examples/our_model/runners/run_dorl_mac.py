@@ -175,6 +175,17 @@ def build_common_argv(args: argparse.Namespace) -> List[str]:
     common_args.extend(["--dynamics_hidden_dims", *map(str, args.dynamics_hidden_dims)])
     if args.item_embedding_path:
         common_args.extend(["--item_embedding_path", args.item_embedding_path])
+    if getattr(args, "dynamics_dataset_path", ""):
+        common_args.extend(
+            ["--dynamics_dataset_path", args.dynamics_dataset_path]
+        )
+    if getattr(args, "dynamics_item_embedding_path", ""):
+        common_args.extend(
+            [
+                "--dynamics_item_embedding_path",
+                args.dynamics_item_embedding_path,
+            ]
+        )
     if args.predicted_mat_path:
         common_args.extend(["--predicted_mat_path", args.predicted_mat_path])
     if args.maxvar_mat_path:

@@ -88,6 +88,8 @@ esac
 case "${ENV_NAME}" in
   KuaiEnv-v0)
     DEFAULT_DATASET_PATH="data/KuaiRec/data_processed/DM_KuaiEnv-v0_small_data.pkl"
+    DEFAULT_TRAIN_DYNAMICS_DATASET_PATH="data/KuaiRec/data_processed/DM_KuaiEnv-v0_data.pkl"
+    DEFAULT_TRAIN_DYNAMICS_EMBEDDING_FILE="[${READ_MESSAGE}]_emb_item_M0.pt"
     DEFAULT_MAX_TURN=100
     DEFAULT_NUM_LEAVE_COMPUTE=1
     DEFAULT_LEAVE_THRESHOLD=0
@@ -95,6 +97,8 @@ case "${ENV_NAME}" in
     ;;
   KuaiRand-v0)
     DEFAULT_DATASET_PATH="data/KuaiRand_Pure/data_processed/DM_KuaiRand-v0_test_data.pkl"
+    DEFAULT_TRAIN_DYNAMICS_DATASET_PATH="data/KuaiRand_Pure/data_processed/DM_KuaiRand-v0_train_data.pkl"
+    DEFAULT_TRAIN_DYNAMICS_EMBEDDING_FILE="[${READ_MESSAGE}]_emb_item_val_M0.pt"
     DEFAULT_MAX_TURN=100
     DEFAULT_NUM_LEAVE_COMPUTE=1
     DEFAULT_LEAVE_THRESHOLD=0
@@ -109,6 +113,15 @@ esac
 DEFAULT_RUN_NAME="${DEFAULT_RUN_BASE}-${ACTOR_TAG}-qv"
 
 DATASET_PATH="${DATASET_PATH:-${DEFAULT_DATASET_PATH}}"
+DYNAMICS_DATA_SOURCE="${DYNAMICS_DATA_SOURCE:-policy}"
+case "${DYNAMICS_DATA_SOURCE}" in
+  policy|train) ;;
+  *)
+    printf '[run_dorl_mac_kuai_train] ERROR: DYNAMICS_DATA_SOURCE must be policy or train; got %s.\n' \
+      "${DYNAMICS_DATA_SOURCE}" >&2
+    exit 2
+    ;;
+esac
 WHICH_TRACKER="${WHICH_TRACKER:-none}"
 REWARD_HANDLE="${REWARD_HANDLE:-cat}"
 WINDOW_SIZE="${WINDOW_SIZE:-3}"
@@ -134,6 +147,15 @@ MAX_TRAJECTORIES="${MAX_TRAJECTORIES:-}"
 MAX_CHUNKS="${MAX_CHUNKS:-}"
 USER_MODEL_ROOT="saved_models/${ENV_NAME}/${USER_MODEL_NAME}"
 ITEM_EMBEDDING_PATH="${ITEM_EMBEDDING_PATH:-${USER_MODEL_ROOT}/embeddings/[${READ_MESSAGE}]_emb_item_val_M0.pt}"
+if [[ "${DYNAMICS_DATA_SOURCE}" == "train" ]]; then
+  DEFAULT_DYNAMICS_DATASET_PATH="${DEFAULT_TRAIN_DYNAMICS_DATASET_PATH}"
+  DEFAULT_DYNAMICS_ITEM_EMBEDDING_PATH="${USER_MODEL_ROOT}/embeddings/${DEFAULT_TRAIN_DYNAMICS_EMBEDDING_FILE}"
+else
+  DEFAULT_DYNAMICS_DATASET_PATH="${DATASET_PATH}"
+  DEFAULT_DYNAMICS_ITEM_EMBEDDING_PATH="${ITEM_EMBEDDING_PATH}"
+fi
+DYNAMICS_DATASET_PATH="${DYNAMICS_DATASET_PATH:-${DEFAULT_DYNAMICS_DATASET_PATH}}"
+DYNAMICS_ITEM_EMBEDDING_PATH="${DYNAMICS_ITEM_EMBEDDING_PATH:-${DEFAULT_DYNAMICS_ITEM_EMBEDDING_PATH}}"
 PREDICTED_MAT_PATH="${PREDICTED_MAT_PATH:-${USER_MODEL_ROOT}/matsPre/[${READ_MESSAGE}]_matPre.pickle}"
 MAXVAR_MAT_PATH="${MAXVAR_MAT_PATH:-${USER_MODEL_ROOT}/matsVar/[${READ_MESSAGE}]_matVar.pickle}"
 
@@ -198,8 +220,13 @@ RUN_TAG="${RUN_NAME}-K${CHUNK_SIZE}-seed${SEED}"
 BC_RUN_NAME="${BC_RUN_NAME:-${RUN_TAG}-bc}"
 QV_RUN_NAME="${QV_RUN_NAME:-${RUN_TAG}-qv}"
 EVAL_RUN_NAME="${EVAL_RUN_NAME:-${RUN_TAG}-H${EXECUTION_HORIZON}-eval}"
-# 新实验统一写入 QV_suite；显式 RUN_DIR 时保留旧的目录覆盖语义。
-OUTPUT_ROOT="${OUTPUT_ROOT:-saved_models/${ENV_NAME}/QV_suite/K${CHUNK_SIZE}}"
+# train Dynamics 模式默认写入独立目录，避免误复用 policy 数据预训练的 checkpoint。
+if [[ "${DYNAMICS_DATA_SOURCE}" == "train" ]]; then
+  DEFAULT_OUTPUT_ROOT="saved_models/${ENV_NAME}/QV_suite_dynamic_train/K${CHUNK_SIZE}"
+else
+  DEFAULT_OUTPUT_ROOT="saved_models/${ENV_NAME}/QV_suite/K${CHUNK_SIZE}"
+fi
+OUTPUT_ROOT="${OUTPUT_ROOT:-${DEFAULT_OUTPUT_ROOT}}"
 RUN_DIR_WAS_SET=0
 if [[ -n "${RUN_DIR:-}" ]]; then
   RUN_DIR_WAS_SET=1
@@ -232,6 +259,7 @@ COMMON_ARGS=(
   --user_model_name "${USER_MODEL_NAME}"
   --read_message "${READ_MESSAGE}"
   --dataset_path "${DATASET_PATH}"
+  --dynamics_dataset_path "${DYNAMICS_DATASET_PATH}"
   --which_tracker "${WHICH_TRACKER}"
   --reward_handle "${REWARD_HANDLE}"
   --window_size "${WINDOW_SIZE}"
@@ -283,6 +311,7 @@ if [[ -n "${MAX_CHUNKS}" ]]; then
   COMMON_ARGS+=(--max_chunks "${MAX_CHUNKS}")
 fi
 COMMON_ARGS+=(--item_embedding_path "${ITEM_EMBEDDING_PATH}")
+COMMON_ARGS+=(--dynamics_item_embedding_path "${DYNAMICS_ITEM_EMBEDDING_PATH}")
 COMMON_ARGS+=(--predicted_mat_path "${PREDICTED_MAT_PATH}")
 COMMON_ARGS+=(--maxvar_mat_path "${MAXVAR_MAT_PATH}")
 if [[ "${USE_ENTROPY_REWARD}" == "1" || "${USE_ENTROPY_REWARD}" == "true" || "${USE_ENTROPY_REWARD}" == "True" ]]; then
@@ -361,8 +390,9 @@ find_existing_bc_ckpt() {
   shopt -u nullglob
   for checkpoint_path in "${checkpoints[@]}"; do
     if "${PYTHON_BIN}" -c \
-      'import sys, torch; payload=torch.load(sys.argv[1], map_location="cpu", weights_only=False); config=payload.get("config", {}); actual=payload.get("actor_type", config.get("actor_type", "categorical")); expected_weight=float(sys.argv[3]); actual_weight=float(config.get("flow_distill_weight", 0.0)); actual_mode=config.get("flow_sampling_mode", "onestep" if payload.get("actor_onestep") is not None else "teacher"); distill_ok=actual != "categorical_flow" or (abs(actual_weight-expected_weight) < 1e-12 and actual_mode == sys.argv[4] and (expected_weight == 0 or payload.get("actor_onestep") is not None)); valid=payload.get("format") == "mac_origin_precomputed_state_v2" and actual == sys.argv[2] and distill_ok; raise SystemExit(0 if valid else 1)' \
-      "${checkpoint_path}" "${ACTOR_TYPE}" "${FLOW_DISTILL_WEIGHT}" "${FLOW_SAMPLING_MODE}"; then
+      'import sys, torch; from pathlib import Path; payload=torch.load(sys.argv[1], map_location="cpu", weights_only=False); config=payload.get("config", {}); actual=payload.get("actor_type", config.get("actor_type", "categorical")); expected_weight=float(sys.argv[3]); actual_weight=float(config.get("flow_distill_weight", 0.0)); actual_mode=config.get("flow_sampling_mode", "onestep" if payload.get("actor_onestep") is not None else "teacher"); distill_ok=actual != "categorical_flow" or (abs(actual_weight-expected_weight) < 1e-12 and actual_mode == sys.argv[4] and (expected_weight == 0 or payload.get("actor_onestep") is not None)); same=lambda left,right: Path(left).resolve() == Path(right).resolve(); data_ok=same(config.get("dynamics_dataset_path", config.get("dataset_path", "")), sys.argv[5]) and same(config.get("dynamics_item_embedding_path", config.get("item_embedding_path", "")), sys.argv[6]); valid=payload.get("format") == "mac_origin_precomputed_state_v2" and actual == sys.argv[2] and distill_ok and data_ok; raise SystemExit(0 if valid else 1)' \
+      "${checkpoint_path}" "${ACTOR_TYPE}" "${FLOW_DISTILL_WEIGHT}" "${FLOW_SAMPLING_MODE}" \
+      "${DYNAMICS_DATASET_PATH}" "${DYNAMICS_ITEM_EMBEDDING_PATH}"; then
       printf '%s\n' "${checkpoint_path}"
       return 0
     fi
@@ -376,6 +406,8 @@ printf '[run_dorl_mac_kuai_train] paths: bc=%s, qv=%s, eval=%s\n' \
   "${BC_SAVE_DIR}" "${MAC_SAVE_DIR}" "${EVAL_SAVE_DIR}"
 printf '[run_dorl_mac_kuai_train] dataset: env=%s, trajectories=%s\n' \
   "${ENV_NAME}" "${DATASET_PATH}"
+printf '[run_dorl_mac_kuai_train] dynamics dataset: source=%s, trajectories=%s, embedding=%s\n' \
+  "${DYNAMICS_DATA_SOURCE}" "${DYNAMICS_DATASET_PATH}" "${DYNAMICS_ITEM_EMBEDDING_PATH}"
 printf '[run_dorl_mac_kuai_train] user model assets: item=%s, prediction=%s, variance=%s\n' \
   "${ITEM_EMBEDDING_PATH}" "${PREDICTED_MAT_PATH}" "${MAXVAR_MAT_PATH}"
 printf '[run_dorl_mac_kuai_train] open-loop diagnostics: CCR_window=%s, ADR=%s\n' \

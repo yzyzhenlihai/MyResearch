@@ -1369,6 +1369,73 @@ class RAVEShellRoutingTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("不支持的 Q/V 类型：transformer", result.stderr)
 
+    def test_suite_routes_train_data_only_to_dynamics(self) -> None:
+        """train 模式应透传独立 Dynamics 数据源并使用隔离的运行名。"""
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = subprocess.run(
+                [
+                    "bash", "script/run_kuai_qv_suite.sh",
+                    "--stage", "pretrain",
+                    "--dynamics-data-source", "train",
+                    "--seeds", "2023 2024 2025 2026 2027",
+                    "--gpus", "0",
+                    "--output-root", temporary_directory,
+                    "--serial",
+                    "--dry-run",
+                ],
+                cwd=self.repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertIn("DYNAMICS_DATA_SOURCE=train", result.stdout)
+        self.assertIn("dyn-train", result.stdout)
+        self.assertIn("TRAIN_STAGES=bc", result.stdout)
+
+    def test_base_script_resolves_policy_and_dynamics_paths(self) -> None:
+        """基础脚本必须保留 policy small/test，并为 Dynamics 切换 train/big。"""
+
+        expected_paths = {
+            "KuaiEnv-v0": (
+                "DM_KuaiEnv-v0_small_data.pkl",
+                "DM_KuaiEnv-v0_data.pkl",
+                "[pointneg]_emb_item_M0.pt",
+            ),
+            "KuaiRand-v0": (
+                "DM_KuaiRand-v0_test_data.pkl",
+                "DM_KuaiRand-v0_train_data.pkl",
+                "[pointneg]_emb_item_val_M0.pt",
+            ),
+        }
+        for env_name, expected in expected_paths.items():
+            with self.subTest(env=env_name), tempfile.TemporaryDirectory() as temporary_directory:
+                environment = os.environ.copy()
+                environment.update({
+                    "ENV_NAME": env_name,
+                    "DYNAMICS_DATA_SOURCE": "train",
+                    "TRAIN_STAGES": "bc",
+                    "DRY_RUN": "1",
+                    "OUTPUT_ROOT": temporary_directory,
+                    "RUN_DIR": f"{temporary_directory}/run",
+                    "BC_SAVE_DIR": f"{temporary_directory}/bc",
+                })
+                result = subprocess.run(
+                    ["bash", "script/run_dorl_mac_kuai_train.sh"],
+                    cwd=self.repo_root,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertIn(expected[0], result.stdout)
+            self.assertIn(expected[1], result.stdout)
+            self.assertIn(expected[2], result.stdout)
+            self.assertIn("--dynamics_dataset_path", result.stdout)
+            self.assertIn("--dynamics_item_embedding_path", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

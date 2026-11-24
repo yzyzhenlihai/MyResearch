@@ -318,6 +318,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         default="",
         help="离线轨迹路径；为空时根据 --env 自动选择 KuaiRec 或 KuaiRand 数据。",
     )
+    parser.add_argument(
+        "--dynamics_dataset_path",
+        type=str,
+        default="",
+        help=(
+            "Dynamics 预训练专用离线轨迹路径；为空时复用 --dataset_path。"
+            "该参数不改变 BC Actor、Q/V 或评估的数据源。"
+        ),
+    )
     parser.add_argument("--which_tracker", type=str, default="none", choices=["none"],
                         help="MAC_origin 不使用 DORL StateTracker。")
     parser.add_argument("--dynamics_hidden_dims", type=int, nargs="+",
@@ -382,6 +391,15 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument("--random_init", action="store_true", default=False)
     parser.add_argument("--item_embedding_path", type=str, default="")
+    parser.add_argument(
+        "--dynamics_item_embedding_path",
+        type=str,
+        default="",
+        help=(
+            "Dynamics 数据集 action 反查使用的 item embedding；为空时复用 "
+            "--item_embedding_path。"
+        ),
+    )
     parser.add_argument("--predicted_mat_path", type=str, default="")
     parser.add_argument(
         "--predicted_mat_normalize",
@@ -564,6 +582,10 @@ def resolve_common_paths(args: argparse.Namespace) -> None:
             args.user_model_name,
             args.read_message,
         )
+    if not getattr(args, "dynamics_dataset_path", ""):
+        args.dynamics_dataset_path = args.dataset_path
+    if not getattr(args, "dynamics_item_embedding_path", ""):
+        args.dynamics_item_embedding_path = args.item_embedding_path
     if not args.predicted_mat_path:
         args.predicted_mat_path = default_predicted_mat_path(
             args.env,

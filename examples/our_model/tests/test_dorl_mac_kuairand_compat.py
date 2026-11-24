@@ -20,6 +20,9 @@ from examples.our_model.runners.common import (
     build_reward_and_leave,
     resolve_common_paths,
 )
+from examples.our_model.runners.pretrain_categorical_bc import (
+    build_pretraining_datasets,
+)
 from src.core.envs.KuaiRand_Pure.KuaiRandData import KuaiRandData
 
 
@@ -36,15 +39,78 @@ class DORLMACKuaiRandCompatTest(unittest.TestCase):
                     user_model_name="DeepFM",
                     read_message="pointneg",
                     dataset_path="",
+                    dynamics_dataset_path="",
                     item_embedding_path="",
+                    dynamics_item_embedding_path="",
                     predicted_mat_path="",
                     maxvar_mat_path="",
                 )
                 resolve_common_paths(args)
                 self.assertEqual(args.dataset_path, dataset_path)
+                self.assertEqual(args.dynamics_dataset_path, dataset_path)
                 self.assertIn(f"saved_models/{env_name}/DeepFM", args.item_embedding_path)
+                self.assertEqual(
+                    args.dynamics_item_embedding_path,
+                    args.item_embedding_path,
+                )
                 self.assertTrue(args.predicted_mat_path.endswith("_matPre.pickle"))
                 self.assertTrue(args.maxvar_mat_path.endswith("_matVar.pickle"))
+
+    def test_pretraining_builds_independent_dynamics_dataset(self) -> None:
+        """独立 Dynamics 路径必须使用第二个 loader 且保留 Actor mapper。"""
+
+        actor_dataset = SimpleNamespace(state_dim=42, action_dim=41)
+        dynamics_dataset = SimpleNamespace(state_dim=42, action_dim=41)
+        actor_mapper = object()
+        args = argparse.Namespace(
+            dataset_path="small.pkl",
+            item_embedding_path="small.pt",
+            dynamics_dataset_path="big.pkl",
+            dynamics_item_embedding_path="big.pt",
+        )
+        with mock.patch(
+            "examples.our_model.runners.pretrain_categorical_bc."
+            "build_dataset_and_mapper",
+            side_effect=[
+                (actor_dataset, actor_mapper, object()),
+                (dynamics_dataset, object(), object()),
+            ],
+        ) as build_dataset:
+            actual_actor, actual_dynamics, actual_mapper = (
+                build_pretraining_datasets(args, torch.device("cpu"))
+            )
+
+        self.assertIs(actual_actor, actor_dataset)
+        self.assertIs(actual_dynamics, dynamics_dataset)
+        self.assertIs(actual_mapper, actor_mapper)
+        self.assertEqual(build_dataset.call_count, 2)
+        dynamics_args = build_dataset.call_args_list[1].args[0]
+        self.assertEqual(dynamics_args.dataset_path, "big.pkl")
+        self.assertEqual(dynamics_args.item_embedding_path, "big.pt")
+
+    def test_pretraining_reuses_policy_dataset_for_legacy_mode(self) -> None:
+        """两组路径相同时应只加载一次，保持旧模式内存行为。"""
+
+        actor_dataset = SimpleNamespace(state_dim=18, action_dim=17)
+        actor_mapper = object()
+        args = argparse.Namespace(
+            dataset_path="test.pkl",
+            item_embedding_path="item.pt",
+            dynamics_dataset_path="test.pkl",
+            dynamics_item_embedding_path="item.pt",
+        )
+        with mock.patch(
+            "examples.our_model.runners.pretrain_categorical_bc."
+            "build_dataset_and_mapper",
+            return_value=(actor_dataset, actor_mapper, object()),
+        ) as build_dataset:
+            _, dynamics_dataset, _ = build_pretraining_datasets(
+                args,
+                torch.device("cpu"),
+            )
+
+        self.assertIs(dynamics_dataset, actor_dataset)
+        build_dataset.assert_called_once()
 
     def test_kuairand_reward_and_leave_use_identity_ids(self) -> None:
         """无 LabelEncoder 的 KuaiRand 应直接使用连续原始 user/item ID。"""

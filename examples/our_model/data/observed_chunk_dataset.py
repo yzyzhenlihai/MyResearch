@@ -34,6 +34,7 @@ class ObservedChunkDataset(ActionChunkDataset):
         """
         super().__init__(*args, **kwargs)
         self.state_dim = self.bundle.state_dim
+        self.action_dim = self.bundle.action_dim
         self.pretraining_only = bool(pretraining_only)
         self._validate_finite_trajectories()
 

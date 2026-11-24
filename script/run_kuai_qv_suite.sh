@@ -16,7 +16,7 @@ ENV_NAME="${ENV_NAME:-KuaiEnv-v0}"
 # multi_prefix_transformer：R/T/D/C 四头前缀 Transformer Q，联合选择候选与 H，无独立 V。
 QV_TYPES="${QV_TYPES:-multi_prefix_transformer}"
 SEEDS="${SEEDS:-2023 2024 2025 2026 2027}"
-GPU_IDS="${GPU_IDS:-5 6 7}"
+GPU_IDS="${GPU_IDS:-0 3 4 5 6}"
 CHUNK_SIZE="${CHUNK_SIZE:-5}"
 #pretrain：只预训练共享 BC Actor，并保存各 seed 的 BC checkpoint。
 #qv：使用已有 BC checkpoint 训练指定的 Q/V 分支。
@@ -42,6 +42,8 @@ LAMBDA_CHUNK="${LAMBDA_CHUNK:-1.0}"
 ALL_PREFIX_AUX_WEIGHT="${ALL_PREFIX_AUX_WEIGHT:-1.0}"
 PRETRAIN_STEPS="${PRETRAIN_STEPS:-100000}"
 DYNAMICS_PRETRAIN_STEPS="${DYNAMICS_PRETRAIN_STEPS:-10000}"
+# policy：Dynamics 与 Actor 共用 small/test；train：仅 Dynamics 使用 big/train。
+DYNAMICS_DATA_SOURCE="${DYNAMICS_DATA_SOURCE:-train}"
 SWANLAB_MODE="${SWANLAB_MODE:-cloud}"
 EVAL_SWANLAB_PROJECT="${EVAL_SWANLAB_PROJECT:-RAVE-H-Eval}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
@@ -60,8 +62,8 @@ LEAVE_THRESHOLD="${LEAVE_THRESHOLD:-0}"
 MAX_TURN="${MAX_TURN:-100}"
 MCD_SEGMENT_LENGTH="${MCD_SEGMENT_LENGTH:-30}"
 LEAVE_POLICY="${LEAVE_POLICY:-terminate}"
-ETA_T="${ETA_T:-0.2}"
-ETA_D="${ETA_D:-0.5}"
+ETA_T="${ETA_T:-0.5}"
+ETA_D="${ETA_D:-0.05}"
 ETA_C="${ETA_C:-0.05}"
 GAMMA="${GAMMA:-0.9}"
 
@@ -80,12 +82,12 @@ usage() {
   --max-turn N           会话最大展示步数，默认 100
   --mcd-segment-length N 分段 MCD 的连续窗口长度，默认 30
   --leave-policy MODE    ordinary 与 Transformer 均仅支持 terminate；保留该参数用于显式校验
-  --eta-t X              四头模型的展示长度权重；默认 0.2
-  --eta-d X              四头模型的 MCD 改善权重；默认 0.2
+  --eta-t X              四头模型的展示长度权重；默认 0.5
+  --eta-d X              四头模型的 MCD 改善权重；默认 0.05
   --eta-c X              四头模型的规划成本权重；默认 0.05
   --gamma X              MAC/ACSAC 每环境步折扣率；默认 0.9
   --stage STAGE           all、pretrain、qv 或 eval
-  --output-root PATH      默认 saved_models/<env>/QV_suite/K<K>
+  --output-root PATH      policy 默认 QV_suite；train 默认 QV_suite_dynamic_train
   --shared-pretrain-root PATH 复用其他实验根目录下的 shared_pretrain
   --rave-steps N          三种 Q/V 的统一更新步数，默认 100000
   --rave-epochs N         三种 Q/V 的统一 epoch 数，默认 100
@@ -99,6 +101,7 @@ usage() {
   --train-eval-episodes N 与 --eval-episodes 等价；三个 Q/V 分支统一使用该轨迹数
   --pretrain-steps N       Flow/CE BC 更新步数
   --dynamics-steps N      chunk dynamics 更新步数
+  --dynamics-data-source SOURCE  policy 或 train；train 仅替换 Dynamics 预训练数据
   --mac-epochs N          --rave-epochs 的兼容别名
   --eval-split SPLIT      独立评估输出标签；评估用户来自完整环境
   --eval-episodes N       每个 checkpoint 的独立评估轨迹数，默认 100
@@ -145,6 +148,7 @@ while (( $# > 0 )); do
     --train-eval-episodes) EVAL_EPISODES="$2"; RAVE_TRAIN_EVAL_EPISODES="$2"; shift 2 ;;
     --pretrain-steps) PRETRAIN_STEPS="$2"; shift 2 ;;
     --dynamics-steps) DYNAMICS_PRETRAIN_STEPS="$2"; shift 2 ;;
+    --dynamics-data-source) DYNAMICS_DATA_SOURCE="$2"; shift 2 ;;
     --mac-epochs) RAVE_EPOCHS="$2"; shift 2 ;;
     --mac-steps)
       printf -- '--mac-steps 已停用；请用 --rave-steps 设置三个分支统一的总更新数。\n' >&2
@@ -173,6 +177,10 @@ case "${ENV_NAME}" in
   KuaiEnv-v0) DATASET_TAG="kuairec"; DEFAULT_LEAVE_WINDOW=1 ;;
   KuaiRand-v0) DATASET_TAG="kuairand"; DEFAULT_LEAVE_WINDOW=1 ;;
   *) printf '不支持的环境：%s\n' "${ENV_NAME}" >&2; exit 2 ;;
+esac
+case "${DYNAMICS_DATA_SOURCE}" in
+  policy|train) ;;
+  *) printf -- '--dynamics-data-source 必须为 policy 或 train。\n' >&2; exit 2 ;;
 esac
 NUM_LEAVE_COMPUTE="${NUM_LEAVE_COMPUTE:-${DEFAULT_LEAVE_WINDOW}}"
 case "${ACTOR_TYPE}" in
@@ -266,7 +274,12 @@ if [[ "${LEAVE_POLICY}" == "penalty" ]]; then
   exit 2
 fi
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-saved_models/${ENV_NAME}/QV_suite/K${CHUNK_SIZE}}"
+if [[ "${DYNAMICS_DATA_SOURCE}" == "train" ]]; then
+  DEFAULT_OUTPUT_ROOT="saved_models/${ENV_NAME}/QV_suite_dynamic_train/K${CHUNK_SIZE}"
+else
+  DEFAULT_OUTPUT_ROOT="saved_models/${ENV_NAME}/QV_suite/K${CHUNK_SIZE}"
+fi
+OUTPUT_ROOT="${OUTPUT_ROOT:-${DEFAULT_OUTPUT_ROOT}}"
 SHARED_ROOT="${SHARED_PRETRAIN_ROOT:-${OUTPUT_ROOT}/shared_pretrain}"
 LOG_ROOT="${OUTPUT_ROOT}/logs"
 MANIFEST="${OUTPUT_ROOT}/manifest.tsv"
@@ -302,12 +315,13 @@ run_pretrain() {
   # 始终进入基础脚本，由它校验 actor 类型、蒸馏权重和采样模式后决定复用。
   local -a command=(env
     "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
+    "DYNAMICS_DATA_SOURCE=${DYNAMICS_DATA_SOURCE}"
     "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
     "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
     "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
     "MCD_SEGMENT_LENGTH=${MCD_SEGMENT_LENGTH}"
     "OUTPUT_ROOT=${OUTPUT_ROOT}"
-    "RUN_NAME=qv-suite-${DATASET_TAG}-${ACTOR_TAG}" "RUN_DIR=${shared_dir}"
+    "RUN_NAME=qv-suite-${DATASET_TAG}-${ACTOR_TAG}-dyn-${DYNAMICS_DATA_SOURCE}" "RUN_DIR=${shared_dir}"
     "BC_SAVE_DIR=${shared_dir}/${BC_SUBDIR}" "TRAIN_STAGES=bc"
     "PRETRAIN_STEPS=${PRETRAIN_STEPS}" "DYNAMICS_PRETRAIN_STEPS=${DYNAMICS_PRETRAIN_STEPS}"
     "BC_SWANLAB_PROJECT=RAVE-H-QV-Suite-Pretrain"
@@ -354,6 +368,7 @@ run_qv() {
   fi
   local -a command=(env
     "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
+    "DYNAMICS_DATA_SOURCE=${DYNAMICS_DATA_SOURCE}"
     "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
     "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
     "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
@@ -371,7 +386,7 @@ run_qv() {
     "FREEZE_DYNAMICS_DURING_QV=1" "DYNAMICS_LOSS_WEIGHT=0" "EPOCH=${RAVE_EPOCHS}"
     "STEP_PER_EPOCH=${STEP_PER_EPOCH}" "EVAL_EVERY_N_EPOCHS=${RAVE_EVAL_EVERY_EPOCHS}"
     "EVAL_EPISODES=${EVAL_EPISODES}" "QV_SWANLAB_PROJECT=RAVE-H-QV-Suite"
-    "QV_RUN_NAME=qv-suite-${DATASET_TAG}-K${CHUNK_SIZE}-${qv_type}-seed${seed}"
+    "QV_RUN_NAME=qv-suite-${DATASET_TAG}-K${CHUNK_SIZE}-${qv_type}-dyn-${DYNAMICS_DATA_SOURCE}-seed${seed}"
     "SWANLAB_MODE=${SWANLAB_MODE}" bash script/run_dorl_mac_kuai_train.sh)
   printf '[run] qv_type=%s seed=%s gpu=%s output=%s\n' \
     "${qv_type}" "${seed}" "${gpu}" "${output_dir}"
@@ -396,7 +411,7 @@ run_rave_eval() {
   eval_dir="${output_dir}/eval_${EVAL_SPLIT}"
   result="${eval_dir}/summary_metrics.json"
   log_file="${LOG_ROOT}/${qv_type}-eval-${EVAL_SPLIT}-seed${seed}.log"
-  run_name="qv-suite-${DATASET_TAG}-K${CHUNK_SIZE}-${qv_type}-eval-${EVAL_SPLIT}-seed${seed}"
+  run_name="qv-suite-${DATASET_TAG}-K${CHUNK_SIZE}-${qv_type}-dyn-${DYNAMICS_DATA_SOURCE}-eval-${EVAL_SPLIT}-seed${seed}"
   if [[ "${DRY_RUN}" != "1" && ! -f "${checkpoint}" ]]; then
     printf '[failed] RAVE-H-Eval 缺少 checkpoint：%s\n' "${checkpoint}" >&2
     return 1
@@ -414,6 +429,7 @@ run_rave_eval() {
   fi
   local -a command=(env
     "CUDA_VISIBLE_DEVICES=${gpu}" "ENV_NAME=${ENV_NAME}" "ACTOR_TYPE=${ACTOR_TYPE}"
+    "DYNAMICS_DATA_SOURCE=${DYNAMICS_DATA_SOURCE}"
     "SEED=${seed}" "CUDA=0" "DEVICE=cuda:0" "CHUNK_SIZE=${CHUNK_SIZE}"
     "NUM_LEAVE_COMPUTE=${NUM_LEAVE_COMPUTE}" "LEAVE_THRESHOLD=${LEAVE_THRESHOLD}"
     "MAX_TURN=${MAX_TURN}" "FORCE_LENGTH=${MAX_TURN}" "LEAVE_POLICY=${LEAVE_POLICY}"
